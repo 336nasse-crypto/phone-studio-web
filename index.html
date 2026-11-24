@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Phone Studio</title>
+<meta name="description" content="Record your vocals over a beat, in time, on your phone.">
+<meta name="theme-color" content="#141414">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Phone Studio">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+  <header class="app-header">
+    <h1>Phone Studio</h1>
+    <p class="muted">Record your vocals over a beat, in time, on your phone.</p>
+  </header>
+
+  <div id="error-box" class="error-box" role="alert" style="display:none"></div>
+  <button id="error-dismiss" class="btn-small" style="display:none">Got it</button>
+
+  <section class="card warning">
+    <h2>Two things to know</h2>
+    <p><strong>Keep this page open and the screen on while you record.</strong>
+    If Safari goes to the background or the screen locks, the recording stops.
+    The app tries to keep the screen awake for you.</p>
+    <p id="wake-note" style="display:none"><strong>Your phone could not keep
+    the screen awake automatically</strong> — tap the screen now and then so it
+    does not lock during a take.</p>
+    <p><strong>Listen when you tap record.</strong> If the beat suddenly sounds
+    muddy and flat, your headphones dropped to phone-call mode and the
+    recording will sound bad. Stop the take, take the headphones off, switch
+    to “No headphones” below, and record with the phone speaker instead.</p>
+  </section>
+
+  <section class="card">
+    <h2>Your song</h2>
+    <label class="field">
+      <span>Song name</span>
+      <input id="song-name" type="text" value="New Song" autocomplete="off">
+    </label>
+    <div class="row">
+      <label class="field">
+        <span>Key</span>
+        <select id="song-key"></select>
+      </label>
+      <label class="field">
+        <span>Open song</span>
+        <select id="session-select"></select>
+      </label>
+      <button id="new-song" class="btn">New song</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Beat</h2>
+    <p id="beat-status" class="muted">No beat yet. Import one to record over it.</p>
+    <div class="row">
+      <button id="beat-pick" class="btn">Import a beat</button>
+      <button id="beat-remove" class="btn danger" style="display:none">Remove beat</button>
+    </div>
+    <input id="beat-file" type="file" accept="audio/*" hidden>
+  </section>
+
+  <section class="card" id="calibration-card">
+    <h2>Headphones</h2>
+    <div class="row">
+      <label class="radio"><input id="mode-headphones" type="radio" name="output-mode" value="headphones" checked> I&rsquo;m wearing headphones</label>
+      <label class="radio"><input id="mode-speaker" type="radio" name="output-mode" value="speaker"> No headphones — phone speaker</label>
+    </div>
+    <p id="speaker-note" class="muted" style="display:none">With the phone
+    speaker there is nothing to measure — the timing is handled from the
+    phone&rsquo;s own numbers, and the check after each take tidies up
+    what&rsquo;s left.</p>
+    <div id="headphones-box">
+      <p class="muted">Wireless headphones delay the sound a little. Measure
+      yours once, and the beat will play early by exactly that much — so you
+      hear it on time and your voice lands in time.</p>
+      <div id="cal-list"></div>
+      <label class="field">
+        <span>Name for these headphones</span>
+        <input id="cal-label" type="text" placeholder="my AirPods" autocomplete="off">
+      </label>
+      <button id="cal-measure" class="btn">Measure my headphones</button>
+      <p class="muted small">Put the headphones next to the phone — not on
+      your ears — turn the volume up, and keep them still. The app plays
+      5 clicks and times how long they take to come back.</p>
+      <p id="cal-status" class="status"></p>
+    </div>
+  </section>
+
+  <section class="card warning" id="cal-gate" style="display:none">
+    <h2>Headphones not measured yet</h2>
+    <p>Your headphones aren&rsquo;t measured yet, so the timing won&rsquo;t be
+    as tight on this take. Measure them first — it takes about 10 seconds —
+    or record anyway.</p>
+    <div class="row">
+      <button id="cal-gate-measure" class="btn">Measure now</button>
+      <button id="cal-gate-anyway" class="btn">Record anyway</button>
+      <button id="cal-gate-cancel" class="btn">Never mind</button>
+    </div>
+  </section>
+
+  <p id="record-hint" class="muted"></p>
+  <div id="tracks"></div>
+
+  <section class="card">
+    <h2>Check my mic</h2>
+    <p class="muted">Records 10 seconds with no beat, so Jim can check which
+    mic your phone used. If the phone mic is doing the work, the recording
+    sounds full and clear. If the headphones&rsquo; mic took over, it sounds
+    thin and muffled — and Jim will tell you.</p>
+    <div class="row">
+      <button id="mic-btn" class="btn">Check my mic (10 seconds)</button>
+      <button id="mic-send" class="btn" style="display:none">Send it to Jim</button>
+    </div>
+    <p id="mic-status" class="status"></p>
+  </section>
+
+  <footer class="muted small">
+    <p>Your takes stay on this phone until you send them. The app works
+    offline after the first load — add it to your home screen from the
+    share menu in Safari.</p>
+    <p>How it works, in one line: the app measures your headphones&rsquo;
+    delay once, plays the beat early by that much while you sing, then
+    checks the timing after every take and lines it up.</p>
+  </footer>
+</main>
+<script src="wav.js"></script>
+<script src="calibrate.js"></script>
+<script src="residual.js"></script>
+<script src="db.js"></script>
+<script src="store.js"></script>
+<script src="audio.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
