@@ -20,7 +20,9 @@
   <header class="topbar">
     <button id="setup-song" class="topbar-song" aria-label="Song settings">
       <span id="topbar-song-name">New Song</span>
-      <span id="topbar-song-key" class="muted">D minor</span>
+    </button>
+    <button id="topbar-key" class="topbar-key" aria-label="Change key">
+      <span id="topbar-song-key">D minor</span>
     </button>
     <button id="setup-open" class="icon-btn" aria-label="Setup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 1-1.82-.33 1.65 1.65 0 0 1-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09a1.65 1.65 0 0 1-1-1.51 1.65 1.65 0 0 1-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 1 .33-1.82 1.65 1.65 0 0 1-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09a1.65 1.65 0 0 1 1.51-1 1.65 1.65 0 0 1-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 1 1.82.33h.01a1.65 1.65 0 0 1 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 1 1 1.51h.01a1.65 1.65 0 0 1 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 1-.33 1.82v.01a1.65 1.65 0 0 1 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 1-1.51 1z"></path></svg></button>
   </header>
@@ -62,10 +64,6 @@
       </label>
       <div class="row song-controls">
         <label class="field">
-          <span>Key</span>
-          <select id="song-key"></select>
-        </label>
-        <label class="field">
           <span>Open song</span>
           <select id="session-select"></select>
         </label>
@@ -81,61 +79,31 @@
         <label class="radio"><input id="mode-speaker" type="radio" name="output-mode" value="speaker"> No headphones — phone speaker</label>
       </div>
       <p id="speaker-note" class="muted" style="display:none">With the phone
-      speaker there is nothing to measure — the timing is handled from the
-      phone&rsquo;s own numbers, and the check after each take tidies up
-      what&rsquo;s left.</p>
+      speaker there is nothing to measure — the timing is handled for you.</p>
       <div id="headphones-box">
-        <p class="muted">Wireless headphones delay the sound a little. Measure
-        yours once, and the beat will play early by exactly that much — so you
-        hear it on time and your voice lands in time.</p>
+        <p class="muted">Measure once and the beat plays early by exactly that
+        much, so your voice lands in time.</p>
         <div id="cal-list"></div>
         <label class="field">
-          <span>Name for these headphones</span>
-          <input id="cal-label" type="text" placeholder="my AirPods" autocomplete="off">
+          <span>Name these headphones (optional)</span>
+          <input id="cal-label" type="text" placeholder="My headphones" autocomplete="off">
         </label>
         <button id="cal-measure" class="btn">Measure my headphones</button>
-        <p class="muted small">Put the headphones next to the phone — not on
-        your ears — turn the volume up, and keep them still. The app plays
-        5 clicks and times how long they take to come back.</p>
-        <p class="muted small">On the studio screen, the headphones button
-        lets you hear your own voice tuned while you sing. On wireless
-        headphones it may sound a little late — if it throws you off, tap
-        it off. You will still hear the tune when you play the take back.</p>
+        <p class="muted small">Headphones next to the phone, not on your ears.
+        Volume up, keep them still — the app plays 5 clicks.</p>
+        <p class="muted small">The headphones button on the studio screen lets
+        you hear yourself tuned while you sing.</p>
+        <p class="muted small">If the beat sounds muddy when you tap record,
+        your headphones dropped to phone-call mode — stop the take and switch
+        to the phone speaker above.</p>
         <p id="cal-status" class="status"></p>
       </div>
     </section>
 
-    <section class="card" id="mic-section">
-      <p class="eyebrow">Sound check</p>
-      <h2>Check my mic</h2>
-      <p class="muted">Records 10 seconds with no beat, so Jim can check which
-      mic your phone used. If the phone mic is doing the work, the recording
-      sounds full and clear. If the headphones&rsquo; mic took over, it sounds
-      thin and muffled — and Jim will tell you.</p>
-      <div class="row">
-        <button id="mic-btn" class="btn">Check my mic (10 seconds)</button>
-        <button id="mic-send" class="btn" style="display:none">Send it to Jim</button>
-      </div>
-      <p id="mic-status" class="status"></p>
-    </section>
-
-    <section class="card warn">
-      <h2>Two things to know</h2>
-      <p><strong>Keep this page open and the screen on while you record.</strong>
-      If Safari goes to the background or the screen locks, the recording stops.
-      The app tries to keep the screen awake for you.</p>
-      <p id="wake-note" style="display:none"><strong>Your phone could not keep
-      the screen awake automatically</strong> — tap the screen now and then so it
-      does not lock during a take.</p>
-      <p><strong>Listen when you tap record.</strong> If the beat suddenly sounds
-      muddy and flat, your headphones dropped to phone-call mode and the
-      recording will sound bad. Stop the take, take the headphones off, switch
-      to “No headphones” above, and record with the phone speaker instead.</p>
-    </section>
-
-    <p class="muted small">Your takes stay on this phone until you send them. The app works
-    offline after the first load — add it to your home screen from the
-    share menu in Safari.</p>
+    <p id="wake-note" class="muted small" style="display:none">Your phone could
+    not keep the screen awake automatically — tap the screen now and then so it
+    does not lock during a take.</p>
+    <p class="muted small">Your takes stay on this phone until you send them.</p>
   </div>
 </div>
 
@@ -149,17 +117,13 @@
   </div>
 </div>
 
-<div id="cal-gate" class="modal" style="display:none">
-  <div class="modal-card">
-    <h2>Headphones not measured yet</h2>
-    <p>Your headphones aren&rsquo;t measured yet, so the timing won&rsquo;t be
-    as tight on this take. Measure them first — it takes about 10 seconds —
-    or record anyway.</p>
-    <div class="row">
-      <button id="cal-gate-measure" class="btn">Measure now</button>
-      <button id="cal-gate-anyway" class="btn">Record anyway</button>
-      <button id="cal-gate-cancel" class="btn">Never mind</button>
+<div id="key-sheet" class="sheet" style="display:none">
+  <div class="sheet-card">
+    <div class="sheet-head">
+      <h2>Key</h2>
+      <button id="key-sheet-close" class="icon-btn" aria-label="Close">✕</button>
     </div>
+    <div id="key-list" class="key-grid"></div>
   </div>
 </div>
 
