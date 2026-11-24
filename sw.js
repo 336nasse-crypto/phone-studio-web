@@ -3,7 +3,7 @@
  * ("./") because the site lives at a subpath (GitHub Pages), not a
  * domain root. Bump CACHE_NAME when the shell changes.
  */
-var CACHE_NAME = 'phone-studio-v9';
+var CACHE_NAME = 'phone-studio-v10';
 var SHELL = [
   './',
   './index.html',
