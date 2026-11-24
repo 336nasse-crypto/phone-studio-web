@@ -96,6 +96,19 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   text-overflow: ellipsis;
 }
 .topbar-song #topbar-song-key { font-size: 14px; font-weight: 600; flex: 0 0 auto; }
+/* Key pill in the top bar — one tap to the key picker. */
+.topbar-key {
+  flex: 0 0 auto;
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  padding: 8px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.topbar-key:active { background: var(--card2); color: var(--text); }
 .topbar-title { font-size: 17px; font-weight: 700; }
 .topbar-spacer { width: 44px; flex: 0 0 auto; }
 .icon-btn {
@@ -540,25 +553,29 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
 .take-info strong { font-size: 16px; }
 .take-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
-/* ------------------------------------------------------------------- modal */
-.modal {
-  position: fixed;
-  inset: 0;
-  z-index: 80;
-  background: rgba(0, 0, 0, .65);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
+/* Key picker — 16 keys as pills in a grid. */
+.key-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  padding: 8px 0 4px;
 }
-.modal-card {
-  width: 100%;
-  max-width: 420px;
-  background: var(--warn-bg);
-  border: 1px solid var(--warn-line);
-  border-radius: var(--radius);
-  padding: 20px;
-  box-shadow: 0 16px 40px rgba(0, 0, 0, .5);
+.key-pill {
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 14px 4px;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  min-height: 52px;
+}
+.key-pill:active { transform: scale(.97); }
+.key-pill.current {
+  border-color: var(--purple);
+  background: var(--purple-soft);
+  color: #fff;
 }
 
 @media (prefers-reduced-motion: reduce) {
