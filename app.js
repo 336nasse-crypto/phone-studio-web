@@ -77,7 +77,15 @@
     waveCacheOrder: [],
     sheetTrack: null,
     sliceCtx: null,
-    scrubbing: false
+    scrubbing: false,
+    // Live tune (Hard Tune): the headphones toggle = hear the tuned
+    // voice live. OFF by default (Voloco's own answer on Bluetooth —
+    // the tuned voice arrives late, and hearing yourself late throws
+    // a take off). The tuned take is heard on playback either way.
+    monitorOn: false,
+    monitor: null, // { source, gain, tune } — the live monitor branch, or null
+    tuneModuleReady: false,
+    playbackTune: null // the AudioWorkletNode that tunes take playback
   };
 
   // ---------------------------------------------------------------- helpers
@@ -157,6 +165,9 @@
       if (state.micTesting) finishMicTest(true);
     } else if (document.visibilityState === 'visible') {
       if (state.recording || state.calibrating) acquireWakeLock();
+      // The context may have been suspended while hidden — resume
+      // it so the monitor (and everything else) comes back alive.
+      PS.audio.ensureContext().catch(function () { /* ignore */ });
     }
   });
 
@@ -280,6 +291,7 @@
     state.calibrating = true;
     renderCalibration();
     updateTransport();
+    updateMonitor(); // the monitor would loop the clicks back into the measurement
     acquireWakeLock();
     $('cal-status').textContent = 'Getting the mic ready…';
     PS.audio.runCalibration(function (text) {
@@ -288,6 +300,7 @@
       state.calibrating = false;
       releaseWakeLock();
       updateTransport();
+      updateMonitor();
       if (!result.ok) {
         $('cal-status').textContent = result.error;
         renderCalibration();
@@ -319,6 +332,7 @@
       state.calibrating = false;
       releaseWakeLock();
       updateTransport();
+      updateMonitor();
       $('cal-status').textContent = '';
       renderCalibration();
       showError(err && err.message ? err.message : 'The measurement failed. Try again.');
@@ -623,7 +637,7 @@
         // playTake anchors its players at ctx.currentTime + 0.1.
         state.playingStartCtx = PS.audio.currentTime() + 0.1;
         state.playingStartOffset = offset;
-        return PS.audio.playTake(playTakeBuffer, playBeatBuffer, function () {
+        return playTakeTuned(playTakeBuffer, playBeatBuffer, function () {
           state.playingStop = null;
           state.playingTakeId = null;
           clearPlayheadTimer();
@@ -744,6 +758,7 @@
     state.micTesting = true;
     renderMicTest();
     updateTransport();
+    updateMonitor(); // the monitor would play the mic test back into itself
     $('mic-status').textContent = 'Recording… talk or sing for 10 seconds.';
     acquireWakeLock();
     PS.audio.startCapture(null).then(function () {
@@ -755,6 +770,7 @@
       releaseWakeLock();
       renderMicTest();
       updateTransport();
+      updateMonitor();
       showError(err && err.message ? err.message : 'The mic test could not start.');
     });
   }
@@ -764,6 +780,7 @@
     state.micTesting = false;
     releaseWakeLock();
     updateTransport();
+    updateMonitor();
     var recorded = PS.audio.stopCapture();
     var sr = PS.audio.sampleRate();
     if (!recorded.samples || recorded.samples.length === 0) {
@@ -803,6 +820,163 @@
       downloadBlob(row.wav, 'mic-test.wav');
     }).catch(function () {
       showError('Sharing failed. Try again.');
+    });
+  }
+
+  // ---------------------------------------------------------------- live tune
+
+  /* The live tune (Voloco's Hard Tune): YIN pitch detection -> hard
+   * snap to the song key -> PSOLA shift, in an AudioWorklet
+   * (tune-worklet.js — a port of the native app's live-tune
+   * prototype). ONE preset, 100% strength, at the song's key. The
+   * take stays DRY — the tune runs on the MONITOR (live, while
+   * singing) and on take PLAYBACK (the recorded take is tuned as it
+   * plays), never baked into the file.
+   *
+   * Two nodes share the processor: one for the live monitor branch,
+   * one for playback. (Separate nodes so the live mic and a playing
+   * take never mix inside one detector.)
+   */
+  function ensureTuneModule() {
+    if (state.tuneModuleReady) return PS.audio.ensureContext();
+    return PS.audio.ensureContext().then(function (ctx) {
+      return ctx.audioWorklet.addModule('tune-worklet.js').then(function () {
+        state.tuneModuleReady = true;
+        return ctx;
+      });
+    });
+  }
+
+  function makeTuneNode(ctx) {
+    var node = new AudioWorkletNode(ctx, 'tune-processor', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      channelCount: 1,
+      channelCountMode: 'explicit',
+      outputChannelCount: [1]
+    });
+    node.port.postMessage({ type: 'key', key: state.session.key });
+    node.port.postMessage({ type: 'enabled', on: true });
+    return node;
+  }
+
+  function broadcastKey() {
+    // The song key changed — retune every live tune node.
+    if (state.monitor && state.monitor.tune) {
+      state.monitor.tune.port.postMessage({ type: 'key', key: state.session.key });
+    }
+    if (state.playbackTune) {
+      state.playbackTune.port.postMessage({ type: 'key', key: state.session.key });
+    }
+  }
+
+  /* The monitor branch: mic -> tune -> headphones, live. It runs
+   * only when the toggle is on AND headphones are the output AND
+   * nothing else owns the mic (calibration / mic test — the monitor
+   * would loop the clicks back into the measurement).
+   */
+  function monitorWanted() {
+    return state.monitorOn &&
+      PS.store.outputMode() === 'headphones' &&
+      !state.calibrating && !state.micTesting;
+  }
+
+  function updateMonitor() {
+    if (monitorWanted()) {
+      if (state.monitor) return; // already running
+      ensureTuneModule().then(function (ctx) {
+        return PS.audio.ensureMic().then(function (stream) {
+          // The toggle may have flipped while the mic was opening.
+          if (!monitorWanted() || state.monitor) return;
+          var source = ctx.createMediaStreamSource(stream);
+          var gain = ctx.createGain();
+          gain.gain.value = 0;
+          var tune = makeTuneNode(ctx);
+          source.connect(gain);
+          gain.connect(tune);
+          tune.connect(ctx.destination);
+          state.monitor = { source: source, gain: gain, tune: tune };
+          gain.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
+        });
+      }).catch(function (err) {
+        console.warn('Monitor could not start:', err);
+        state.monitorOn = false;
+        updateTransport();
+        showError('Could not hear yourself — the mic did not open. Try again.');
+      });
+      return;
+    }
+    // Not wanted — tear the branch down (fade first, no click).
+    if (!state.monitor) return;
+    var mon = state.monitor;
+    state.monitor = null;
+    PS.audio.ensureContext().then(function (ctx) {
+      try { mon.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.01); } catch (e) { /* ignore */ }
+      setTimeout(function () {
+        try { mon.source.disconnect(); } catch (e) { /* ignore */ }
+        try { mon.gain.disconnect(); } catch (e) { /* ignore */ }
+        try { mon.tune.disconnect(); } catch (e) { /* ignore */ }
+      }, 120);
+    }).catch(function () {
+      try { mon.source.disconnect(); } catch (e) { /* ignore */ }
+      try { mon.gain.disconnect(); } catch (e) { /* ignore */ }
+      try { mon.tune.disconnect(); } catch (e) { /* ignore */ }
+    });
+  }
+
+  function toggleMonitor() {
+    if (PS.store.outputMode() !== 'headphones') {
+      showError('Put your headphones on to hear yourself while you sing — through the speaker it would feed back.');
+      return;
+    }
+    state.monitorOn = !state.monitorOn;
+    updateMonitor();
+    updateTransport();
+  }
+
+  /* Plays the take (tuned) against the beat, both from the anchor.
+   * The take runs through the tune worklet so Denasse hears the Hard
+   * Tune on playback — the same sound as the live monitor. The beat
+   * goes straight to the output. (The tune adds ~8 ms to the vocal;
+   * that is inside the app's own 15 ms timing tolerance, so the beat
+   * is not delayed to match.) If the tune cannot start, the take
+   * plays dry and he is told — never silently wrong.
+   */
+  function playTakeTuned(takeBuffer, beatBuffer, onEnded) {
+    return ensureTuneModule().then(function (ctx) {
+      if (!state.playbackTune) {
+        state.playbackTune = makeTuneNode(ctx);
+        state.playbackTune.connect(ctx.destination);
+      }
+      var tune = state.playbackTune;
+      tune.port.postMessage({ type: 'reset' });
+      tune.port.postMessage({ type: 'key', key: state.session.key });
+      tune.port.postMessage({ type: 'enabled', on: true });
+      var anchor = PS.audio.currentTime() + 0.1;
+      var players = [];
+      var takePlayer = ctx.createBufferSource();
+      takePlayer.buffer = takeBuffer;
+      takePlayer.connect(tune);
+      takePlayer.start(anchor);
+      if (onEnded) takePlayer.onended = onEnded;
+      players.push(takePlayer);
+      if (beatBuffer) {
+        var beatPlayer = ctx.createBufferSource();
+        beatPlayer.buffer = beatBuffer;
+        beatPlayer.connect(ctx.destination);
+        beatPlayer.start(anchor);
+        players.push(beatPlayer);
+      }
+      return function stop() {
+        players.forEach(function (p) {
+          try { p.onended = null; p.stop(); } catch (e) { /* ignore */ }
+          try { p.disconnect(); } catch (e) { /* ignore */ }
+        });
+      };
+    }).catch(function (err) {
+      console.warn('Tuned playback failed, playing dry:', err);
+      showError('The tune could not start — playing the raw take instead.');
+      return PS.audio.playTake(takeBuffer, beatBuffer, onEnded);
     });
   }
 
@@ -1338,14 +1512,7 @@
     play.setAttribute('aria-label', playing ? 'Stop' : 'Play');
     share.disabled = !take;
     rewind.disabled = !!state.recording;
-    phones.classList.toggle('active', PS.store.outputMode() === 'headphones');
-  }
-
-  function toggleOutputMode() {
-    var next = PS.store.outputMode() === 'headphones' ? 'speaker' : 'headphones';
-    PS.store.setOutputMode(next);
-    renderCalibration();
-    updateTransport();
+    phones.classList.toggle('active', state.monitorOn);
   }
 
   // ---------------------------------------------------------------- views
@@ -1381,7 +1548,7 @@
       setPlayhead(0);
     });
     $('transport-share').addEventListener('click', shareSelected);
-    $('transport-headphones').addEventListener('click', toggleOutputMode);
+    $('transport-headphones').addEventListener('click', toggleMonitor);
     $('sheet-close').addEventListener('click', closeTakeSheet);
     $('take-sheet').addEventListener('click', function (event) {
       if (event.target === $('take-sheet')) closeTakeSheet();
@@ -1403,6 +1570,7 @@
       state.session.key = $('song-key').value;
       saveSessions();
       renderSession();
+      broadcastKey();
     });
     $('session-select').addEventListener('change', function () {
       switchSession($('session-select').value);
@@ -1423,11 +1591,13 @@
       PS.store.setOutputMode('headphones');
       renderCalibration();
       updateTransport();
+      updateMonitor();
     });
     $('mode-speaker').addEventListener('change', function () {
       PS.store.setOutputMode('speaker');
       renderCalibration();
       updateTransport();
+      updateMonitor();
     });
     $('cal-measure').addEventListener('click', startCalibration);
     $('cal-gate-measure').addEventListener('click', function () {
