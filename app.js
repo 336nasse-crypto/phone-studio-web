@@ -6,8 +6,9 @@
  * waveforms drawn from the actual audio (canvas); the beat is the
  * bottom row, on the same timeline. One shared playhead, one big
  * red record button in the transport (it records the SELECTED
- * track). Setup (song, headphones, mic check) lives behind the
- * gear. Takes are managed from a bottom sheet (the ··· on a row).
+ * track). Setup (song, headphones) lives behind the gear. Takes
+ * are managed from a bottom sheet (the ··· on a row). The key
+ * picker is one tap from the top bar.
  *
  * The ENGINE is untouched: the take flow ports
  * AudioEngineManager.beginTake/finishTake (record raw PCM over the
@@ -61,14 +62,14 @@
     beatLoading: false, // a beat file is being read + decoded (row shows "Loading…")
     calibrations: {},
     recording: null, // { track, handle, anchorTime, startWall, timer, interrupted }
+    startingTake: false, // record tapped, the take is still starting (mic opening, overdubs loading)
     calibrating: false,
-    pendingTakeTrack: null,
     playingStop: null,
     playingTakeId: null,
+    playGen: 0, // playback generation — a stale play chain (still loading when a newer play starts) aborts instead of doubling up
     playingStartCtx: 0,
     playingStartOffset: 0,
     playheadTimer: null,
-    micTesting: false,
     wakeLock: null,
     wakeLockSupported: ('wakeLock' in navigator),
     selectedTrack: 'lead',
@@ -163,7 +164,6 @@
       // of silently losing audio. (Native keeps recording on lock;
       // the web cannot. This is the honest handling.)
       if (state.recording) finishTake(true);
-      if (state.micTesting) finishMicTest(true);
     } else if (document.visibilityState === 'visible') {
       if (state.recording || state.calibrating) acquireWakeLock();
       // The context may have been suspended while hidden — resume
@@ -305,13 +305,20 @@
 
   // ---------------------------------------------------------------- calibration
 
+  /* No typing required to measure: one pair of headphones is the
+   * normal case, so an empty name becomes "My headphones" (a second
+   * pair gets a number). The name only matters if he ever measures
+   * a second pair.
+   */
+  function defaultCalLabel() {
+    if (!state.calibrations['My headphones']) return 'My headphones';
+    var n = 2;
+    while (state.calibrations['Headphones ' + n]) n += 1;
+    return 'Headphones ' + n;
+  }
+
   function startCalibration() {
-    var label = $('cal-label').value.trim();
-    if (!label) {
-      showError('Type a name for the headphones first — like "my AirPods".');
-      $('cal-label').focus();
-      return;
-    }
+    var label = $('cal-label').value.trim() || defaultCalLabel();
     clearError();
     state.calibrating = true;
     renderCalibration();
@@ -346,13 +353,6 @@
       $('cal-status').textContent = 'Done — ' + label + ': ' + Math.round(result.medianMs) +
         ' ms. Your voice will land in time.';
       renderCalibration();
-      // A take was waiting on this calibration — start it now.
-      if (state.pendingTakeTrack) {
-        var track = state.pendingTakeTrack;
-        state.pendingTakeTrack = null;
-        showStudio();
-        beginTake(track);
-      }
     }).catch(function (err) {
       state.calibrating = false;
       releaseWakeLock();
@@ -367,27 +367,31 @@
   // ---------------------------------------------------------------- takes
 
   function startTakeRequest(track) {
-    if (state.recording || state.calibrating || state.micTesting) return;
+    if (state.recording || state.calibrating || state.startingTake) return;
     clearError();
-    // Calibration gate (native startTake): headphones mode with no
-    // measured headphones → offer to measure first, or record anyway.
-    // Recording is never blocked.
-    if (PS.store.outputMode() === 'headphones' && !activeCalibration()) {
-      state.pendingTakeTrack = track;
-      $('cal-gate').style.display = 'flex';
-      return;
-    }
+    // A playing take or beat would double up with the take's beat —
+    // stop it first. (The record button is disabled while playing is
+    // loading, so this also cancels a play still starting up.)
+    stopPlayback();
     beginTake(track);
   }
 
   function beginTake(track) {
-    $('cal-gate').style.display = 'none';
     var active = activeCalibration();
     var mode = PS.store.outputMode();
     var delaySeconds = null;
     if (mode === 'headphones' && active) {
       delaySeconds = active.calibration.delaySeconds;
     }
+    // No calibration gate: record anyway. With no measured
+    // headphones the take uses the nominal delay and is flagged
+    // uncalibrated (see finishTake) — the check after the take
+    // still catches part of the delay. Recording is never blocked.
+    state.startingTake = true;
+    updateTransport(); // the record button goes quiet while starting — a second tap must not start a second take
+    $('live-strip').style.display = 'flex';
+    $('record-hint').textContent = 'Getting ready…';
+    setMeter(0);
     // Overdubs: the active takes of the OTHER vocal tracks, so ad-libs
     // and harmonies record over the lead. Same anchor as the beat —
     // they travel the same Bluetooth path, so they need the same
@@ -400,6 +404,7 @@
         onBlock: function (batch) { setMeter(batch.peak); }
       });
     }).then(function (handle) {
+      state.startingTake = false;
       state.recording = {
         track: track,
         handle: handle,
@@ -410,12 +415,17 @@
       };
       acquireWakeLock();
       $('live-strip').style.display = 'flex';
-      $('record-hint').textContent = 'Recording — sing when the beat starts. Keep this page open.';
+      $('record-hint').textContent = state.beat
+        ? 'Recording — sing when the beat starts. Keep this page open.'
+        : 'Recording — sing whenever you are ready. Keep this page open.';
       setPlayhead(0);
       ensurePlayheadTimer();
       renderTracks();
       updateTransport();
     }).catch(function (err) {
+      state.startingTake = false;
+      $('live-strip').style.display = 'none';
+      $('record-hint').textContent = '';
       showError(err && err.message ? err.message : 'The take could not start. Try again.');
       renderTracks();
       updateTransport();
@@ -478,6 +488,7 @@
     var timerEl = $('record-timer');
     if (timerEl) timerEl.textContent = '';
     clearPlayheadTimer();
+    setPlayhead(0); // the take is done — back to the top, so Play hears it from the beginning
 
     var result = PS.audio.stopTake(rec.handle);
     var track = rec.track;
@@ -530,6 +541,15 @@
     }
     var trimSamples = Math.max(0, Math.min(baseTrimSamples + residual.trimSamples, result.samples.length));
     var alignedSamples = result.samples.subarray(trimSamples);
+    if (alignedSamples.length < Math.round(0.3 * sr)) {
+      // A tap-and-release (or a take sung entirely inside the
+      // lead-in) leaves nothing after the trim — do not save an
+      // empty take.
+      showError('Too short to save — tap record and sing a little longer.');
+      renderTracks();
+      updateTransport();
+      return;
+    }
 
     var vocal = state.session.tracks[track];
     var takeNumber = vocal.takes.length + 1;
@@ -634,8 +654,12 @@
       stopPlayback();
       if (wasPlaying === takeId) return;
     }
-    if (state.recording || state.calibrating || state.micTesting) return;
+    if (state.recording || state.calibrating) return;
     clearError();
+    // Generation: if another play starts (or the user stops) while
+    // this take is still loading, the stale chain must not start
+    // playing over it — or leave a take playing with no stop.
+    var gen = ++state.playGen;
     PS.db.getTake(takeId).then(function (record) {
       if (!record || !record.alignedWav) {
         showError('That take could not be found.');
@@ -648,8 +672,8 @@
         var playTakeBuffer = takeBuffer;
         var playBeatBuffer = state.beat ? state.beat.buffer : null;
         if (offset > 0.05) {
-          if (offset >= takeBuffer.duration) {
-            offset = 0; // past the take — start from the beginning
+          if (offset >= takeBuffer.duration - 0.5) {
+            offset = 0; // at (or nearly at) the end — start from the beginning, not a sliver of the tail
             setPlayhead(0);
           } else {
             playTakeBuffer = sliceBuffer(takeBuffer, offset);
@@ -659,8 +683,6 @@
             }
           }
         }
-        // playTake anchors its players at ctx.currentTime + 0.1.
-        state.playingStartCtx = PS.audio.currentTime() + 0.1;
         state.playingStartOffset = offset;
         return playTakeTuned(playTakeBuffer, playBeatBuffer, function () {
           state.playingStop = null;
@@ -670,8 +692,17 @@
           renderSheet();
           updateTransport();
         }).then(function (stopFn) {
+          if (gen !== state.playGen) {
+            // A newer play won — stop this one before it is heard.
+            if (stopFn) stopFn();
+            return;
+          }
           state.playingStop = stopFn;
           state.playingTakeId = takeId;
+          // Set the clock anchor HERE (the players were just created
+          // with anchor = currentTime + 0.1), not before the decode —
+          // the decode time used to push the playhead ahead.
+          state.playingStartCtx = PS.audio.currentTime() + 0.1;
           ensurePlayheadTimer();
           renderTracks();
           renderSheet();
@@ -685,6 +716,7 @@
   }
 
   function stopPlayback() {
+    state.playGen += 1; // cancel any play still loading
     if (state.playingStop) state.playingStop();
     state.playingStop = null;
     state.playingTakeId = null;
@@ -716,12 +748,15 @@
    */
   function playBeatOnly() {
     if (!state.beat) return;
+    if (state.recording || state.calibrating) return;
     clearError();
+    // Same generation rule as playTake: a stale chain aborts.
+    var gen = ++state.playGen;
     var offset = state.playheadSeconds;
     var beatBuffer = state.beat.buffer;
     if (offset > 0.05) {
-      if (offset >= beatBuffer.duration) {
-        offset = 0; // past the beat — start from the beginning
+      if (offset >= beatBuffer.duration - 0.5) {
+        offset = 0; // at (or nearly at) the end — start from the beginning, not a sliver of the tail
         setPlayhead(0);
       } else {
         beatBuffer = sliceBuffer(beatBuffer, offset);
@@ -730,6 +765,17 @@
     state.playingStartOffset = offset;
     PS.audio.ensureContext().then(function (ctx) {
       var anchor = ctx.currentTime + 0.1;
+      var player = ctx.createBufferSource();
+      player.buffer = beatBuffer;
+      player.connect(ctx.destination);
+      player.start(anchor);
+      if (gen !== state.playGen) {
+        // A newer play won — stop this one before it is heard
+        // (the anchor is 0.1 s out, so nothing has played yet).
+        try { player.stop(); } catch (e) { /* ignore */ }
+        try { player.disconnect(); } catch (e) { /* ignore */ }
+        return;
+      }
       state.playingStartCtx = anchor;
       var player = ctx.createBufferSource();
       player.buffer = beatBuffer;
@@ -823,84 +869,6 @@
     updateTransport();
   }
 
-  // ---------------------------------------------------------------- mic test
-
-  /* Records 10 seconds with no beat, so Jim can check the frequency
-   * content and prove which mic the phone used (phone mic = full
-   * range; Bluetooth headset mic = nothing above ~4 kHz).
-   */
-  function startMicTest() {
-    if (state.recording || state.calibrating || state.micTesting) return;
-    clearError();
-    state.micTesting = true;
-    renderMicTest();
-    updateTransport();
-    updateMonitor(); // the monitor would play the mic test back into itself
-    $('mic-status').textContent = 'Recording… talk or sing for 10 seconds.';
-    acquireWakeLock();
-    PS.audio.startCapture(null).then(function () {
-      return new Promise(function (resolve) { setTimeout(resolve, 10000); });
-    }).then(function () {
-      finishMicTest(false);
-    }).catch(function (err) {
-      state.micTesting = false;
-      $('mic-status').textContent = ''; // never leave "Recording…" showing after a failed start
-      releaseWakeLock();
-      renderMicTest();
-      updateTransport();
-      updateMonitor();
-      showError(err && err.message ? err.message : 'The mic test could not start.');
-    });
-  }
-
-  function finishMicTest(interrupted) {
-    if (!state.micTesting) return;
-    state.micTesting = false;
-    releaseWakeLock();
-    updateTransport();
-    updateMonitor();
-    var recorded = PS.audio.stopCapture();
-    var sr = PS.audio.sampleRate();
-    if (!recorded.samples || recorded.samples.length === 0) {
-      $('mic-status').textContent = 'Nothing was recorded.';
-      renderMicTest();
-      return;
-    }
-    var wavBlob = new Blob([PS.wav.encodeWavFloat32(recorded.samples, sr)], { type: 'audio/wav' });
-    PS.db.saveMisc('mic-test', {
-      wav: wavBlob,
-      sampleRate: sr,
-      recordedAt: new Date().toISOString(),
-      interrupted: !!interrupted
-    }).then(function () {
-      $('mic-status').textContent = interrupted
-        ? 'Stopped early — the page went to the background. What was recorded is saved; send it anyway or try again.'
-        : 'Done — 10 seconds saved. Send it to Jim so he can check which mic your phone used.';
-      renderMicTest();
-    }).catch(function () {
-      $('mic-status').textContent = 'Recorded, but could not be saved.';
-      renderMicTest();
-    });
-  }
-
-  function shareMicTest() {
-    PS.db.getMisc('mic-test').then(function (row) {
-      if (!row || !row.wav) {
-        showError('No mic test saved yet.');
-        return;
-      }
-      var file = new File([row.wav], 'mic-test.wav', { type: 'audio/wav' });
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        return navigator.share({ files: [file], title: 'Mic test' }).catch(function (err) {
-          if (err && err.name !== 'AbortError') throw err;
-        });
-      }
-      downloadBlob(row.wav, 'mic-test.wav');
-    }).catch(function () {
-      showError('Sharing failed. Try again.');
-    });
-  }
-
   // ---------------------------------------------------------------- live tune
 
   /* The live tune (Voloco's Hard Tune): YIN pitch detection -> hard
@@ -950,19 +918,26 @@
 
   /* The monitor branch: mic -> tune -> headphones, live. It runs
    * only when the toggle is on AND headphones are the output AND
-   * nothing else owns the mic (calibration / mic test — the monitor
-   * would loop the clicks back into the measurement).
+   * calibration is not running (the monitor would loop the clicks
+   * back into the measurement).
    */
   function monitorWanted() {
     return state.monitorOn &&
       PS.store.outputMode() === 'headphones' &&
-      !state.calibrating && !state.micTesting;
+      !state.calibrating;
   }
 
   function updateMonitor() {
     if (monitorWanted()) {
       if (state.monitor) return; // already running
-      ensureTuneModule().then(function (ctx) {
+      // The start runs on a 3-second timeout: after a calibration
+      // finishes (not a tap), the context resume can hang on iOS
+      // Safari, and a hang must become a visible error — never a
+      // toggle that says ON with no sound. (If the start resolves
+      // late, the monitorWanted guard below still refuses to build
+      // the branch, because the timeout already turned the toggle
+      // off.)
+      var startJob = ensureTuneModule().then(function (ctx) {
         return PS.audio.ensureMic().then(function (stream) {
           // The toggle may have flipped while the mic was opening.
           if (!monitorWanted() || state.monitor) return;
@@ -976,7 +951,8 @@
           state.monitor = { source: source, gain: gain, tune: tune };
           gain.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
         });
-      }).catch(function (err) {
+      });
+      withTimeout(startJob, 3000, 'Monitor start timed out.').catch(function (err) {
         console.warn('Monitor could not start:', err);
         state.monitorOn = false;
         updateTransport();
@@ -1036,7 +1012,19 @@
       takePlayer.buffer = takeBuffer;
       takePlayer.connect(tune);
       takePlayer.start(anchor);
-      if (onEnded) takePlayer.onended = onEnded;
+      if (onEnded) {
+        takePlayer.onended = function () {
+          // The take ended — the song is over. Stop the beat too
+          // (it outlasts every take) or it plays on with no stop
+          // button, then tell the UI playback is over.
+          players.forEach(function (p) {
+            if (p === takePlayer) return;
+            try { p.stop(); } catch (e) { /* ignore */ }
+            try { p.disconnect(); } catch (e) { /* ignore */ }
+          });
+          onEnded();
+        };
+      }
       players.push(takePlayer);
       if (beatBuffer) {
         var beatPlayer = ctx.createBufferSource();
@@ -1300,9 +1288,9 @@
   /* A press on a vocal row SELECTS it (selection happens on
    * pointerdown, not click — pointer capture would retarget the
    * click and break it, so no capture is used here). A press on the
-   * beat row with no beat opens the import picker. Otherwise the
-   * press starts a scrub (ignored while recording — the playhead
-   * is live then — and on buttons, which handle themselves).
+   * beat row with no beat opens the import picker. A press on the
+   * track's NAME only selects it — it does not move the playhead or
+   * stop playback. Scrubbing starts from the waveform lane.
    */
   function onTracksPointerDown(event) {
     if (event.target.closest('button')) return;
@@ -1317,6 +1305,7 @@
       } else {
         selectTrack(kind);
       }
+      if (event.target.closest('.row-label')) return;
     }
     if (state.recording) return;
     if (state.playingStop) stopPlayback();
@@ -1339,15 +1328,6 @@
     $('song-name').value = state.session.name;
     $('topbar-song-name').textContent = state.session.name;
     $('topbar-song-key').textContent = state.session.key;
-    var keySelect = $('song-key');
-    keySelect.innerHTML = '';
-    SONG_KEYS.forEach(function (key) {
-      var opt = document.createElement('option');
-      opt.value = key;
-      opt.textContent = key;
-      if (key === state.session.key) opt.selected = true;
-      keySelect.appendChild(opt);
-    });
     var sessionSelect = $('session-select');
     sessionSelect.innerHTML = '';
     state.sessions.forEach(function (s) {
@@ -1357,6 +1337,17 @@
       if (s.id === state.session.id) opt.selected = true;
       sessionSelect.appendChild(opt);
     });
+  }
+
+  /* The song key — set from the key picker (top bar). Retunes every
+   * live tune node at once (monitor + playback).
+   */
+  function setKey(key) {
+    if (SONG_KEYS.indexOf(key) === -1) return;
+    state.session.key = key;
+    saveSessions();
+    renderSession();
+    broadcastKey();
   }
 
   /* The beat row is built by renderTracks — this just re-renders. */
@@ -1394,6 +1385,7 @@
       var text = el('span', '', label + ' — ' + Math.round(cal.delayMs) + ' ms, measured ' + fmtTime(cal.date));
       var del = el('button', 'btn-small danger', 'Remove');
       del.addEventListener('click', function () {
+        if (!window.confirm('Remove the measurement for "' + label + '"?')) return;
         PS.store.deleteCalibration(label);
         state.calibrations = PS.store.loadCalibrations();
         renderCalibration();
@@ -1410,7 +1402,7 @@
       var active = activeCalibration();
       $('cal-status').textContent = active
         ? 'Using ' + active.label + ' — your voice will land in time.'
-        : 'Pick your headphones above, or measure a new pair.';
+        : 'Not measured yet.';
     }
   }
 
@@ -1554,22 +1546,38 @@
     });
   }
 
-  function renderMicTest() {
-    $('mic-btn').disabled = state.micTesting;
-    $('mic-btn').textContent = state.micTesting ? 'Recording…' : 'Check my mic (10 seconds)';
-    PS.db.getMisc('mic-test').then(function (row) {
-      $('mic-send').style.display = row && row.wav ? '' : 'none';
-      if (row && row.wav && !$('mic-status').textContent) {
-        $('mic-status').textContent = 'Last mic test: ' + fmtTime(row.recordedAt) + '.';
-      }
-    }).catch(function () { /* ignore */ });
+  // ---------------------------------------------------------------- key picker
+
+  /* The key, one tap from the studio screen: tap the key in the top
+   * bar, tap a key, done. (Voloco puts Key top-right on the effects
+   * screen; ours is in the top bar, always visible.)
+   */
+  function openKeySheet() {
+    renderKeySheet();
+    $('key-sheet').style.display = 'flex';
+  }
+
+  function closeKeySheet() {
+    $('key-sheet').style.display = 'none';
+  }
+
+  function renderKeySheet() {
+    var list = $('key-list');
+    list.innerHTML = '';
+    SONG_KEYS.forEach(function (key) {
+      var pill = el('button', 'key-pill' + (key === state.session.key ? ' current' : ''), key);
+      pill.addEventListener('click', function () {
+        setKey(key);
+        closeKeySheet();
+      });
+      list.appendChild(pill);
+    });
   }
 
   function renderAll() {
     renderSession();
     renderCalibration();
     renderTracks();
-    renderMicTest();
     $('wake-note').style.display = state.wakeLockSupported ? 'none' : '';
     updateTransport();
   }
@@ -1582,10 +1590,10 @@
     var share = $('transport-share');
     var rewind = $('transport-rewind');
     var phones = $('transport-headphones');
-    var busy = state.calibrating || state.micTesting;
+    var busy = state.calibrating;
     var playing = !!state.playingStop;
     var take = activeTakeOf(state.selectedTrack);
-    rec.disabled = busy;
+    rec.disabled = busy || state.startingTake;
     rec.classList.toggle('recording', !!state.recording);
     rec.setAttribute('aria-label', state.recording ? 'Stop' : 'Record');
     play.disabled = busy || !!state.recording || (!playing && !take && !state.beat);
@@ -1634,6 +1642,11 @@
     $('take-sheet').addEventListener('click', function (event) {
       if (event.target === $('take-sheet')) closeTakeSheet();
     });
+    $('topbar-key').addEventListener('click', openKeySheet);
+    $('key-sheet-close').addEventListener('click', closeKeySheet);
+    $('key-sheet').addEventListener('click', function (event) {
+      if (event.target === $('key-sheet')) closeKeySheet();
+    });
     var wrap = document.querySelector('.tracks-wrap');
     wrap.addEventListener('pointerdown', onTracksPointerDown);
     wrap.addEventListener('pointermove', onTracksPointerMove);
@@ -1646,12 +1659,6 @@
       state.session.name = $('song-name').value.trim() || 'New Song';
       saveSessions();
       renderSession();
-    });
-    $('song-key').addEventListener('change', function () {
-      state.session.key = $('song-key').value;
-      saveSessions();
-      renderSession();
-      broadcastKey();
     });
     $('session-select').addEventListener('change', function () {
       switchSession($('session-select').value);
@@ -1681,23 +1688,6 @@
       updateMonitor();
     });
     $('cal-measure').addEventListener('click', startCalibration);
-    $('cal-gate-measure').addEventListener('click', function () {
-      $('cal-gate').style.display = 'none';
-      showSetup();
-      $('cal-label').focus();
-    });
-    $('cal-gate-anyway').addEventListener('click', function () {
-      $('cal-gate').style.display = 'none';
-      var track = state.pendingTakeTrack;
-      state.pendingTakeTrack = null;
-      if (track) beginTake(track);
-    });
-    $('cal-gate-cancel').addEventListener('click', function () {
-      $('cal-gate').style.display = 'none';
-      state.pendingTakeTrack = null;
-    });
-    $('mic-btn').addEventListener('click', startMicTest);
-    $('mic-send').addEventListener('click', shareMicTest);
     $('error-dismiss').addEventListener('click', clearError);
 
     var resizeTimer = null;
@@ -1711,13 +1701,14 @@
   }
 
   function switchSession(id) {
-    if (state.recording || state.calibrating || state.micTesting) return;
+    if (state.recording || state.calibrating) return;
     stopPlayback();
     var session = state.sessions.find(function (s) { return s.id === id; });
     if (!session) return;
     state.session = session;
     PS.store.setCurrentSessionId(id);
     setPlayhead(0);
+    broadcastKey(); // the new song may be in a different key — retune the monitor + playback
     loadBeatForSession().then(function () {
       renderAll();
     });
