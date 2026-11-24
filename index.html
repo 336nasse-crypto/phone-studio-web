@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Phone Studio</title>
 <meta name="description" content="Record your vocals over a beat, in time, on your phone.">
-<meta name="theme-color" content="#0a0a12">
+<meta name="theme-color" content="#000000">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -16,111 +16,137 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-<main>
-  <header class="hero">
-    <p class="eyebrow">Your studio</p>
-    <h1>Phone Studio</h1>
-    <div class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-    <p id="record-hint" class="studio-status"></p>
-    <p class="hero-sub muted">Record your vocals over a beat, in time, on your phone.</p>
+<div id="studio-view" class="studio-view">
+  <header class="topbar">
+    <button id="setup-song" class="topbar-song" aria-label="Song settings">
+      <span id="topbar-song-name">New Song</span>
+      <span id="topbar-song-key" class="muted">D minor</span>
+    </button>
+    <button id="setup-open" class="icon-btn" aria-label="Setup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 1-1.82-.33 1.65 1.65 0 0 1-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09a1.65 1.65 0 0 1-1-1.51 1.65 1.65 0 0 1-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 1 .33-1.82 1.65 1.65 0 0 1-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09a1.65 1.65 0 0 1 1.51-1 1.65 1.65 0 0 1-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 1 1.82.33h.01a1.65 1.65 0 0 1 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 1 1 1.51h.01a1.65 1.65 0 0 1 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 1-.33 1.82v.01a1.65 1.65 0 0 1 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 1-1.51 1z"></path></svg></button>
   </header>
 
-  <div id="error-box" class="error-box" role="alert" style="display:none"></div>
-  <button id="error-dismiss" class="btn-small" style="display:none">Got it</button>
+  <div class="ruler"><span id="time-label">0:00</span></div>
 
-  <section class="song-bar" aria-label="Your song">
-    <label class="song-name-field">
-      <span class="eyebrow">Song</span>
-      <input id="song-name" type="text" value="New Song" autocomplete="off">
-    </label>
-    <div class="row song-controls">
-      <label class="field">
-        <span>Key</span>
-        <select id="song-key"></select>
+  <div class="tracks-wrap">
+    <div id="tracks" class="track-rows"></div>
+    <div id="playhead" class="playhead"></div>
+  </div>
+
+  <div id="live-strip" class="live-strip" style="display:none">
+    <span class="live-dot" aria-hidden="true">●</span>
+    <span id="record-timer" class="live-timer"></span>
+    <span id="record-hint" class="live-hint"></span>
+    <div class="meter"><div id="level-bar" class="meter-bar"></div></div>
+  </div>
+
+  <footer class="transport">
+    <button id="transport-headphones" class="t-btn" aria-label="Headphones on or off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg></button>
+    <button id="transport-rewind" class="t-btn" aria-label="Back to the start"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M11 18V6l-8.5 6L11 18zm9 0V6l-8.5 6L20 18z"></path></svg></button>
+    <button id="transport-record" class="btn-record" aria-label="Record">Record</button>
+    <button id="transport-play" class="t-btn" aria-label="Play"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"></path></svg></button>
+    <button id="transport-share" class="t-btn share" aria-label="Send the take"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16"></path><path d="M13 5l7 7-7 7"></path></svg></button>
+  </footer>
+</div>
+
+<div id="setup-view" class="setup-view" style="display:none">
+  <header class="topbar">
+    <button id="setup-back" class="icon-btn" aria-label="Back to the studio"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"></path><path d="M12 19l-7-7 7-7"></path></svg></button>
+    <span class="topbar-title">Setup</span>
+    <span class="topbar-spacer"></span>
+  </header>
+  <div class="setup-scroll">
+    <section class="card" id="song-section">
+      <p class="eyebrow">Song</p>
+      <label class="song-name-field">
+        <input id="song-name" type="text" value="New Song" autocomplete="off" aria-label="Song name">
       </label>
-      <label class="field">
-        <span>Open song</span>
-        <select id="session-select"></select>
-      </label>
-      <button id="new-song" class="btn">New song</button>
-    </div>
-  </section>
-
-  <section class="card" id="beat-card">
-    <div class="card-top">
-      <div>
-        <p class="eyebrow">Backing track</p>
-        <h2>Beat</h2>
+      <div class="row song-controls">
+        <label class="field">
+          <span>Key</span>
+          <select id="song-key"></select>
+        </label>
+        <label class="field">
+          <span>Open song</span>
+          <select id="session-select"></select>
+        </label>
+        <button id="new-song" class="btn">New song</button>
       </div>
-      <span class="card-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg></span>
-    </div>
-    <p id="beat-status" class="muted">No beat yet. Import one to record over it.</p>
-    <div class="row">
-      <button id="beat-pick" class="btn">Import a beat</button>
-      <button id="beat-remove" class="btn danger" style="display:none">Remove beat</button>
-    </div>
-    <input id="beat-file" type="file" accept="audio/*" hidden>
-  </section>
+    </section>
 
-  <section class="tracks-section" aria-label="Tracks">
-    <div class="section-head">
-      <div>
-        <p class="eyebrow">Vocals</p>
-        <h2>Tracks</h2>
+    <section class="card" id="headphones-section">
+      <p class="eyebrow">Setup</p>
+      <h2>Headphones</h2>
+      <div class="segmented">
+        <label class="radio"><input id="mode-headphones" type="radio" name="output-mode" value="headphones" checked> I&rsquo;m wearing headphones</label>
+        <label class="radio"><input id="mode-speaker" type="radio" name="output-mode" value="speaker"> No headphones — phone speaker</label>
       </div>
-      <p class="muted small">Tap the red button on a track to record over the beat.</p>
-    </div>
-    <div id="tracks"></div>
-  </section>
-
-  <details class="card warn-details" open>
-    <summary>Two things to know</summary>
-    <p><strong>Keep this page open and the screen on while you record.</strong>
-    If Safari goes to the background or the screen locks, the recording stops.
-    The app tries to keep the screen awake for you.</p>
-    <p id="wake-note" style="display:none"><strong>Your phone could not keep
-    the screen awake automatically</strong> — tap the screen now and then so it
-    does not lock during a take.</p>
-    <p><strong>Listen when you tap record.</strong> If the beat suddenly sounds
-    muddy and flat, your headphones dropped to phone-call mode and the
-    recording will sound bad. Stop the take, take the headphones off, switch
-    to “No headphones” below, and record with the phone speaker instead.</p>
-  </details>
-
-  <section class="card" id="calibration-card">
-    <div class="card-top">
-      <div>
-        <p class="eyebrow">Setup</p>
-        <h2>Headphones</h2>
+      <p id="speaker-note" class="muted" style="display:none">With the phone
+      speaker there is nothing to measure — the timing is handled from the
+      phone&rsquo;s own numbers, and the check after each take tidies up
+      what&rsquo;s left.</p>
+      <div id="headphones-box">
+        <p class="muted">Wireless headphones delay the sound a little. Measure
+        yours once, and the beat will play early by exactly that much — so you
+        hear it on time and your voice lands in time.</p>
+        <div id="cal-list"></div>
+        <label class="field">
+          <span>Name for these headphones</span>
+          <input id="cal-label" type="text" placeholder="my AirPods" autocomplete="off">
+        </label>
+        <button id="cal-measure" class="btn">Measure my headphones</button>
+        <p class="muted small">Put the headphones next to the phone — not on
+        your ears — turn the volume up, and keep them still. The app plays
+        5 clicks and times how long they take to come back.</p>
+        <p id="cal-status" class="status"></p>
       </div>
-      <span class="card-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg></span>
-    </div>
-    <div class="segmented">
-      <label class="radio"><input id="mode-headphones" type="radio" name="output-mode" value="headphones" checked> I&rsquo;m wearing headphones</label>
-      <label class="radio"><input id="mode-speaker" type="radio" name="output-mode" value="speaker"> No headphones — phone speaker</label>
-    </div>
-    <p id="speaker-note" class="muted" style="display:none">With the phone
-    speaker there is nothing to measure — the timing is handled from the
-    phone&rsquo;s own numbers, and the check after each take tidies up
-    what&rsquo;s left.</p>
-    <div id="headphones-box">
-      <p class="muted">Wireless headphones delay the sound a little. Measure
-      yours once, and the beat will play early by exactly that much — so you
-      hear it on time and your voice lands in time.</p>
-      <div id="cal-list"></div>
-      <label class="field">
-        <span>Name for these headphones</span>
-        <input id="cal-label" type="text" placeholder="my AirPods" autocomplete="off">
-      </label>
-      <button id="cal-measure" class="btn">Measure my headphones</button>
-      <p class="muted small">Put the headphones next to the phone — not on
-      your ears — turn the volume up, and keep them still. The app plays
-      5 clicks and times how long they take to come back.</p>
-      <p id="cal-status" class="status"></p>
-    </div>
-  </section>
+    </section>
 
-  <section class="card warning" id="cal-gate" style="display:none">
+    <section class="card" id="mic-section">
+      <p class="eyebrow">Sound check</p>
+      <h2>Check my mic</h2>
+      <p class="muted">Records 10 seconds with no beat, so Jim can check which
+      mic your phone used. If the phone mic is doing the work, the recording
+      sounds full and clear. If the headphones&rsquo; mic took over, it sounds
+      thin and muffled — and Jim will tell you.</p>
+      <div class="row">
+        <button id="mic-btn" class="btn">Check my mic (10 seconds)</button>
+        <button id="mic-send" class="btn" style="display:none">Send it to Jim</button>
+      </div>
+      <p id="mic-status" class="status"></p>
+    </section>
+
+    <section class="card warn">
+      <h2>Two things to know</h2>
+      <p><strong>Keep this page open and the screen on while you record.</strong>
+      If Safari goes to the background or the screen locks, the recording stops.
+      The app tries to keep the screen awake for you.</p>
+      <p id="wake-note" style="display:none"><strong>Your phone could not keep
+      the screen awake automatically</strong> — tap the screen now and then so it
+      does not lock during a take.</p>
+      <p><strong>Listen when you tap record.</strong> If the beat suddenly sounds
+      muddy and flat, your headphones dropped to phone-call mode and the
+      recording will sound bad. Stop the take, take the headphones off, switch
+      to “No headphones” above, and record with the phone speaker instead.</p>
+    </section>
+
+    <p class="muted small">Your takes stay on this phone until you send them. The app works
+    offline after the first load — add it to your home screen from the
+    share menu in Safari.</p>
+  </div>
+</div>
+
+<div id="take-sheet" class="sheet" style="display:none">
+  <div class="sheet-card">
+    <div class="sheet-head">
+      <h2 id="sheet-title">Takes</h2>
+      <button id="sheet-close" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <div id="sheet-list"></div>
+  </div>
+</div>
+
+<div id="cal-gate" class="modal" style="display:none">
+  <div class="modal-card">
     <h2>Headphones not measured yet</h2>
     <p>Your headphones aren&rsquo;t measured yet, so the timing won&rsquo;t be
     as tight on this take. Measure them first — it takes about 10 seconds —
@@ -130,42 +156,12 @@
       <button id="cal-gate-anyway" class="btn">Record anyway</button>
       <button id="cal-gate-cancel" class="btn">Never mind</button>
     </div>
-  </section>
+  </div>
+</div>
 
-  <section class="card" id="mic-card">
-    <div class="card-top">
-      <div>
-        <p class="eyebrow">Sound check</p>
-        <h2>Check my mic</h2>
-      </div>
-      <span class="card-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg></span>
-    </div>
-    <p class="muted">Records 10 seconds with no beat, so Jim can check which
-    mic your phone used. If the phone mic is doing the work, the recording
-    sounds full and clear. If the headphones&rsquo; mic took over, it sounds
-    thin and muffled — and Jim will tell you.</p>
-    <div class="row">
-      <button id="mic-btn" class="btn">Check my mic (10 seconds)</button>
-      <button id="mic-send" class="btn" style="display:none">Send it to Jim</button>
-    </div>
-    <p id="mic-status" class="status"></p>
-  </section>
+<div id="error-box" class="error-box" role="alert" style="display:none"><span id="error-text"></span><button id="error-dismiss" class="btn-small">Got it</button></div>
 
-  <footer class="muted small">
-    <p>Your takes stay on this phone until you send them. The app works
-    offline after the first load — add it to your home screen from the
-    share menu in Safari.</p>
-    <p>How it works, in one line: the app measures your headphones&rsquo;
-    delay once, plays the beat early by that much while you sing, then
-    checks the timing after every take and lines it up.</p>
-  </footer>
-</main>
-<nav class="tabbar" aria-label="Sections">
-  <a href="#tracks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg><span>Studio</span></a>
-  <a href="#beat-card"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg><span>Beat</span></a>
-  <a href="#calibration-card"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg><span>Setup</span></a>
-  <a href="#mic-card"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="4" y="9" width="3" height="6" rx="1.5"></rect><rect x="10.5" y="4" width="3" height="16" rx="1.5"></rect><rect x="17" y="7" width="3" height="10" rx="1.5"></rect></svg><span>Mic</span></a>
-</nav>
+<input id="beat-file" type="file" accept="audio/*" hidden>
 <script src="wav.js"></script>
 <script src="calibrate.js"></script>
 <script src="residual.js"></script>
