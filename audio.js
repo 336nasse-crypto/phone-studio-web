@@ -84,6 +84,24 @@
     });
   }
 
+  /* Creates the audio context for DECODING only — never resumes it
+   * and never loads the worklet. decodeAudioData is an offline
+   * operation: it works fine on a suspended context. On iOS Safari,
+   * ctx.resume() outside a tap returns a promise that never settles,
+   * which used to hang the beat import silently after the file
+   * picker closed (the tap that opened the picker is long gone by
+   * the time the file comes back — and the file picker's own tap is
+   * not a web-page gesture). Live paths (mic, record, play) still
+   * use ensureContext(), which resumes on a real tap.
+   */
+  function ensureDecodeContext() {
+    if (ctx) return Promise.resolve(ctx);
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return Promise.reject(new Error('This browser cannot do audio recording.'));
+    ctx = new AC();
+    return Promise.resolve(ctx);
+  }
+
   /* Opens the mic with raw-audio constraints (no echo cancellation,
    * no noise suppression, no automatic gain). Keeps the stream open
    * across takes so the user is asked once.
@@ -206,7 +224,7 @@
    * equivalent of BeatImporter converting to the engine rate.)
    */
   function decodeBeat(arrayBuffer) {
-    return ensureContext().then(function () {
+    return ensureDecodeContext().then(function () {
       return ctx.decodeAudioData(arrayBuffer);
     }).then(function (buffer) {
       var mono = new Float32Array(buffer.length);
@@ -220,7 +238,7 @@
   }
 
   function decodeAudio(arrayBuffer) {
-    return ensureContext().then(function () {
+    return ensureDecodeContext().then(function () {
       return ctx.decodeAudioData(arrayBuffer);
     });
   }
