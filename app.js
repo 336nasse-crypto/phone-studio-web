@@ -58,6 +58,7 @@
     sessions: [],
     session: null,
     beat: null, // { buffer, mono, duration, sampleRate, fileName, originalName, peaks }
+    beatLoading: false, // a beat file is being read + decoded (row shows "Loading…")
     calibrations: {},
     recording: null, // { track, handle, anchorTime, startWall, timer, interrupted }
     calibrating: false,
@@ -228,11 +229,23 @@
     });
   }
 
+  /* A promise that rejects if the given promise takes longer than ms.
+   * The beat import used to hang silently on iOS (see
+   * ensureDecodeContext in audio.js) — a hang must become an error
+   * the singer can see, never silence.
+   */
+  function withTimeout(promise, ms, message) {
+    return Promise.race([promise, new Promise(function (_, reject) {
+      setTimeout(function () { reject(new Error(message)); }, ms);
+    })]);
+  }
+
   function onBeatFilePicked(file) {
     if (!file) return;
     clearError();
+    state.beatLoading = true;
     renderTracks(); // the beat row shows "Loading…" while it decodes
-    file.arrayBuffer().then(function (buf) {
+    var importJob = file.arrayBuffer().then(function (buf) {
       return PS.audio.decodeBeat(buf);
     }).then(function (decoded) {
       return PS.db.saveBeat({
@@ -256,12 +269,20 @@
           originalName: file.name,
           peaks: null
         };
+        // A late success (after the timeout fired) still lands the
+        // beat and clears the error — the take is never lost.
+        clearError();
         setPlayhead(0);
         renderTracks();
       });
+    });
+    withTimeout(importJob, 30000, 'The beat took too long to load. Try tapping the Beat row again.').then(function () {
+      state.beatLoading = false;
+      renderTracks();
     }).catch(function (err) {
+      state.beatLoading = false;
       console.warn('Beat import failed:', err);
-      showError('That file could not be used as a beat. Try an MP3, M4A, or WAV file.');
+      showError(err && err.message && err.message.indexOf('too long') !== -1 ? err.message : 'That file could not be used as a beat. Try an MP3, M4A, or WAV file.');
       renderTracks();
     });
   }
@@ -1381,6 +1402,8 @@
     var beatSub;
     if (state.beat) {
       beatSub = state.beat.originalName + ' — ' + Math.round(state.beat.duration) + 's';
+    } else if (state.beatLoading) {
+      beatSub = 'Loading…';
     } else if (state.session.beatOriginalName) {
       beatSub = state.session.beatOriginalName + ' — loading…';
     } else {
