@@ -27,9 +27,36 @@
   var PS = window.PS;
   var $ = function (id) { return document.getElementById(id); };
 
-  var SONG_KEYS = ['C major', 'G major', 'D major', 'A major', 'E major',
-    'F major', 'Bb major', 'Eb major', 'A minor', 'E minor', 'B minor',
-    'F# minor', 'D minor', 'G minor', 'C minor', 'F minor'];
+  /* The key is a tonic (12 notes) + a scale (Major/Minor) — the
+   * picker shows them as two rows, and the song key is the two
+   * joined ('D minor'). The worklet parses the same string, so any
+   * of the 24 combinations works.
+   */
+  var TONICS = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+  var SCALES = ['major', 'minor'];
+  var TONIC_NAMES = { C: 1, 'C#': 1, D: 1, Eb: 1, E: 1, F: 1, 'F#': 1, G: 1, Ab: 1, A: 1, Bb: 1, B: 1 };
+
+  function parseKey(key) {
+    // 'D minor' -> { tonic: 'D', scale: 'minor' }. Unparseable -> D minor.
+    var m = /^\s*([A-G](?:#|b)?)\s+(major|minor)\s*$/i.exec(key || '');
+    if (!m) return { tonic: 'D', scale: 'minor' };
+    var tonic = m[1].charAt(0).toUpperCase() + m[1].slice(1);
+    if (!TONIC_NAMES[tonic]) return { tonic: 'D', scale: 'minor' };
+    return { tonic: tonic, scale: m[2].toLowerCase() };
+  }
+
+  /* The five starter presets (Voloco's Starter pack). The id goes
+   * to the worklet; the short label is what Denasse taps on the
+   * preset strip; the full label is the accessible name.
+   */
+  var PRESETS = [
+    { id: 'hard', short: 'Hard', label: 'Hard Tune' },
+    { id: 'natural', short: 'Natural', label: 'Natural Tune' },
+    { id: 'vocoder', short: 'Vocoder', label: 'Super Vocoder' },
+    { id: 'chorus', short: 'Chorus', label: 'Big Chorus' },
+    { id: 'clean', short: 'Clean', label: 'Clean' }
+  ];
+  var PRESET_IDS = PRESETS.map(function (p) { return p.id; });
 
   // Plain-words versions of the residual verdicts.
   var VERDICT_TEXT = {
@@ -176,6 +203,13 @@
 
   function loadSessions() {
     state.sessions = PS.store.loadSessions();
+    // Songs saved before step 2 have no preset/strength — backfill
+    // the defaults (Hard Tune, 100%) so the picker and the worklet
+    // always have something real to use.
+    state.sessions.forEach(function (s) {
+      if (PRESET_IDS.indexOf(s.preset) === -1) s.preset = 'hard';
+      if (typeof s.strength !== 'number' || s.strength < 0 || s.strength > 100) s.strength = 100;
+    });
     var currentId = PS.store.currentSessionId();
     state.session = state.sessions.find(function (s) { return s.id === currentId; }) || state.sessions[0];
     PS.store.setCurrentSessionId(state.session.id);
@@ -871,17 +905,20 @@
 
   // ---------------------------------------------------------------- live tune
 
-  /* The live tune (Voloco's Hard Tune): YIN pitch detection -> hard
-   * snap to the song key -> PSOLA shift, in an AudioWorklet
+  /* The live tune (Voloco's Starter presets): YIN pitch detection
+   * -> snap to the song key -> PSOLA shift, in an AudioWorklet
    * (tune-worklet.js — a port of the native app's live-tune
-   * prototype). ONE preset, 100% strength, at the song's key. The
-   * take stays DRY — the tune runs on the MONITOR (live, while
-   * singing) and on take PLAYBACK (the recorded take is tuned as it
-   * plays), never baked into the file.
+   * prototype). Five presets (Hard Tune, Natural Tune, Super
+   * Vocoder, Big Chorus, Clean) + a strength slider, at the song's
+   * key. The take stays DRY — the tune runs on the MONITOR (live,
+   * while singing) and on take PLAYBACK (the recorded take is tuned
+   * as it plays), never baked into the file.
    *
    * Two nodes share the processor: one for the live monitor branch,
    * one for playback. (Separate nodes so the live mic and a playing
-   * take never mix inside one detector.)
+   * take never mix inside one detector.) The monitor node runs in
+   * live mode — Big Chorus renders 4 voices there to save phone
+   * CPU; playback renders the full 7.
    */
   function ensureTuneModule() {
     if (state.tuneModuleReady) return PS.audio.ensureContext();
@@ -893,7 +930,7 @@
     });
   }
 
-  function makeTuneNode(ctx) {
+  function makeTuneNode(ctx, isLive) {
     var node = new AudioWorkletNode(ctx, 'tune-processor', {
       numberOfInputs: 1,
       numberOfOutputs: 1,
@@ -902,18 +939,26 @@
       outputChannelCount: [1]
     });
     node.port.postMessage({ type: 'key', key: state.session.key });
+    node.port.postMessage({ type: 'preset', preset: state.session.preset });
+    node.port.postMessage({ type: 'strength', value: state.session.strength });
+    node.port.postMessage({ type: 'live', on: !!isLive });
     node.port.postMessage({ type: 'enabled', on: true });
     return node;
   }
 
-  function broadcastKey() {
-    // The song key changed — retune every live tune node.
-    if (state.monitor && state.monitor.tune) {
-      state.monitor.tune.port.postMessage({ type: 'key', key: state.session.key });
-    }
-    if (state.playbackTune) {
-      state.playbackTune.port.postMessage({ type: 'key', key: state.session.key });
-    }
+  function broadcastTune() {
+    // The song key, preset, or strength changed — retune every live
+    // tune node (monitor + playback) so what he hears changes at
+    // once, even mid-playback.
+    var messages = [
+      { type: 'key', key: state.session.key },
+      { type: 'preset', preset: state.session.preset },
+      { type: 'strength', value: state.session.strength }
+    ];
+    [state.monitor && state.monitor.tune, state.playbackTune].forEach(function (node) {
+      if (!node) return;
+      messages.forEach(function (msg) { node.port.postMessage(msg); });
+    });
   }
 
   /* The monitor branch: mic -> tune -> headphones, live. It runs
@@ -944,7 +989,7 @@
           var source = ctx.createMediaStreamSource(stream);
           var gain = ctx.createGain();
           gain.gain.value = 0;
-          var tune = makeTuneNode(ctx);
+          var tune = makeTuneNode(ctx, true); // live mode: chorus renders 4 voices
           source.connect(gain);
           gain.connect(tune);
           tune.connect(ctx.destination);
@@ -989,22 +1034,25 @@
   }
 
   /* Plays the take (tuned) against the beat, both from the anchor.
-   * The take runs through the tune worklet so Denasse hears the Hard
-   * Tune on playback — the same sound as the live monitor. The beat
-   * goes straight to the output. (The tune adds ~8 ms to the vocal;
-   * that is inside the app's own 15 ms timing tolerance, so the beat
-   * is not delayed to match.) If the tune cannot start, the take
-   * plays dry and he is told — never silently wrong.
+   * The take runs through the tune worklet so Denasse hears the
+   * chosen preset on playback — the same sound as the live monitor.
+   * The beat goes straight to the output. (The tune adds ~8 ms to
+   * the vocal — the vocoder ~0 ms more, its carrier is real-time —
+   * that is inside the app's own 15 ms timing tolerance, so the
+   * beat is not delayed to match.) If the tune cannot start, the
+   * take plays dry and he is told — never silently wrong.
    */
   function playTakeTuned(takeBuffer, beatBuffer, onEnded) {
     return ensureTuneModule().then(function (ctx) {
       if (!state.playbackTune) {
-        state.playbackTune = makeTuneNode(ctx);
+        state.playbackTune = makeTuneNode(ctx, false); // full 7-voice chorus on playback
         state.playbackTune.connect(ctx.destination);
       }
       var tune = state.playbackTune;
       tune.port.postMessage({ type: 'reset' });
       tune.port.postMessage({ type: 'key', key: state.session.key });
+      tune.port.postMessage({ type: 'preset', preset: state.session.preset });
+      tune.port.postMessage({ type: 'strength', value: state.session.strength });
       tune.port.postMessage({ type: 'enabled', on: true });
       var anchor = PS.audio.currentTime() + 0.1;
       var players = [];
@@ -1343,11 +1391,12 @@
    * live tune node at once (monitor + playback).
    */
   function setKey(key) {
-    if (SONG_KEYS.indexOf(key) === -1) return;
-    state.session.key = key;
+    var parsed = parseKey(key);
+    var composed = parsed.tonic + ' ' + parsed.scale;
+    state.session.key = composed;
     saveSessions();
     renderSession();
-    broadcastKey();
+    broadcastTune();
   }
 
   /* The beat row is built by renderTracks — this just re-renders. */
@@ -1562,22 +1611,79 @@
   }
 
   function renderKeySheet() {
-    var list = $('key-list');
-    list.innerHTML = '';
-    SONG_KEYS.forEach(function (key) {
-      var pill = el('button', 'key-pill' + (key === state.session.key ? ' current' : ''), key);
+    var parsed = parseKey(state.session.key);
+    var tonicList = $('tonic-list');
+    tonicList.innerHTML = '';
+    TONICS.forEach(function (tonic) {
+      var pill = el('button', 'key-pill' + (tonic === parsed.tonic ? ' current' : ''), tonic);
       pill.addEventListener('click', function () {
-        setKey(key);
-        closeKeySheet();
+        setKey(tonic + ' ' + parsed.scale);
+        renderKeySheet(); // stays open — he may want to change the scale too
       });
-      list.appendChild(pill);
+      tonicList.appendChild(pill);
     });
+    var scaleList = $('scale-list');
+    scaleList.innerHTML = '';
+    SCALES.forEach(function (scale) {
+      var label = scale.charAt(0).toUpperCase() + scale.slice(1);
+      var pill = el('button', 'key-pill' + (scale === parsed.scale ? ' current' : ''), label);
+      pill.addEventListener('click', function () {
+        setKey(parsed.tonic + ' ' + scale);
+        renderKeySheet();
+      });
+      scaleList.appendChild(pill);
+    });
+  }
+
+  // ---------------------------------------------------------------- preset strip
+
+  /* The preset picker + strength slider on the record screen: five
+   * pills (Hard, Natural, Vocoder, Chorus, Clean) and a 0-100
+   * slider. Tapping a pill switches the sound at once — even
+   * mid-playback (broadcastTune retunes the live nodes) — and the
+   * choice is saved with the song. Clean ignores strength (nothing
+   * to correct), so the slider greys out on Clean.
+   */
+  function renderPresetStrip() {
+    var pills = $('preset-pills');
+    pills.innerHTML = '';
+    PRESETS.forEach(function (preset) {
+      var pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = 'preset-pill' + (state.session.preset === preset.id ? ' current' : '');
+      pill.textContent = preset.short;
+      pill.setAttribute('aria-label', preset.label);
+      pill.setAttribute('aria-pressed', state.session.preset === preset.id ? 'true' : 'false');
+      pill.addEventListener('click', function () { setPreset(preset.id); });
+      pills.appendChild(pill);
+    });
+    var slider = $('strength-slider');
+    slider.value = String(state.session.strength);
+    slider.disabled = state.session.preset === 'clean';
+    $('strength-value').textContent = state.session.strength + '%';
+  }
+
+  function setPreset(id) {
+    if (PRESET_IDS.indexOf(id) === -1) return;
+    if (state.session.preset === id) return;
+    state.session.preset = id;
+    saveSessions();
+    broadcastTune();
+    renderPresetStrip();
+  }
+
+  function setStrength(value) {
+    var v = Math.max(0, Math.min(100, Math.round(value)));
+    state.session.strength = v;
+    $('strength-value').textContent = v + '%';
+    broadcastTune();
   }
 
   function renderAll() {
     renderSession();
     renderCalibration();
     renderTracks();
+    renderPresetStrip();
     $('wake-note').style.display = state.wakeLockSupported ? 'none' : '';
     updateTransport();
   }
@@ -1638,6 +1744,15 @@
     });
     $('transport-share').addEventListener('click', shareSelected);
     $('transport-headphones').addEventListener('click', toggleMonitor);
+    // Strength slider: live while dragging (he hears it change),
+    // saved when he lets go.
+    $('strength-slider').addEventListener('input', function () {
+      setStrength(Number(this.value));
+    });
+    $('strength-slider').addEventListener('change', function () {
+      setStrength(Number(this.value));
+      saveSessions();
+    });
     $('sheet-close').addEventListener('click', closeTakeSheet);
     $('take-sheet').addEventListener('click', function (event) {
       if (event.target === $('take-sheet')) closeTakeSheet();
@@ -1708,7 +1823,7 @@
     state.session = session;
     PS.store.setCurrentSessionId(id);
     setPlayhead(0);
-    broadcastKey(); // the new song may be in a different key — retune the monitor + playback
+    broadcastTune(); // the new song may be in a different key, preset, or strength — retune the monitor + playback
     loadBeatForSession().then(function () {
       renderAll();
     });
