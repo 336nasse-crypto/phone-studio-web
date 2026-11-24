@@ -67,15 +67,22 @@
    * suspended. Loads the worklet module once.
    */
   function ensureContext() {
+    // The worklet module must load whenever it has not loaded yet —
+    // even if the context already exists. (The decode path creates
+    // the context without the worklet; the old code returned early
+    // on an existing context and the worklet never loaded, so every
+    // record / mic-test / calibration failed with "No
+    // ScriptProcessor was registered with this name".)
+    var ready;
     if (ctx) {
-      if (ctx.state === 'suspended') return ctx.resume().then(function () { return ctx; });
-      return Promise.resolve(ctx);
+      ready = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
+    } else {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return Promise.reject(new Error('This browser cannot do audio recording.'));
+      ctx = new AC();
+      ready = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
     }
-    var AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return Promise.reject(new Error('This browser cannot do audio recording.'));
-    ctx = new AC();
-    var resume = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
-    return resume.then(function () {
+    return ready.then(function () {
       if (workletReady) return ctx;
       return ctx.audioWorklet.addModule('worklet.js').then(function () {
         workletReady = true;
@@ -129,14 +136,24 @@
       return ensureMic();
     }).then(function () {
       if (!sourceNode) {
-        sourceNode = ctx.createMediaStreamSource(stream);
-        workletNode = new AudioWorkletNode(ctx, 'recorder-processor', {
-          numberOfInputs: 1,
-          numberOfOutputs: 0,
-          channelCount: 1
-        });
-        workletNode.port.onmessage = onWorkletMessage;
-        sourceNode.connect(workletNode);
+        try {
+          sourceNode = ctx.createMediaStreamSource(stream);
+          workletNode = new AudioWorkletNode(ctx, 'recorder-processor', {
+            numberOfInputs: 1,
+            numberOfOutputs: 0,
+            channelCount: 1
+          });
+          workletNode.port.onmessage = onWorkletMessage;
+          sourceNode.connect(workletNode);
+        } catch (err) {
+          // A failed graph build must not leave a half-built graph
+          // behind (source set, worklet null) — the next attempt
+          // would skip the build and crash on workletNode.port.
+          // Reset both so the next attempt retries from scratch.
+          sourceNode = null;
+          workletNode = null;
+          throw err;
+        }
       }
       return ctx;
     });
@@ -165,8 +182,16 @@
   function startCapture(onBlock) {
     return ensureGraph().then(function () {
       if (capture) return Promise.reject(new Error('A recording is already running.'));
+      if (!workletNode) return Promise.reject(new Error('The recorder could not start. Close the app and open it again.'));
       capture = { blocks: [], firstTime: null, totalFrames: 0, onBlock: onBlock || null, waiters: [] };
-      workletNode.port.postMessage({ type: 'start' });
+      try {
+        workletNode.port.postMessage({ type: 'start' });
+      } catch (err) {
+        // Never leave a half-started capture behind — it blocks
+        // every later attempt with "already running".
+        capture = null;
+        throw err;
+      }
       return new Promise(function (resolve, reject) {
         var done = false;
         var timer = setTimeout(function () {
