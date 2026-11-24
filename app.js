@@ -274,16 +274,19 @@
         clearError();
         setPlayhead(0);
         renderTracks();
+        updateTransport();
       });
     });
     withTimeout(importJob, 30000, 'The beat took too long to load. Try tapping the Beat row again.').then(function () {
       state.beatLoading = false;
       renderTracks();
+      updateTransport(); // the beat arriving enables Play
     }).catch(function (err) {
       state.beatLoading = false;
       console.warn('Beat import failed:', err);
       showError(err && err.message && err.message.indexOf('too long') !== -1 ? err.message : 'That file could not be used as a beat. Try an MP3, M4A, or WAV file.');
       renderTracks();
+      updateTransport();
     });
   }
 
@@ -297,6 +300,7 @@
     saveSessions();
     setPlayhead(0);
     renderTracks();
+    updateTransport(); // no beat and no take — Play goes back off
   }
 
   // ---------------------------------------------------------------- calibration
@@ -696,8 +700,60 @@
       return;
     }
     var take = activeTakeOf(state.selectedTrack);
-    if (!take) return;
-    playTake(take.id);
+    if (take) {
+      playTake(take.id);
+      return;
+    }
+    // No take yet — play the beat alone, from the playhead, so the
+    // singer can hear it and rehearse before recording.
+    if (state.beat) playBeatOnly();
+  }
+
+  /* Plays just the beat (no take to tune — the beat plays dry).
+   * The transport Play button used to do nothing at all before the
+   * first take (it was even disabled); the beat is the song, so it
+   * plays on its own.
+   */
+  function playBeatOnly() {
+    if (!state.beat) return;
+    clearError();
+    var offset = state.playheadSeconds;
+    var beatBuffer = state.beat.buffer;
+    if (offset > 0.05) {
+      if (offset >= beatBuffer.duration) {
+        offset = 0; // past the beat — start from the beginning
+        setPlayhead(0);
+      } else {
+        beatBuffer = sliceBuffer(beatBuffer, offset);
+      }
+    }
+    state.playingStartOffset = offset;
+    PS.audio.ensureContext().then(function (ctx) {
+      var anchor = ctx.currentTime + 0.1;
+      state.playingStartCtx = anchor;
+      var player = ctx.createBufferSource();
+      player.buffer = beatBuffer;
+      player.connect(ctx.destination);
+      player.start(anchor);
+      player.onended = function () {
+        state.playingStop = null;
+        state.playingTakeId = null;
+        clearPlayheadTimer();
+        renderTracks();
+        updateTransport();
+      };
+      state.playingStop = function () {
+        try { player.onended = null; player.stop(); } catch (e) { /* ignore */ }
+        try { player.disconnect(); } catch (e) { /* ignore */ }
+      };
+      state.playingTakeId = 'beat-only';
+      ensurePlayheadTimer();
+      renderTracks();
+      updateTransport();
+    }).catch(function (err) {
+      console.warn('Beat playback failed:', err);
+      showError('The beat could not be played.');
+    });
   }
 
   // ---------------------------------------------------------------- share / export
@@ -788,6 +844,7 @@
       finishMicTest(false);
     }).catch(function (err) {
       state.micTesting = false;
+      $('mic-status').textContent = ''; // never leave "Recording…" showing after a failed start
       releaseWakeLock();
       renderMicTest();
       updateTransport();
@@ -1305,6 +1362,7 @@
   /* The beat row is built by renderTracks — this just re-renders. */
   function renderBeat() {
     renderTracks();
+    updateTransport(); // the beat arriving (or leaving) changes what Play can do
   }
 
   function renderCalibration() {
@@ -1530,7 +1588,7 @@
     rec.disabled = busy;
     rec.classList.toggle('recording', !!state.recording);
     rec.setAttribute('aria-label', state.recording ? 'Stop' : 'Record');
-    play.disabled = busy || !!state.recording || (!playing && !take);
+    play.disabled = busy || !!state.recording || (!playing && !take && !state.beat);
     play.innerHTML = playing ? STOP_SVG : PLAY_SVG;
     play.setAttribute('aria-label', playing ? 'Stop' : 'Play');
     share.disabled = !take;
