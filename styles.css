@@ -250,12 +250,81 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   pointer-events: none;
 }
 
+/* ------------------------------------------------------------ preset strip */
+/* The voice-sound picker + strength slider, between the tracks and
+ * the transport. Fixed height — the track rows shrink to make
+ * room, the screen never scrolls. */
+.preset-strip {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+  background: #000;
+}
+.preset-pills {
+  display: flex;
+  gap: 6px;
+}
+.preset-pill {
+  flex: 1 1 0;
+  min-width: 0;
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  padding: 8px 2px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.preset-pill:active { background: var(--card2); color: var(--text); }
+.preset-pill.current {
+  background: var(--purple-soft);
+  border-color: var(--purple);
+  color: var(--text);
+}
+.strength-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.strength-row label {
+  flex: 0 0 auto;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.strength-row input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  accent-color: var(--purple);
+  height: 28px;
+  margin: 0;
+  cursor: pointer;
+}
+.strength-row input[type="range"]:disabled {
+  opacity: .4;
+  cursor: default;
+}
+#strength-value {
+  flex: 0 0 44px;
+  text-align: right;
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
 /* --------------------------------------------------------------- live strip */
 .live-strip {
   position: absolute;
   left: 10px;
   right: 10px;
-  bottom: calc(112px + env(safe-area-inset-bottom));
+  bottom: calc(196px + env(safe-area-inset-bottom));
   z-index: 20;
   background: rgba(10, 10, 16, .92);
   border: 1px solid var(--line);
@@ -560,6 +629,18 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
   gap: 8px;
   padding: 8px 0 4px;
 }
+/* Key picker: 12 tonics in two rows of six, then Major/Minor. */
+.tonic-grid { grid-template-columns: repeat(6, 1fr); }
+.scale-grid { grid-template-columns: repeat(2, 1fr); }
+.key-section-label {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--purple);
+  margin: 12px 0 0;
+}
+.key-section-label:first-of-type { margin-top: 4px; }
 .key-pill {
   background: var(--bg-soft);
   border: 1px solid var(--line);
