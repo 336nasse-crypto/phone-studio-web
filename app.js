@@ -1,12 +1,24 @@
-/* app.js — Phone Studio PWA: UI, take flow, calibration, export.
+/* app.js — Phone Studio PWA: one-screen studio UI, take flow,
+ * calibration, export, real waveforms.
  *
- * The take flow ports AudioEngineManager.beginTake/finishTake:
- * record raw PCM over the beat (pre-compensated when a calibration
- * exists), trim lead-in (only) or lead-in + delay, run the residual
- * check, save raw + aligned WAVs + a metadata JSON sidecar.
+ * ONE SCREEN: the whole studio fits in one phone screen (100dvh) —
+ * no scrolling on the main view. Tracks are slim rows with real
+ * waveforms drawn from the actual audio (canvas); the beat is the
+ * bottom row, on the same timeline. One shared playhead, one big
+ * red record button in the transport (it records the SELECTED
+ * track). Setup (song, headphones, mic check) lives behind the
+ * gear. Takes are managed from a bottom sheet (the ··· on a row).
  *
- * Plain words everywhere — Denasse is not a coder. No jargon in the
- * UI: "Measure my headphones", "Send", "Lined up".
+ * The ENGINE is untouched: the take flow ports
+ * AudioEngineManager.beginTake/finishTake (record raw PCM over the
+ * beat, pre-compensated when a calibration exists, trim lead-in
+ * (only) or lead-in + delay, run the residual check, save raw +
+ * aligned WAVs + a metadata JSON sidecar). All engine calls go
+ * through PS.audio / PS.db / PS.store / PS.wav / PS.residual
+ * exactly as before — this file only changes the UI around them.
+ *
+ * Plain words everywhere — Denasse is not a coder. No jargon in
+ * the UI: "Measure my headphones", "Send", "Lined up".
  */
 (function () {
   'use strict';
@@ -30,19 +42,42 @@
     'read-failed': 'Could not read the take to check the timing.'
   };
 
+  // Waveform peaks are cached at this fixed resolution per take/beat
+  // (4 KB per take) and downsampled to the lane width when drawn —
+  // so a resize never re-decodes audio.
+  var PEAK_BUCKETS = 1000;
+  var WAVE_CACHE_MAX = 20;
+  var MIN_TIMELINE_SECONDS = 30;
+
+  var PLAY_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"></path></svg>';
+  var STOP_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>';
+  var MIC_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>';
+  var NOTE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>';
+
   var state = {
     sessions: [],
     session: null,
-    beat: null, // { buffer, mono, duration, sampleRate, fileName, originalName }
+    beat: null, // { buffer, mono, duration, sampleRate, fileName, originalName, peaks }
     calibrations: {},
-    recording: null, // { track, handle, startWall, timer, interrupted }
+    recording: null, // { track, handle, anchorTime, startWall, timer, interrupted }
     calibrating: false,
     pendingTakeTrack: null,
     playingStop: null,
     playingTakeId: null,
+    playingStartCtx: 0,
+    playingStartOffset: 0,
+    playheadTimer: null,
     micTesting: false,
     wakeLock: null,
-    wakeLockSupported: ('wakeLock' in navigator)
+    wakeLockSupported: ('wakeLock' in navigator),
+    selectedTrack: 'lead',
+    playheadSeconds: 0,
+    timelineSeconds: MIN_TIMELINE_SECONDS,
+    waveCache: {}, // takeId -> { peaks, duration } (peaks: Float32Array, PEAK_BUCKETS)
+    waveCacheOrder: [],
+    sheetTrack: null,
+    sliceCtx: null,
+    scrubbing: false
   };
 
   // ---------------------------------------------------------------- helpers
@@ -55,22 +90,18 @@
   }
 
   function showError(message) {
-    var box = $('error-box');
-    box.textContent = message;
-    box.style.display = 'block';
-    $('error-dismiss').style.display = '';
-    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    $('error-text').textContent = message;
+    $('error-box').style.display = 'flex';
   }
 
   function clearError() {
-    var box = $('error-box');
-    box.textContent = '';
-    box.style.display = 'none';
-    $('error-dismiss').style.display = 'none';
+    $('error-text').textContent = '';
+    $('error-box').style.display = 'none';
   }
 
-  function fmtMs(seconds) {
-    return Math.round(seconds * 1000) + ' ms';
+  function fmtClock(seconds) {
+    var s = Math.max(0, Math.floor(seconds || 0));
+    return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2);
   }
 
   function fmtTime(dateIso) {
@@ -150,6 +181,16 @@
     return cal ? { label: label, calibration: cal } : null;
   }
 
+  function activeTakeOf(kind) {
+    var vocal = state.session.tracks[kind];
+    if (!vocal || !vocal.takes.length) return null;
+    if (vocal.activeTakeId) {
+      var found = vocal.takes.find(function (t) { return t.id === vocal.activeTakeId; });
+      if (found) return found;
+    }
+    return vocal.takes[vocal.takes.length - 1];
+  }
+
   // ---------------------------------------------------------------- beat
 
   function loadBeatForSession() {
@@ -166,7 +207,8 @@
           duration: decoded.duration,
           sampleRate: decoded.sampleRate,
           fileName: state.session.beatFileName,
-          originalName: state.session.beatOriginalName
+          originalName: state.session.beatOriginalName,
+          peaks: null
         };
       });
     }).catch(function (err) {
@@ -178,8 +220,7 @@
   function onBeatFilePicked(file) {
     if (!file) return;
     clearError();
-    var status = $('beat-status');
-    status.textContent = 'Loading the beat…';
+    renderTracks(); // the beat row shows "Loading…" while it decodes
     file.arrayBuffer().then(function (buf) {
       return PS.audio.decodeBeat(buf);
     }).then(function (decoded) {
@@ -201,25 +242,29 @@
           duration: decoded.duration,
           sampleRate: decoded.sampleRate,
           fileName: state.session.beatFileName,
-          originalName: file.name
+          originalName: file.name,
+          peaks: null
         };
-        renderBeat();
+        setPlayhead(0);
+        renderTracks();
       });
     }).catch(function (err) {
       console.warn('Beat import failed:', err);
-      status.textContent = '';
       showError('That file could not be used as a beat. Try an MP3, M4A, or WAV file.');
+      renderTracks();
     });
   }
 
   function removeBeat() {
+    if (!window.confirm('Remove the beat from this song? Your takes stay.')) return;
     PS.db.deleteBeat(state.session.id).catch(function () { /* ignore */ });
     state.session.beatFileName = null;
     state.session.beatOriginalName = null;
     state.session.beatDuration = null;
     state.beat = null;
     saveSessions();
-    renderBeat();
+    setPlayhead(0);
+    renderTracks();
   }
 
   // ---------------------------------------------------------------- calibration
@@ -234,6 +279,7 @@
     clearError();
     state.calibrating = true;
     renderCalibration();
+    updateTransport();
     acquireWakeLock();
     $('cal-status').textContent = 'Getting the mic ready…';
     PS.audio.runCalibration(function (text) {
@@ -241,6 +287,7 @@
     }).then(function (result) {
       state.calibrating = false;
       releaseWakeLock();
+      updateTransport();
       if (!result.ok) {
         $('cal-status').textContent = result.error;
         renderCalibration();
@@ -265,11 +312,13 @@
       if (state.pendingTakeTrack) {
         var track = state.pendingTakeTrack;
         state.pendingTakeTrack = null;
+        showStudio();
         beginTake(track);
       }
     }).catch(function (err) {
       state.calibrating = false;
       releaseWakeLock();
+      updateTransport();
       $('cal-status').textContent = '';
       renderCalibration();
       showError(err && err.message ? err.message : 'The measurement failed. Try again.');
@@ -286,8 +335,7 @@
     // Recording is never blocked.
     if (PS.store.outputMode() === 'headphones' && !activeCalibration()) {
       state.pendingTakeTrack = track;
-      $('cal-gate').style.display = 'block';
-      $('cal-gate').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      $('cal-gate').style.display = 'flex';
       return;
     }
     beginTake(track);
@@ -316,16 +364,22 @@
       state.recording = {
         track: track,
         handle: handle,
+        anchorTime: handle.anchorTime,
         startWall: Date.now(),
         interrupted: false,
         timer: setInterval(updateRecordTimer, 100)
       };
       acquireWakeLock();
-      renderTracks();
+      $('live-strip').style.display = 'flex';
       $('record-hint').textContent = 'Recording — sing when the beat starts. Keep this page open.';
+      setPlayhead(0);
+      ensurePlayheadTimer();
+      renderTracks();
+      updateTransport();
     }).catch(function (err) {
       showError(err && err.message ? err.message : 'The take could not start. Try again.');
       renderTracks();
+      updateTransport();
     });
   }
 
@@ -381,8 +435,10 @@
     releaseWakeLock();
     setMeter(0);
     $('record-hint').textContent = '';
+    $('live-strip').style.display = 'none';
     var timerEl = $('record-timer');
     if (timerEl) timerEl.textContent = '';
+    clearPlayheadTimer();
 
     var result = PS.audio.stopTake(rec.handle);
     var track = rec.track;
@@ -390,6 +446,7 @@
     if (!result.samples || result.samples.length === 0 || result.firstSampleTime === null) {
       showError('Nothing was recorded — the mic did not pick up any sound.');
       renderTracks();
+      updateTransport();
       return;
     }
 
@@ -438,11 +495,13 @@
     var vocal = state.session.tracks[track];
     var takeNumber = vocal.takes.length + 1;
     var baseName = 'take-' + takeNumber;
+    var durationSeconds = alignedSamples.length / sr;
     var metadata = {
       trackKind: track,
       rawFileName: baseName + '-raw.wav',
       alignedFileName: baseName + '.wav',
       sampleRate: sr,
+      durationSeconds: durationSeconds,
       leadInSamples: leadInSamples,
       delaySamples: delaySamples,
       delayMilliseconds: delaySamples / sr * 1000,
@@ -476,6 +535,7 @@
       recordedAt: metadata.recordedAt,
       calibrated: calibrated,
       delayMilliseconds: metadata.delayMilliseconds,
+      durationSeconds: durationSeconds,
       residualVerdict: residual.verdict
     };
 
@@ -493,24 +553,49 @@
       vocal.activeTakeId = takeId;
       saveSessions();
       renderTracks();
+      renderSheet();
+      updateTransport();
     }).catch(function (err) {
       console.warn('Take save failed:', err);
       showError('The take recorded but could not be saved — the phone may be out of space for this site.');
       renderTracks();
+      updateTransport();
     });
   }
 
   // ---------------------------------------------------------------- playback
 
+  /* Plays one take against the beat from the PLAYHEAD position.
+   * The engine's playTake always starts its buffers at 0, so this
+   * slices both buffers from the playhead offset first (stereo kept:
+   * the slice is built channel by channel at the buffer's own
+   * sample rate, on a scratch context used only for creating
+   * buffers — no audio ever plays through it). If the playhead is
+   * past the take, playback starts from 0 instead.
+   */
+  function sliceBuffer(buffer, startSeconds) {
+    var sr = buffer.sampleRate;
+    var startSample = Math.min(Math.floor(startSeconds * sr), buffer.length);
+    var len = buffer.length - startSample;
+    if (len <= 0) return null;
+    if (!state.sliceCtx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      state.sliceCtx = new AC();
+    }
+    var out = state.sliceCtx.createBuffer(buffer.numberOfChannels, len, sr);
+    for (var ch = 0; ch < buffer.numberOfChannels; ch++) {
+      out.getChannelData(ch).set(buffer.getChannelData(ch).subarray(startSample));
+    }
+    return out;
+  }
+
   function playTake(takeId) {
     if (state.playingStop) {
       var wasPlaying = state.playingTakeId;
-      state.playingStop();
-      state.playingStop = null;
-      state.playingTakeId = null;
-      renderTracks();
+      stopPlayback();
       if (wasPlaying === takeId) return;
     }
+    if (state.recording || state.calibrating || state.micTesting) return;
     clearError();
     PS.db.getTake(takeId).then(function (record) {
       if (!record || !record.alignedWav) {
@@ -520,15 +605,39 @@
       return record.alignedWav.arrayBuffer().then(function (buf) {
         return PS.audio.decodeAudio(buf);
       }).then(function (takeBuffer) {
-        return PS.audio.playTake(takeBuffer, state.beat ? state.beat.buffer : null, function () {
+        var offset = state.playheadSeconds;
+        var playTakeBuffer = takeBuffer;
+        var playBeatBuffer = state.beat ? state.beat.buffer : null;
+        if (offset > 0.05) {
+          if (offset >= takeBuffer.duration) {
+            offset = 0; // past the take — start from the beginning
+            setPlayhead(0);
+          } else {
+            playTakeBuffer = sliceBuffer(takeBuffer, offset);
+            if (playBeatBuffer) {
+              playBeatBuffer = offset >= playBeatBuffer.duration
+                ? null : sliceBuffer(playBeatBuffer, offset);
+            }
+          }
+        }
+        // playTake anchors its players at ctx.currentTime + 0.1.
+        state.playingStartCtx = PS.audio.currentTime() + 0.1;
+        state.playingStartOffset = offset;
+        return PS.audio.playTake(playTakeBuffer, playBeatBuffer, function () {
           state.playingStop = null;
           state.playingTakeId = null;
+          clearPlayheadTimer();
           renderTracks();
+          renderSheet();
+          updateTransport();
+        }).then(function (stopFn) {
+          state.playingStop = stopFn;
+          state.playingTakeId = takeId;
+          ensurePlayheadTimer();
+          renderTracks();
+          renderSheet();
+          updateTransport();
         });
-      }).then(function (stopFn) {
-        state.playingStop = stopFn;
-        state.playingTakeId = takeId;
-        renderTracks();
       });
     }).catch(function (err) {
       console.warn('Playback failed:', err);
@@ -540,7 +649,20 @@
     if (state.playingStop) state.playingStop();
     state.playingStop = null;
     state.playingTakeId = null;
+    clearPlayheadTimer();
     renderTracks();
+    renderSheet();
+    updateTransport();
+  }
+
+  function playSelected() {
+    if (state.playingStop) {
+      stopPlayback();
+      return;
+    }
+    var take = activeTakeOf(state.selectedTrack);
+    if (!take) return;
+    playTake(take.id);
   }
 
   // ---------------------------------------------------------------- share / export
@@ -572,6 +694,12 @@
     });
   }
 
+  function shareSelected() {
+    var take = activeTakeOf(state.selectedTrack);
+    if (!take) return;
+    shareTake(take.id);
+  }
+
   function downloadRawTake(takeId) {
     PS.db.getTake(takeId).then(function (record) {
       if (!record) return;
@@ -586,15 +714,22 @@
     if (vocal.activeTakeId === takeId) {
       vocal.activeTakeId = vocal.takes.length ? vocal.takes[vocal.takes.length - 1].id : null;
     }
+    delete state.waveCache[takeId];
+    state.waveCacheOrder = state.waveCacheOrder.filter(function (id) { return id !== takeId; });
     saveSessions();
     PS.db.deleteTake(takeId).catch(function () { /* ignore */ });
+    if (state.playingTakeId === takeId) stopPlayback();
     renderTracks();
+    renderSheet();
+    updateTransport();
   }
 
   function setActiveTake(track, takeId) {
     state.session.tracks[track].activeTakeId = takeId;
     saveSessions();
     renderTracks();
+    renderSheet();
+    updateTransport();
   }
 
   // ---------------------------------------------------------------- mic test
@@ -608,6 +743,7 @@
     clearError();
     state.micTesting = true;
     renderMicTest();
+    updateTransport();
     $('mic-status').textContent = 'Recording… talk or sing for 10 seconds.';
     acquireWakeLock();
     PS.audio.startCapture(null).then(function () {
@@ -618,6 +754,7 @@
       state.micTesting = false;
       releaseWakeLock();
       renderMicTest();
+      updateTransport();
       showError(err && err.message ? err.message : 'The mic test could not start.');
     });
   }
@@ -626,6 +763,7 @@
     if (!state.micTesting) return;
     state.micTesting = false;
     releaseWakeLock();
+    updateTransport();
     var recorded = PS.audio.stopCapture();
     var sr = PS.audio.sampleRate();
     if (!recorded.samples || recorded.samples.length === 0) {
@@ -668,10 +806,287 @@
     });
   }
 
+  // ---------------------------------------------------------------- waveforms
+
+  /* Peaks: one magnitude (0..1) per bucket — the loudest absolute
+   * sample in that slice of the audio. Computed once at PEAK_BUCKETS
+   * and downsampled to the lane width when drawn.
+   */
+  function computePeaks(samples, buckets) {
+    var peaks = new Float32Array(buckets);
+    if (!samples || samples.length === 0) return peaks;
+    var perBucket = samples.length / buckets;
+    for (var b = 0; b < buckets; b++) {
+      var start = Math.floor(b * perBucket);
+      var end = Math.min(samples.length, Math.floor((b + 1) * perBucket));
+      var max = 0;
+      for (var i = start; i < end; i++) {
+        var v = samples[i];
+        if (v < 0) v = -v;
+        if (v > max) max = v;
+      }
+      peaks[b] = max > 1 ? 1 : max;
+    }
+    return peaks;
+  }
+
+  function cacheWave(takeId, entry) {
+    if (!state.waveCache[takeId]) {
+      state.waveCacheOrder.push(takeId);
+      while (state.waveCacheOrder.length > WAVE_CACHE_MAX) {
+        var oldest = state.waveCacheOrder.shift();
+        delete state.waveCache[oldest];
+      }
+    }
+    state.waveCache[takeId] = entry;
+  }
+
+  /* Decodes a take's aligned WAV and caches its peaks + duration.
+   * Returns a promise resolving to the entry (or null on failure —
+   * a missing wave never breaks the row).
+   */
+  function getTakeWave(takeId) {
+    if (state.waveCache[takeId]) return Promise.resolve(state.waveCache[takeId]);
+    return PS.db.getTake(takeId).then(function (record) {
+      if (!record || !record.alignedWav) return null;
+      return record.alignedWav.arrayBuffer().then(function (buf) {
+        return PS.audio.decodeAudio(buf);
+      }).then(function (audioBuffer) {
+        var entry = {
+          peaks: computePeaks(audioBuffer.getChannelData(0), PEAK_BUCKETS),
+          duration: audioBuffer.duration
+        };
+        cacheWave(takeId, entry);
+        return entry;
+      });
+    }).catch(function () { return null; });
+  }
+
+  function getBeatWave() {
+    if (!state.beat || !state.beat.mono) return null;
+    if (!state.beat.peaks) {
+      state.beat.peaks = computePeaks(state.beat.mono, PEAK_BUCKETS);
+    }
+    return { peaks: state.beat.peaks, duration: state.beat.duration };
+  }
+
+  /* The timeline covers the longest thing on it (beat or active
+   * takes), with a 30-second floor so a short take does not stretch
+   * across the whole lane. Recomputed whenever waves resolve.
+   */
+  function updateTimeline() {
+    var longest = MIN_TIMELINE_SECONDS;
+    if (state.beat) longest = Math.max(longest, state.beat.duration);
+    PS.store.TRACKS.forEach(function (kind) {
+      var take = activeTakeOf(kind);
+      if (!take) return;
+      var cached = state.waveCache[take.id];
+      var d = cached ? cached.duration : (take.durationSeconds || 0);
+      if (d > longest) longest = d;
+    });
+    if (Math.abs(longest - state.timelineSeconds) > 0.01) {
+      state.timelineSeconds = longest;
+      drawAllWaves();
+      renderPlayhead();
+    }
+  }
+
+  /* Draws one lane: real bars where the audio is, a dotted baseline
+   * where it is not. The wave occupies [0, duration] on the shared
+   * timeline — every lane is on the same time scale, like Voloco.
+   */
+  function drawWave(canvas, wave, color) {
+    if (!canvas) return;
+    var dpr = window.devicePixelRatio || 1;
+    var w = canvas.clientWidth;
+    var h = canvas.clientHeight;
+    if (w <= 0 || h <= 0) return;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+    }
+    var ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    var mid = h / 2;
+    var maxBar = h * 0.42;
+    // Dotted baseline across the whole lane (the empty-region look).
+    ctx.fillStyle = 'rgba(255,255,255,0.22)';
+    for (var x = 2; x < w; x += 7) {
+      ctx.beginPath();
+      ctx.arc(x, mid, 1.1, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (!wave || !wave.peaks) return;
+    var span = Math.max(1, (wave.duration / state.timelineSeconds) * w);
+    var barW = 2;
+    var gap = 1;
+    var step = barW + gap;
+    var bars = Math.max(1, Math.floor(span / step));
+    ctx.fillStyle = color;
+    for (var b = 0; b < bars; b++) {
+      var from = Math.floor((b / bars) * PEAK_BUCKETS);
+      var to = Math.max(from + 1, Math.floor(((b + 1) / bars) * PEAK_BUCKETS));
+      var peak = 0;
+      for (var i = from; i < to && i < PEAK_BUCKETS; i++) {
+        if (wave.peaks[i] > peak) peak = wave.peaks[i];
+      }
+      var barH = Math.max(2, peak * maxBar * 2);
+      var bx = b * step;
+      ctx.beginPath();
+      var r = Math.min(barW / 2, barH / 2);
+      var top = mid - barH / 2;
+      if (ctx.roundRect) {
+        ctx.roundRect(bx, top, barW, barH, r);
+      } else {
+        ctx.rect(bx, top, barW, barH);
+      }
+      ctx.fill();
+    }
+  }
+
+  function drawAllWaves() {
+    var rows = document.querySelectorAll('.track-row');
+    rows.forEach(function (row) {
+      var canvas = row.querySelector('canvas');
+      if (!canvas) return;
+      var kind = row.getAttribute('data-track');
+      var color = getComputedStyle(row).getPropertyValue('--track-accent').trim() || '#8b5cf6';
+      if (kind === 'beat') {
+        drawWave(canvas, getBeatWave(), '#e5e5e5');
+        return;
+      }
+      var take = activeTakeOf(kind);
+      if (!take) {
+        drawWave(canvas, null, color);
+        return;
+      }
+      var cached = state.waveCache[take.id];
+      if (cached) {
+        drawWave(canvas, cached, color);
+      } else {
+        drawWave(canvas, null, color);
+        getTakeWave(take.id).then(function (entry) {
+          if (!entry) return;
+          updateTimeline();
+          var live = document.querySelector('.track-row[data-track="' + kind + '"] canvas');
+          if (live) drawWave(live, entry, color);
+        });
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- playhead
+
+  function fmtPlayhead() {
+    $('time-label').textContent = fmtClock(state.playheadSeconds);
+  }
+
+  function laneRect() {
+    var canvas = document.querySelector('.track-row canvas');
+    var wrap = document.querySelector('.tracks-wrap');
+    if (!canvas || !wrap) return null;
+    var c = canvas.getBoundingClientRect();
+    var w = wrap.getBoundingClientRect();
+    return { left: c.left - w.left, width: c.width };
+  }
+
+  function renderPlayhead() {
+    var line = $('playhead');
+    var rect = laneRect();
+    if (!rect || rect.width <= 0) {
+      line.style.display = 'none';
+      fmtPlayhead();
+      return;
+    }
+    var frac = Math.max(0, Math.min(1, state.playheadSeconds / state.timelineSeconds));
+    line.style.display = '';
+    line.style.left = (rect.left + frac * rect.width) + 'px';
+    fmtPlayhead();
+  }
+
+  function setPlayhead(seconds) {
+    state.playheadSeconds = Math.max(0, Math.min(state.timelineSeconds, seconds));
+    renderPlayhead();
+  }
+
+  function tickPlayhead() {
+    if (state.recording) {
+      var pos = PS.audio.currentTime() - state.recording.anchorTime;
+      setPlayhead(Math.max(0, pos));
+    } else if (state.playingStop) {
+      var elapsed = PS.audio.currentTime() - state.playingStartCtx;
+      setPlayhead(state.playingStartOffset + Math.max(0, elapsed));
+    }
+  }
+
+  function ensurePlayheadTimer() {
+    if (state.playheadTimer) return;
+    state.playheadTimer = setInterval(tickPlayhead, 100);
+  }
+
+  function clearPlayheadTimer() {
+    if (!state.playheadTimer) return;
+    if (state.recording || state.playingStop) return; // the other one still needs it
+    clearInterval(state.playheadTimer);
+    state.playheadTimer = null;
+  }
+
+  /* Scrub: press/drag on the lanes moves the playhead. Ignored while
+   * recording (the playhead is live then) and on buttons.
+   */
+  function scrubFromEvent(event) {
+    var rect = laneRect();
+    if (!rect || rect.width <= 0) return;
+    var wrap = document.querySelector('.tracks-wrap');
+    var wrapRect = wrap.getBoundingClientRect();
+    var x = (event.clientX - wrapRect.left) - rect.left;
+    var frac = Math.max(0, Math.min(1, x / rect.width));
+    setPlayhead(frac * state.timelineSeconds);
+  }
+
+  /* A press on a vocal row SELECTS it (selection happens on
+   * pointerdown, not click — pointer capture would retarget the
+   * click and break it, so no capture is used here). A press on the
+   * beat row with no beat opens the import picker. Otherwise the
+   * press starts a scrub (ignored while recording — the playhead
+   * is live then — and on buttons, which handle themselves).
+   */
+  function onTracksPointerDown(event) {
+    if (event.target.closest('button')) return;
+    var row = event.target.closest('.track-row');
+    if (row) {
+      var kind = row.getAttribute('data-track');
+      if (kind === 'beat') {
+        if (!state.beat) {
+          $('beat-file').click();
+          return;
+        }
+      } else {
+        selectTrack(kind);
+      }
+    }
+    if (state.recording) return;
+    if (state.playingStop) stopPlayback();
+    state.scrubbing = true;
+    scrubFromEvent(event);
+  }
+
+  function onTracksPointerMove(event) {
+    if (!state.scrubbing) return;
+    scrubFromEvent(event);
+  }
+
+  function onTracksPointerUp() {
+    state.scrubbing = false;
+  }
+
   // ---------------------------------------------------------------- rendering
 
   function renderSession() {
     $('song-name').value = state.session.name;
+    $('topbar-song-name').textContent = state.session.name;
+    $('topbar-song-key').textContent = state.session.key;
     var keySelect = $('song-key');
     keySelect.innerHTML = '';
     SONG_KEYS.forEach(function (key) {
@@ -692,18 +1107,9 @@
     });
   }
 
+  /* The beat row is built by renderTracks — this just re-renders. */
   function renderBeat() {
-    var status = $('beat-status');
-    if (state.beat) {
-      status.textContent = state.beat.originalName + ' — ' +
-        Math.round(state.beat.duration) + ' seconds';
-      $('beat-remove').style.display = '';
-    } else {
-      status.textContent = state.session.beatOriginalName
-        ? state.session.beatOriginalName + ' — loading…'
-        : 'No beat yet. Import one to record over it.';
-      $('beat-remove').style.display = 'none';
-    }
+    renderTracks();
   }
 
   function renderCalibration() {
@@ -755,79 +1161,141 @@
     }
   }
 
+  function selectTrack(kind) {
+    if (state.selectedTrack === kind) return;
+    state.selectedTrack = kind;
+    renderTracks();
+    updateTransport();
+  }
+
   function renderTracks() {
     var container = $('tracks');
     container.innerHTML = '';
     PS.store.TRACKS.forEach(function (kind) {
       var vocal = state.session.tracks[kind];
-      var section = el('section', 'card track');
-      var head = el('div', 'track-head');
-      head.appendChild(el('h2', '', PS.store.TRACK_NAMES[kind]));
-      var recBtn = el('button', 'btn-record', 'Record');
-      if (state.recording) {
-        if (state.recording.track === kind) {
-          recBtn.textContent = 'Stop';
-          recBtn.classList.add('recording');
-          recBtn.addEventListener('click', stopTakeRequest);
-        } else {
-          recBtn.disabled = true;
-        }
-      } else {
-        recBtn.addEventListener('click', function () { startTakeRequest(kind); });
-      }
-      head.appendChild(recBtn);
-      section.appendChild(head);
-
-      if (state.recording && state.recording.track === kind) {
-        var live = el('div', 'live-row');
-        live.appendChild(el('span', 'live-dot', '●'));
-        live.appendChild(el('span', '', 'Recording — '));
-        var timer = el('span', '');
-        timer.id = 'record-timer';
-        live.appendChild(timer);
-        section.appendChild(live);
-        var meter = el('div', 'meter');
-        var bar = el('div', 'meter-bar');
-        bar.id = 'level-bar';
-        meter.appendChild(bar);
-        section.appendChild(meter);
-        section.appendChild(el('p', 'muted', 'Keep this page open and the screen on.'));
-      }
-
-      if (vocal.takes.length === 0) {
-        section.appendChild(el('p', 'muted', 'No takes yet.'));
-      }
-      vocal.takes.slice().reverse().forEach(function (take) {
-        var row = el('div', 'take-row');
-        var isActive = take.id === vocal.activeTakeId;
-        var isPlaying = take.id === state.playingTakeId;
-        var info = el('div', 'take-info');
-        info.appendChild(el('strong', '', 'Take ' + take.takeNumber + (isActive ? ' ✓' : '')));
-        var sub = el('div', 'muted small', fmtTime(take.recordedAt) +
-          (take.calibrated ? '' : ' — not measured, timing may be off') +
-          (take.residualVerdict ? ' — ' + (VERDICT_TEXT[take.residualVerdict] || take.residualVerdict) : ''));
-        info.appendChild(sub);
-        row.appendChild(info);
-        var actions = el('div', 'take-actions');
-        var play = el('button', 'btn-small', isPlaying ? 'Stop' : 'Play');
-        play.addEventListener('click', function () {
-          if (isPlaying) stopPlayback(); else playTake(take.id);
-        });
-        var send = el('button', 'btn-small', 'Send');
-        send.addEventListener('click', function () { shareTake(take.id); });
-        var raw = el('button', 'btn-small', 'Raw');
-        raw.title = 'Download the untrimmed recording';
-        raw.addEventListener('click', function () { downloadRawTake(take.id); });
-        var use = el('button', 'btn-small', isActive ? 'In use' : 'Use this');
-        use.disabled = isActive;
-        use.addEventListener('click', function () { setActiveTake(kind, take.id); });
-        var del = el('button', 'btn-small danger', 'Delete');
-        del.addEventListener('click', function () { deleteTake(kind, take.id); });
-        [play, send, raw, use, del].forEach(function (b) { actions.appendChild(b); });
-        row.appendChild(actions);
-        section.appendChild(row);
+      var row = el('div', 'track-row' + (kind === state.selectedTrack ? ' selected' : ''));
+      row.setAttribute('data-track', kind);
+      var label = el('div', 'row-label');
+      var name = el('div', 'row-name');
+      name.innerHTML = MIC_SVG;
+      name.appendChild(document.createTextNode(PS.store.TRACK_NAMES[kind]));
+      label.appendChild(name);
+      var active = activeTakeOf(kind);
+      label.appendChild(el('div', 'row-sub', active ? 'Take ' + active.takeNumber : ''));
+      row.appendChild(label);
+      var lane = el('div', 'wave-lane');
+      lane.appendChild(document.createElement('canvas'));
+      row.appendChild(lane);
+      var more = el('button', 'row-more', '···');
+      more.setAttribute('aria-label', PS.store.TRACK_NAMES[kind] + ' takes');
+      more.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        openTakeSheet(kind);
       });
-      container.appendChild(section);
+      row.appendChild(more);
+      container.appendChild(row);
+    });
+
+    // The beat is the bottom row, on the same timeline.
+    var beatRow = el('div', 'track-row beat-row');
+    beatRow.setAttribute('data-track', 'beat');
+    var beatLabel = el('div', 'row-label');
+    var beatName = el('div', 'row-name');
+    beatName.innerHTML = NOTE_SVG;
+    beatName.appendChild(document.createTextNode('Beat'));
+    beatLabel.appendChild(beatName);
+    var beatSub;
+    if (state.beat) {
+      beatSub = state.beat.originalName + ' — ' + Math.round(state.beat.duration) + 's';
+    } else if (state.session.beatOriginalName) {
+      beatSub = state.session.beatOriginalName + ' — loading…';
+    } else {
+      beatSub = 'Tap to import';
+    }
+    beatLabel.appendChild(el('div', 'row-sub', beatSub));
+    beatRow.appendChild(beatLabel);
+    var beatLane = el('div', 'wave-lane');
+    beatLane.appendChild(document.createElement('canvas'));
+    if (!state.beat) {
+      var importBtn = el('button', 'btn-small lane-btn', 'Import a beat');
+      importBtn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        $('beat-file').click();
+      });
+      beatLane.appendChild(importBtn);
+    }
+    beatRow.appendChild(beatLane);
+    if (state.beat) {
+      var remove = el('button', 'row-more', '×');
+      remove.setAttribute('aria-label', 'Remove beat');
+      remove.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        removeBeat();
+      });
+      beatRow.appendChild(remove);
+    }
+    container.appendChild(beatRow);
+
+    updateTimeline();
+    requestAnimationFrame(function () {
+      drawAllWaves();
+      renderPlayhead();
+    });
+  }
+
+  // ---------------------------------------------------------------- take sheet
+
+  function openTakeSheet(track) {
+    state.sheetTrack = track;
+    renderSheet();
+    $('take-sheet').style.display = 'flex';
+  }
+
+  function closeTakeSheet() {
+    state.sheetTrack = null;
+    $('take-sheet').style.display = 'none';
+  }
+
+  function renderSheet() {
+    if (!state.sheetTrack) return;
+    var kind = state.sheetTrack;
+    var vocal = state.session.tracks[kind];
+    $('sheet-title').textContent = PS.store.TRACK_NAMES[kind] + ' — Takes';
+    var list = $('sheet-list');
+    list.innerHTML = '';
+    if (vocal.takes.length === 0) {
+      list.appendChild(el('p', 'muted', 'No takes yet.'));
+      return;
+    }
+    vocal.takes.slice().reverse().forEach(function (take) {
+      var row = el('div', 'take-row');
+      var isActive = take.id === vocal.activeTakeId;
+      var isPlaying = take.id === state.playingTakeId;
+      var info = el('div', 'take-info');
+      info.appendChild(el('strong', '', 'Take ' + take.takeNumber + (isActive ? ' ✓' : '')));
+      var sub = el('div', 'muted small', fmtTime(take.recordedAt) +
+        (take.calibrated ? '' : ' — not measured, timing may be off') +
+        (take.residualVerdict ? ' — ' + (VERDICT_TEXT[take.residualVerdict] || take.residualVerdict) : ''));
+      info.appendChild(sub);
+      row.appendChild(info);
+      var actions = el('div', 'take-actions');
+      var play = el('button', 'btn-small', isPlaying ? 'Stop' : 'Play');
+      play.addEventListener('click', function () {
+        if (isPlaying) stopPlayback(); else playTake(take.id);
+      });
+      var send = el('button', 'btn-small', 'Send');
+      send.addEventListener('click', function () { shareTake(take.id); });
+      var raw = el('button', 'btn-small', 'Raw');
+      raw.title = 'Download the untrimmed recording';
+      raw.addEventListener('click', function () { downloadRawTake(take.id); });
+      var use = el('button', 'btn-small', isActive ? 'In use' : 'Use this');
+      use.disabled = isActive;
+      use.addEventListener('click', function () { setActiveTake(kind, take.id); });
+      var del = el('button', 'btn-small danger', 'Delete');
+      del.addEventListener('click', function () { deleteTake(kind, take.id); });
+      [play, send, raw, use, del].forEach(function (b) { actions.appendChild(b); });
+      row.appendChild(actions);
+      list.appendChild(row);
     });
   }
 
@@ -844,16 +1312,88 @@
 
   function renderAll() {
     renderSession();
-    renderBeat();
     renderCalibration();
     renderTracks();
     renderMicTest();
     $('wake-note').style.display = state.wakeLockSupported ? 'none' : '';
+    updateTransport();
+  }
+
+  // ---------------------------------------------------------------- transport
+
+  function updateTransport() {
+    var rec = $('transport-record');
+    var play = $('transport-play');
+    var share = $('transport-share');
+    var rewind = $('transport-rewind');
+    var phones = $('transport-headphones');
+    var busy = state.calibrating || state.micTesting;
+    var playing = !!state.playingStop;
+    var take = activeTakeOf(state.selectedTrack);
+    rec.disabled = busy;
+    rec.classList.toggle('recording', !!state.recording);
+    rec.setAttribute('aria-label', state.recording ? 'Stop' : 'Record');
+    play.disabled = busy || !!state.recording || (!playing && !take);
+    play.innerHTML = playing ? STOP_SVG : PLAY_SVG;
+    play.setAttribute('aria-label', playing ? 'Stop' : 'Play');
+    share.disabled = !take;
+    rewind.disabled = !!state.recording;
+    phones.classList.toggle('active', PS.store.outputMode() === 'headphones');
+  }
+
+  function toggleOutputMode() {
+    var next = PS.store.outputMode() === 'headphones' ? 'speaker' : 'headphones';
+    PS.store.setOutputMode(next);
+    renderCalibration();
+    updateTransport();
+  }
+
+  // ---------------------------------------------------------------- views
+
+  function showSetup() {
+    $('studio-view').style.display = 'none';
+    $('setup-view').style.display = 'flex';
+  }
+
+  function showStudio() {
+    $('setup-view').style.display = 'none';
+    $('studio-view').style.display = 'flex';
+    // The canvases were 0-size while hidden — redraw once laid out.
+    requestAnimationFrame(function () {
+      drawAllWaves();
+      renderPlayhead();
+    });
   }
 
   // ---------------------------------------------------------------- wiring
 
   function wire() {
+    $('setup-open').addEventListener('click', showSetup);
+    $('setup-song').addEventListener('click', showSetup);
+    $('setup-back').addEventListener('click', showStudio);
+    $('transport-record').addEventListener('click', function () {
+      if (state.recording) stopTakeRequest();
+      else startTakeRequest(state.selectedTrack);
+    });
+    $('transport-play').addEventListener('click', playSelected);
+    $('transport-rewind').addEventListener('click', function () {
+      if (state.playingStop) stopPlayback();
+      setPlayhead(0);
+    });
+    $('transport-share').addEventListener('click', shareSelected);
+    $('transport-headphones').addEventListener('click', toggleOutputMode);
+    $('sheet-close').addEventListener('click', closeTakeSheet);
+    $('take-sheet').addEventListener('click', function (event) {
+      if (event.target === $('take-sheet')) closeTakeSheet();
+    });
+    var wrap = document.querySelector('.tracks-wrap');
+    wrap.addEventListener('pointerdown', onTracksPointerDown);
+    wrap.addEventListener('pointermove', onTracksPointerMove);
+    // pointerup on the window: a drag released outside the lanes
+    // still has to end the scrub.
+    window.addEventListener('pointerup', onTracksPointerUp);
+    window.addEventListener('pointercancel', onTracksPointerUp);
+
     $('song-name').addEventListener('change', function () {
       state.session.name = $('song-name').value.trim() || 'New Song';
       saveSessions();
@@ -862,6 +1402,7 @@
     $('song-key').addEventListener('change', function () {
       state.session.key = $('song-key').value;
       saveSessions();
+      renderSession();
     });
     $('session-select').addEventListener('change', function () {
       switchSession($('session-select').value);
@@ -874,24 +1415,24 @@
       saveSessions();
       switchSession(session.id);
     });
-    $('beat-pick').addEventListener('click', function () { $('beat-file').click(); });
     $('beat-file').addEventListener('change', function () {
       onBeatFilePicked($('beat-file').files[0]);
       $('beat-file').value = '';
     });
-    $('beat-remove').addEventListener('click', removeBeat);
     $('mode-headphones').addEventListener('change', function () {
       PS.store.setOutputMode('headphones');
       renderCalibration();
+      updateTransport();
     });
     $('mode-speaker').addEventListener('change', function () {
       PS.store.setOutputMode('speaker');
       renderCalibration();
+      updateTransport();
     });
     $('cal-measure').addEventListener('click', startCalibration);
     $('cal-gate-measure').addEventListener('click', function () {
       $('cal-gate').style.display = 'none';
-      document.getElementById('calibration-card').scrollIntoView({ behavior: 'smooth' });
+      showSetup();
       $('cal-label').focus();
     });
     $('cal-gate-anyway').addEventListener('click', function () {
@@ -907,6 +1448,15 @@
     $('mic-btn').addEventListener('click', startMicTest);
     $('mic-send').addEventListener('click', shareMicTest);
     $('error-dismiss').addEventListener('click', clearError);
+
+    var resizeTimer = null;
+    window.addEventListener('resize', function () {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function () {
+        drawAllWaves();
+        renderPlayhead();
+      }, 150);
+    });
   }
 
   function switchSession(id) {
@@ -916,6 +1466,7 @@
     if (!session) return;
     state.session = session;
     PS.store.setCurrentSessionId(id);
+    setPlayhead(0);
     loadBeatForSession().then(function () {
       renderAll();
     });
@@ -929,8 +1480,8 @@
     } catch (e) {
       // Storage unavailable (e.g. a private browsing tab): say so
       // plainly instead of showing a blank page.
-      document.querySelector('main').innerHTML =
-        '<div class="error-box" style="display:block">This app needs ' +
+      $('studio-view').innerHTML =
+        '<div class="error-box" style="display:flex;position:static;margin:16px">This app needs ' +
         'storage on your phone to save your songs. If you opened it in ' +
         'a private browsing tab, open it in a normal Safari tab instead.</div>';
       return;
@@ -938,6 +1489,7 @@
     wire();
     renderAll();
     loadBeatForSession().then(function () { renderBeat(); });
+    if (window.location.hash === '#setup') showSetup();
     // Service worker: works offline after the first load.
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('sw.js').catch(function (err) {
