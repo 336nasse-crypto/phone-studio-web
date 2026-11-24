@@ -420,7 +420,19 @@
         player.buffer = buffer;
         player.connect(ctx.destination);
         player.start(anchor);
-        if (isTake && onEnded) player.onended = onEnded;
+        if (isTake && onEnded) {
+          player.onended = function () {
+            // The take ended — the song is over. Stop the beat too
+            // (it outlasts every take) or it plays on with no stop
+            // button, then tell the caller playback is over.
+            players.forEach(function (p) {
+              if (p === player) return;
+              try { p.stop(); } catch (e) { /* ignore */ }
+              try { p.disconnect(); } catch (e) { /* ignore */ }
+            });
+            onEnded();
+          };
+        }
         players.push(player);
       }
       schedule(takeBuffer, true);
