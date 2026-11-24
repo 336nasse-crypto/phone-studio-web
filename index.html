@@ -34,6 +34,15 @@
     <div id="playhead" class="playhead"></div>
   </div>
 
+  <div id="preset-strip" class="preset-strip">
+    <div id="preset-pills" class="preset-pills" role="group" aria-label="Voice sound"></div>
+    <div class="strength-row">
+      <label for="strength-slider">Strength</label>
+      <input id="strength-slider" type="range" min="0" max="100" value="100" aria-label="Tune strength">
+      <span id="strength-value">100%</span>
+    </div>
+  </div>
+
   <div id="live-strip" class="live-strip" style="display:none">
     <span class="live-dot" aria-hidden="true">●</span>
     <span id="record-timer" class="live-timer"></span>
@@ -123,7 +132,10 @@
       <h2>Key</h2>
       <button id="key-sheet-close" class="icon-btn" aria-label="Close">✕</button>
     </div>
-    <div id="key-list" class="key-grid"></div>
+    <p class="key-section-label">Note</p>
+    <div id="tonic-list" class="key-grid tonic-grid"></div>
+    <p class="key-section-label">Scale</p>
+    <div id="scale-list" class="key-grid scale-grid"></div>
   </div>
 </div>
 
