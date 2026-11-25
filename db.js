@@ -5,6 +5,12 @@
  *   takes: keyed by take id — raw + aligned WAV Blobs + metadata
  *   beats: keyed by session id — the original imported beat file
  *   misc:  keyed by name — the mic-test recording
+ *   takeChunks: one record per 48,000-sample chunk written WHILE a
+ *     take is recording (Step 1B). Keyed by
+ *     `${sessionId}/${track}/${takeId}/${index}` with an index on
+ *     takeId, so a take killed mid-record can be rebuilt from its
+ *     chunks on the next boot — at most the last partial second is
+ *     lost. Chunk rows are deleted once the take is saved.
  *
  * Loads in the browser as window.PS.db. Promise-based.
  */
@@ -20,7 +26,7 @@
   'use strict';
 
   var DB_NAME = 'phone-studio';
-  var DB_VERSION = 1;
+  var DB_VERSION = 2;
   var dbPromise = null;
 
   function open() {
@@ -38,6 +44,10 @@
         }
         if (!db.objectStoreNames.contains('misc')) {
           db.createObjectStore('misc', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('takeChunks')) {
+          var chunks = db.createObjectStore('takeChunks', { keyPath: 'key' });
+          chunks.createIndex('takeId', 'takeId', { unique: false });
         }
       };
       request.onsuccess = function () { resolve(request.result); };
@@ -97,6 +107,33 @@
     getMisc: function (key) {
       return get('misc', key).then(function (row) { return row ? row.value : undefined; });
     },
-    deleteMisc: function (key) { return remove('misc', key); }
+    deleteMisc: function (key) { return remove('misc', key); },
+    // --- Take chunks (Step 1B): one row per 48,000-sample chunk. ---
+    saveTakeChunk: function (chunk) { return put('takeChunks', chunk); },
+    getTakeChunks: function (takeId) { return getAllByIndex('takeChunks', 'takeId', takeId); },
+    getAllTakeChunks: function () {
+      return open().then(function (db) {
+        return new Promise(function (resolve, reject) {
+          var tx = db.transaction('takeChunks', 'readonly');
+          var req = tx.objectStore('takeChunks').getAll();
+          req.onsuccess = function () { resolve(req.result || []); };
+          req.onerror = function () { reject(req.error); };
+        });
+      });
+    },
+    deleteTakeChunks: function (takeId) {
+      return getAllByIndex('takeChunks', 'takeId', takeId).then(function (rows) {
+        if (!rows || rows.length === 0) return;
+        return open().then(function (db) {
+          return new Promise(function (resolve, reject) {
+            var tx = db.transaction('takeChunks', 'readwrite');
+            var store = tx.objectStore('takeChunks');
+            rows.forEach(function (r) { store.delete(r.key); });
+            tx.oncomplete = function () { resolve(); };
+            tx.onerror = function () { reject(tx.error); };
+          });
+        });
+      });
+    }
   };
 });
