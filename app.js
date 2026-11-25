@@ -1359,6 +1359,7 @@
     livePeakAccum = 0;
     if (livePeaks.length > 90) livePeaks.shift();
     drawLiveWave();
+    drawFxWave();
   }
 
   function setMeter(peak) {
@@ -1382,8 +1383,9 @@
   // drawWave(canvas, wave, color) already exists later in this
   // file — function declarations hoist, so the later one silently
   // replaced this one and the live canvas stayed blank. Renamed.
-  function drawLiveWave() {
-    var canvas = $('live-wave');
+  // Step 5 (v13.6): the rolling peaks draw into any canvas — the
+  // record strip and the sound panel's wave share this one draw.
+  function drawLivePeaksInto(canvas) {
     if (!canvas) return;
     var c2d = canvas.getContext('2d');
     if (!c2d) return;
@@ -1400,6 +1402,10 @@
       c2d.fillStyle = 'rgba(167, 139, 250, 0.9)';
       c2d.fillRect(i * bw + 1, (h - bh) / 2, bw - 2, bh);
     }
+  }
+
+  function drawLiveWave() {
+    drawLivePeaksInto($('live-wave'));
   }
 
   function stopTakeRequest() {
@@ -1420,6 +1426,9 @@
     livePeaks = [];
     livePeakAccum = 0;
     drawLiveWave();
+    // Step 5 (v13.6): the panel's wave falls back to the take that
+    // just ended, if the panel is open.
+    drawFxWave();
     $('record-hint').textContent = '';
     $('live-strip').style.display = 'none';
     var timerEl = $('record-timer');
@@ -2200,6 +2209,178 @@
 
   // ---------------------------------------------------------------- share / export
 
+  /* v13.7 — the smaller copy. A 103.8 s take as a 32-bit float WAV
+   * is ~20 MB per file, and the share timed out 3 times trying to
+   * send it ("unable to upload file"). The smaller copy is the same
+   * lined-up take, shorter in the file, not in the song: 16-bit
+   * samples at 22,050 Hz — 103.8 s is ~4.6 MB, under the 5 MB the
+   * share handles easily. The rate keeps everything up to 11 kHz;
+   * his takes carry nothing above ~7.5 kHz (the mic is the
+   * phone-call one), so nothing he actually sang is lost — and the
+   * top end the small copy cannot carry is measured in the test,
+   * not assumed. The full-quality copy stays: the choice is his,
+   * every time, and the small copy is never sent instead of the
+   * full one without him tapping it.
+   *
+   * The take is filtered before it is resampled: the renderer's
+   * own rate change folds anything above the new top end back down
+   * as a phantom tone (a 12 kHz tone came back at 10,050 Hz at
+   * 0.81× with no filter — measured in the cdp-v137 harness), so
+   * the 10th-order Butterworth at 8,500 Hz runs first (8 kHz
+   * passes at ~0.88×, 12 kHz is down to ~0.03×). The filter is
+   * plain JS (PS.retune.lowpassButterworth), not a BiquadFilterNode
+   * — the node was measured not to match its own cookbook in this
+   * Chromium (see retune.js). The rate change itself is the
+   * browser's resampler (OfflineAudioContext), so there is no new
+   * library and nothing downloaded. If this browser cannot render
+   * offline, the small copy says so plainly and the full-quality
+   * button still works.
+   */
+  var SMALL_COPY_SAMPLE_RATE = 22050;
+  var SMALL_COPY_BITS = 16;
+  var SMALL_COPY_CUTOFF_HZ = 8500;
+  var SMALL_COPY_FILTER_ORDER = 10;
+
+  function smallCopyFileName(alignedFileName) {
+    return String(alignedFileName || 'take.wav').replace(/\.wav$/i, '-small.wav');
+  }
+
+  /* A WAV Blob in, a small WAV Blob out. Returns a promise of
+   * { blob, fileName, sampleRate, bitsPerSample, durationSeconds,
+   * sizeBytes }. Throws when the file cannot be read, the filter
+   * is not loaded, or this browser cannot render offline.
+   */
+  function makeSmallCopy(wavBlob, alignedFileName) {
+    if (!wavBlob) return Promise.reject(new Error('No take to copy.'));
+    if (!PS.retune || !PS.retune.lowpassButterworth) {
+      return Promise.reject(new Error('This browser cannot make the smaller copy.'));
+    }
+    if (typeof OfflineAudioContext === 'undefined') {
+      return Promise.reject(new Error('This browser cannot make the smaller copy.'));
+    }
+    return wavBlob.arrayBuffer().then(function (buf) {
+      var decoded = PS.wav.decodeWavFloat32(buf);
+      if (!decoded || !decoded.samples || decoded.samples.length === 0) {
+        throw new Error('That take could not be read.');
+      }
+      // The anti-alias filter, in plain JS at the take's own rate —
+      // anything above the new top end is filtered, not folded back.
+      PS.retune.lowpassButterworth(decoded.samples, decoded.sampleRate,
+        SMALL_COPY_CUTOFF_HZ, SMALL_COPY_FILTER_ORDER);
+      // The rate change, on the already-filtered take.
+      var target = SMALL_COPY_SAMPLE_RATE;
+      var outLen = Math.max(1, Math.round(decoded.samples.length * target / decoded.sampleRate));
+      var off = new OfflineAudioContext(1, outLen, target);
+      var srcBuf = off.createBuffer(1, decoded.samples.length, decoded.sampleRate);
+      srcBuf.getChannelData(0).set(decoded.samples);
+      var src = off.createBufferSource();
+      src.buffer = srcBuf;
+      src.connect(off.destination);
+      src.start(0);
+      return off.startRendering();
+    }).then(function (rendered) {
+      var samples = rendered.getChannelData(0);
+      var bytes = PS.wav.encodeWav16(samples, SMALL_COPY_SAMPLE_RATE);
+      var blob = new Blob([bytes], { type: 'audio/wav' });
+      return {
+        blob: blob,
+        fileName: smallCopyFileName(alignedFileName),
+        sampleRate: SMALL_COPY_SAMPLE_RATE,
+        bitsPerSample: SMALL_COPY_BITS,
+        durationSeconds: samples.length / SMALL_COPY_SAMPLE_RATE,
+        sizeBytes: blob.size
+      };
+    });
+  }
+  PS.makeSmallCopy = makeSmallCopy; // v13.7: exposed for the CDP tests
+  PS.smallCopyFileName = smallCopyFileName; // v13.7: exposed for the CDP tests
+
+  /* The send choice sheet: one tap picks the smaller copy or the
+   * full quality. It opens over the take sheet (the key sheet is
+   * the only other sheet that layers this way) and over the sound
+   * panel from the transport arrow — one sheet at a time, so the
+   * panel closes with it.
+   */
+  var pendingSendTakeId = null;
+
+  function openSendSheet(takeId) {
+    clearError();
+    pendingSendTakeId = takeId;
+    closeFxPanel();
+    var status = $('send-status');
+    if (status) status.textContent = '';
+    setSendButtonsEnabled(true);
+    $('send-sheet').style.display = 'flex';
+  }
+
+  function closeSendSheet() {
+    pendingSendTakeId = null;
+    $('send-sheet').style.display = 'none';
+  }
+
+  function setSendButtonsEnabled(enabled) {
+    var small = $('send-small');
+    var full = $('send-full');
+    if (small) small.disabled = !enabled;
+    if (full) full.disabled = !enabled;
+  }
+
+  /* The smaller copy: make it, then share it with its details file.
+   * The details file is the take's own metadata plus one extra line
+   * naming the small file, so the studio knows exactly what it is.
+   * The raw recording stays full-quality-only — it is the safety
+   * copy, and the small send is the lined-up take.
+   */
+  function sendSmallCopy(takeId) {
+    clearError();
+    var status = $('send-status');
+    if (status) status.textContent = 'Making the smaller copy…';
+    setSendButtonsEnabled(false);
+    PS.db.getTake(takeId).then(function (record) {
+      if (!record) throw new Error('That take could not be found.');
+      return makeSmallCopy(record.alignedWav, record.metadata.alignedFileName).then(function (small) {
+        var meta = {};
+        Object.keys(record.metadata || {}).forEach(function (k) { meta[k] = record.metadata[k]; });
+        meta.smallCopy = { fileName: small.fileName, sampleRate: small.sampleRate, bitsPerSample: small.bitsPerSample };
+        var metaJson = JSON.stringify(meta, null, 2);
+        var metaName = record.metadata.alignedFileName.replace(/\.wav$/i, '.json');
+        var files = [
+          new File([small.blob], small.fileName, { type: 'audio/wav' }),
+          new File([metaJson], metaName, { type: 'application/json' })
+        ];
+        if (navigator.canShare && navigator.canShare({ files: files })) {
+          return navigator.share({ files: files, title: 'Phone Studio take' }).then(function () {
+            closeSendSheet();
+          }).catch(function (err) {
+            if (err && err.name === 'AbortError') {
+              setSendButtonsEnabled(true);
+              if (status) status.textContent = '';
+              return;
+            }
+            throw err;
+          });
+        }
+        // No share sheet — download the small files instead.
+        downloadBlob(small.blob, small.fileName);
+        downloadBlob(new Blob([metaJson], { type: 'application/json' }), metaName);
+        closeSendSheet();
+      });
+    }).catch(function (err) {
+      console.warn('Small copy failed:', err);
+      if (status) status.textContent = 'The smaller copy could not be made — send the full one instead.';
+      setSendButtonsEnabled(true);
+    });
+  }
+
+  /* Full quality, from the send sheet: the sheet closes and the
+   * take goes out exactly as before (lined-up take + raw + the
+   * details file). Nothing in the full path changed in v13.7.
+   */
+  function sendFullQuality(takeId) {
+    closeSendSheet();
+    shareTake(takeId);
+  }
+
   function shareTake(takeId) {
     clearError();
     PS.db.getTake(takeId).then(function (record) {
@@ -2231,14 +2412,14 @@
       downloadBlob(new Blob([metaJson], { type: 'application/json' }), metaName);
     }).catch(function (err) {
       console.warn('Share failed:', err);
-      showError('Sharing failed. Try the download buttons instead.');
+      showError('Sharing failed. Try again, or back up the take from Setup.');
     });
   }
 
   function shareSelected() {
     var take = activeTakeOf(state.selectedTrack);
     if (!take) return;
-    shareTake(take.id);
+    openSendSheet(take.id); // v13.7: the choice, not the big file straight away
   }
 
   /* One-tap backup (Step 1B): every take as one WAV, plus one JSON
@@ -2389,6 +2570,21 @@
   PS.makeVocalChain = makeVocalChain; // Step 4B: build a chain in any context — the CDP tests render it offline through the real worklets
   PS.chainInfo = chainInfo; // Step 4A: the chain as the app wired it (stages in order, switches, latencies)
   PS.chainProbe = chainProbe; // Step 4A: the live node values of the playback/monitor chain
+  PS.fxPanelState = function () { // Step 5: the panel as the app sees it — open, the song sound, each part on/off
+    var slots = {};
+    FX_MODULES.forEach(function (m) { slots[m.id] = fxModuleOn(m); });
+    return {
+      open: $('fx-panel').style.display !== 'none',
+      preset: state.session.preset,
+      strength: state.session.strength,
+      key: state.session.key,
+      chainOn: state.session.chainOn,
+      slots: slots,
+      bypass: copySessionBypass(),
+      macros: copySessionMacros(),
+      tone: copySessionTone()
+    };
+  };
   PS.routeIsSlow = routeIsSlow; // Step 4A: is the measured route Bluetooth-like?
 
   // Step 6C (v13.3) — exposed for the CDP tests: setLoop drives
@@ -2617,6 +2813,10 @@
       if (!ch) return;
       ch.setSound(sound, false);
     });
+    // Step 5 (v13.6): the sound panel shows the same song sound,
+    // so every change lands there too — preset, strength, key,
+    // macros, tone, parts, the whole switch.
+    renderFxPanel();
   }
 
   // ---------------------------------------------------------------- live chain (Step 4A)
@@ -2713,6 +2913,34 @@
     presence: 'Makes the words cut through the beat.',
     air: 'Makes the voice shine on top.'
   };
+
+  /* Step 5 (v13.6) — the effects screen's 5-slot chain strip. The
+   * live-chain stages group into five parts a singer can turn off
+   * or on with one tap — eight of the nine stages. The ninth, the
+   * room-noise cut, sits outside the strip as its own switch (it is
+   * off by default — a gate you opt into, not a part of the sound
+   * you shape — so it would always show its part as off). A part is
+   * ON when every stage in it is on; tapping a part that is off
+   * turns all of its stages back on, and tapping one that is on
+   * turns them all off. A part turned off keeps its settings — the
+   * strip only parks it. Icons are plain stroke shapes, same style
+   * as the transport icons.
+   */
+  var FX_ICON_SPARKLE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"></path></svg>';
+  var FX_ICON_NOTE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>';
+  var FX_ICON_LEVELS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16"></path><path d="M4 12h10"></path><path d="M4 17h13"></path></svg>';
+  var FX_ICON_SLIDERS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 4v16"></path><path d="M12 4v16"></path><path d="M18 4v16"></path><circle cx="6" cy="14" r="2"></circle><circle cx="12" cy="8" r="2"></circle><circle cx="18" cy="11" r="2"></circle></svg>';
+  var FX_ICON_SPACE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 14a8 8 0 0 1 16 0"></path><path d="M7.5 14a4.5 4.5 0 0 1 9 0"></path><circle cx="12" cy="14" r="1.5" fill="currentColor" stroke="none"></circle></svg>';
+  var FX_MODULES = [
+    { id: 'clean', label: 'Clean up', stages: ['tonefix', 'lowcut'], icon: FX_ICON_SPARKLE },
+    { id: 'tune', label: 'Tune', stages: ['tune'], icon: FX_ICON_NOTE },
+    { id: 'even', label: 'Even out', stages: ['even', 'deess'], icon: FX_ICON_LEVELS },
+    { id: 'tone', label: 'Tone shape', stages: ['tone'], icon: FX_ICON_SLIDERS },
+    { id: 'space', label: 'Space', stages: ['echo', 'room'], icon: FX_ICON_SPACE }
+  ];
+  PS.fxModules = FX_MODULES; // Step 5: the chain-strip parts and the stages each one covers, for the CDP tests
+  // The strip buttons, built once in wire() and kept for state sync.
+  var fxSlots = [];
 
   function clampBypass(b) {
     var out = {};
@@ -3151,6 +3379,29 @@
           gain.connect(chainObj.input);
           state.monitor = { source: source, gain: gain, chain: chainObj, tune: chainObj.tune };
           gain.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
+          // Step 5 (v13.6): the sound panel's live wave needs the
+          // mic's level while the monitor runs — a passive analyser
+          // tap on the monitor gain (it hears the signal, it never
+          // changes it). A 100 ms tick feeds the same rolling peaks
+          // the record strip draws, so the panel's wave moves while
+          // he sings into the monitor.
+          var analyser = ctx.createAnalyser();
+          analyser.fftSize = 512;
+          gain.connect(analyser);
+          var waveBuf = new Uint8Array(analyser.fftSize);
+          state.monitor.analyser = analyser;
+          state.monitor.waveTimer = setInterval(function () {
+            analyser.getByteTimeDomainData(waveBuf);
+            var peak = 0;
+            for (var i = 0; i < waveBuf.length; i++) {
+              var v = Math.abs(waveBuf[i] - 128) / 128;
+              if (v > peak) peak = v;
+            }
+            livePeaks.push(peak);
+            if (livePeaks.length > 90) livePeaks.shift();
+            drawLiveWave();
+            drawFxWave();
+          }, 100);
         });
       });
       withTimeout(startJob, 3000, 'Monitor start timed out.').catch(function (err) {
@@ -3165,19 +3416,28 @@
     if (!state.monitor) return;
     var mon = state.monitor;
     state.monitor = null;
+    // Step 5 (v13.6): stop the panel wave's tick with the monitor,
+    // and drop the peaks it fed — the next record starts clean.
+    if (mon.waveTimer) clearInterval(mon.waveTimer);
+    livePeaks = [];
+    livePeakAccum = 0;
+    drawLiveWave();
     PS.audio.ensureContext().then(function (ctx) {
       try { mon.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.01); } catch (e) { /* ignore */ }
       setTimeout(function () {
         try { mon.source.disconnect(); } catch (e) { /* ignore */ }
         try { mon.gain.disconnect(); } catch (e) { /* ignore */ }
+        try { if (mon.analyser) mon.analyser.disconnect(); } catch (e) { /* ignore */ }
         // Step 4A (v13.4): one call drops the whole chain
         // (tune, worklet, EQ, echo) with the monitor.
         try { mon.chain.disconnect(); } catch (e) { /* ignore */ }
         maybeCloseMic(); // nothing needs the mic now — review plays at full quality
       }, 120);
     }).catch(function () {
+      try { if (mon.waveTimer) clearInterval(mon.waveTimer); } catch (e) { /* ignore */ }
       try { mon.source.disconnect(); } catch (e) { /* ignore */ }
       try { mon.gain.disconnect(); } catch (e) { /* ignore */ }
+      try { if (mon.analyser) mon.analyser.disconnect(); } catch (e) { /* ignore */ }
       try { mon.chain.disconnect(); } catch (e) { /* ignore */ }
       maybeCloseMic();
     });
@@ -3199,6 +3459,9 @@
     state.monitorOn = !state.monitorOn;
     updateMonitor();
     updateTransport();
+    // Step 5 (v13.6): the panel's wave switches source with the
+    // monitor — live peaks while it runs, the take when it stops.
+    drawFxWave();
   }
 
   /* Plays the take (tuned) against the beat, both from the anchor.
@@ -3773,6 +4036,10 @@
   // ---------------------------------------------------------------- take sheet
 
   function openTakeSheet(track) {
+    // Step 5 (v13.6): one sheet at a time — the take sheet takes
+    // over from the sound panel (the key sheet is the exception:
+    // it opens on top of the panel from the panel's Key button).
+    closeFxPanel();
     state.sheetTrack = track;
     renderSheet();
     $('take-sheet').style.display = 'flex';
@@ -4129,7 +4396,7 @@
         if (isPlaying) stopPlayback(); else playTake(take.id);
       });
       var send = el('button', 'btn-small', 'Send');
-      send.addEventListener('click', function () { shareTake(take.id); });
+      send.addEventListener('click', function () { openSendSheet(take.id); }); // v13.7: the choice sheet
       // Step 6C (v13.3): one tap keeps this take as the best on
       // the track — the starred take is the default pick for every
       // part of a best-of take. The star is separate from "Use
@@ -4228,6 +4495,7 @@
   }
 
   function openCompSheet(track) {
+    closeFxPanel();
     state.compTrack = track;
     state.compPicks = {};
     compSegments(track).forEach(function (segment, i) {
@@ -4692,6 +4960,10 @@
     var v = Math.max(0, Math.min(100, Math.round(value)));
     state.session.strength = v;
     $('strength-value').textContent = v + '%';
+    // Step 5 (v13.6): the record screen's slider follows too —
+    // the panel's slider sets the same strength, and the two
+    // sliders must never disagree about it.
+    $('strength-slider').value = String(v);
     broadcastTune();
   }
 
@@ -4705,6 +4977,169 @@
     var v = Math.max(0, Math.min(100, Math.round(value)));
     $('volume-value').textContent = v + '%';
     PS.audio.setVolume(v / 100);
+  }
+
+  // ---------------------------------------------------------------- effects screen (Step 5, v13.6)
+  //
+  // One screen where the whole sound lives — the preset row, the
+  // 5-slot chain strip, the live waveform, the strength slider,
+  // the Key button, and the One Knob macros. It slides up over the
+  // studio like Voloco's Edit sheet (see voloco-effects-hardtune).
+  // Everything here edits the SONG's sound (the next take); a take
+  // already made keeps its own stamped sound. Changes retune the
+  // live chains at once through broadcastTune, same as Setup, so
+  // he hears them while he sings. The Key button opens the key
+  // sheet on top of the panel; closing the key sheet drops back
+  // to the panel.
+
+  function fxModuleOn(mod) {
+    var bypass = state.session.bypass;
+    return mod.stages.every(function (s) { return !bypass[s]; });
+  }
+
+  function buildFxStrip() {
+    var strip = $('fx-strip');
+    strip.innerHTML = '';
+    fxSlots = [];
+    FX_MODULES.forEach(function (mod) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'fx-slot';
+      btn.setAttribute('data-module', mod.id);
+      btn.innerHTML = mod.icon + '<span>' + mod.label + '</span>';
+      btn.setAttribute('aria-label', mod.label + ' — turn the whole part off or on');
+      btn.addEventListener('click', function () { toggleFxModule(mod); });
+      strip.appendChild(btn);
+      fxSlots.push(btn);
+    });
+  }
+
+  function toggleFxModule(mod) {
+    // With the whole sound off the parts are inert — the switch
+    // above the strip is the way back on, and every part keeps
+    // its settings underneath.
+    if (!state.session.chainOn) return;
+    var on = fxModuleOn(mod);
+    mod.stages.forEach(function (s) { state.session.bypass[s] = on; });
+    saveSessions();
+    broadcastTune();
+    renderFxPanel();
+  }
+
+  function renderFxPills() {
+    var pills = $('fx-pills');
+    pills.innerHTML = '';
+    SOUND_MAIN.forEach(function (sound) {
+      var pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = 'preset-pill sound-btn' + (state.session.preset === sound.id ? ' current' : '');
+      pill.textContent = sound.text;
+      pill.setAttribute('data-preset', sound.id);
+      pill.setAttribute('aria-label', sound.text);
+      pill.setAttribute('aria-pressed', state.session.preset === sound.id ? 'true' : 'false');
+      pill.addEventListener('click', function () { setSound(sound.id); });
+      pills.appendChild(pill);
+    });
+    pills.appendChild(el('span', 'fun-label', 'Fun sounds'));
+    SOUND_FUN.forEach(function (sound) {
+      var preset = PRESETS.filter(function (p) { return p.id === sound.id; })[0];
+      var pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = 'preset-pill' + (state.session.preset === sound.id ? ' current' : '');
+      pill.textContent = sound.text;
+      pill.setAttribute('data-preset', sound.id);
+      pill.setAttribute('aria-label', preset ? preset.label : sound.text);
+      pill.setAttribute('aria-pressed', state.session.preset === sound.id ? 'true' : 'false');
+      pill.addEventListener('click', function () { setPreset(sound.id); });
+      pills.appendChild(pill);
+    });
+  }
+
+  function renderFxPanel() {
+    var panel = $('fx-panel');
+    if (!panel) return;
+    renderFxPills();
+    var slider = $('fx-strength');
+    slider.value = String(state.session.strength);
+    slider.disabled = state.session.preset === 'clean';
+    $('fx-strength-value').textContent = state.session.strength + '%';
+    // v13.2 (item 7): the button reads "Key", never the key's
+    // name — same rule as the top bar. The key sheet itself is
+    // the only place the name shows.
+    $('fx-chain-on').checked = state.session.chainOn;
+    // The room-noise cut is its own switch (checked = the cut is
+    // ON, bypass off) — same as Setup's.
+    $('fx-nr').checked = !state.session.bypass.nr;
+    FX_MODULES.forEach(function (mod, i) {
+      var btn = fxSlots[i];
+      if (!btn) return;
+      var on = state.session.chainOn && fxModuleOn(mod);
+      btn.classList.toggle('off', !on);
+      btn.disabled = !state.session.chainOn;
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    MACRO_KEYS.forEach(function (key) {
+      var s2 = $('fx-macro-' + key);
+      var val = $('fx-macro-' + key + '-value');
+      if (!s2) return;
+      s2.value = String(state.session.macros[key]);
+      if (val) val.textContent = state.session.macros[key] + '%';
+    });
+    TONE_KEYS.forEach(function (key) {
+      var s2 = $('fx-tone-' + key);
+      var val = $('fx-tone-' + key + '-value');
+      if (!s2) return;
+      s2.value = String(state.session.tone[key]);
+      if (val) val.textContent = state.session.tone[key] + '%';
+    });
+  }
+
+  var FX_TRACK_NAMES = { lead: 'Lead', adlibs: 'Ad-libs', harmonies: 'Harmonies' };
+
+  /* The panel's wave: live while he sings (record or monitor —
+   * the same rolling peaks as the record strip), otherwise the
+   * selected track's take, otherwise a flat line that says so.
+   * The mic is never opened for the panel — it only draws what
+   * the app is already hearing or has already saved (v11: the
+   * mic opens only while a take is recording).
+   */
+  function drawFxWave() {
+    var panel = $('fx-panel');
+    if (!panel || panel.style.display === 'none') return;
+    var canvas = $('fx-wave');
+    if (!canvas) return;
+    if (state.recording || state.monitorOn) {
+      drawLivePeaksInto(canvas);
+      $('fx-wave-hint').textContent = 'Your voice, live.';
+      return;
+    }
+    var take = activeTakeOf(state.selectedTrack);
+    if (!take) {
+      drawWave(canvas, null, '#a78bfa');
+      $('fx-wave-hint').textContent = 'Sing to see your voice move here.';
+      return;
+    }
+    var label = FX_TRACK_NAMES[state.selectedTrack] || 'Lead';
+    $('fx-wave-hint').textContent = 'Your last take on ' + label + '.';
+    drawWave(canvas, null, '#a78bfa'); // baseline until the peaks arrive
+    getTakeWave(take.id).then(function (wave) {
+      if ($('fx-panel').style.display === 'none') return;
+      if (state.recording || state.monitorOn) {
+        drawLivePeaksInto(canvas);
+        return;
+      }
+      if (wave) drawWave(canvas, wave, '#a78bfa');
+    });
+  }
+
+  function openFxPanel() {
+    renderFxPanel();
+    $('fx-panel').style.display = 'flex';
+    drawFxWave();
+  }
+
+  function closeFxPanel() {
+    $('fx-panel').style.display = 'none';
   }
 
   function renderAll() {
@@ -4892,8 +5327,129 @@
     $('take-sheet').addEventListener('click', function (event) {
       if (event.target === $('take-sheet')) closeTakeSheet();
     });
+    // v13.7 — the send choice sheet: the X, a tap on the dimmed
+    // backdrop, and the two choices. The buttons read the take the
+    // sheet was opened for; tapping either twice is safe (the
+    // buttons disable while the smaller copy is being made).
+    $('send-close').addEventListener('click', closeSendSheet);
+    $('send-sheet').addEventListener('click', function (event) {
+      if (event.target === $('send-sheet')) closeSendSheet();
+    });
+    $('send-small').addEventListener('click', function () {
+      if (pendingSendTakeId) sendSmallCopy(pendingSendTakeId);
+    });
+    $('send-full').addEventListener('click', function () {
+      if (pendingSendTakeId) sendFullQuality(pendingSendTakeId);
+    });
     $('topbar-key').addEventListener('click', openKeySheet);
     $('key-sheet-close').addEventListener('click', closeKeySheet);
+    // Step 5 (v13.6): the sound panel — the Sound button in the
+    // top bar, the close button, a tap on the dimmed backdrop, and
+    // a swipe down on the panel's head. The Key button opens the
+    // key sheet on top of the panel.
+    buildFxStrip();
+    $('fx-open').addEventListener('click', openFxPanel);
+    $('fx-close').addEventListener('click', closeFxPanel);
+    $('fx-panel').addEventListener('click', function (event) {
+      if (event.target === $('fx-panel')) closeFxPanel();
+    });
+    $('fx-key').addEventListener('click', openKeySheet);
+    // The panel's strength slider: live while dragging (he hears
+    // it change), saved when he lets go — same as the record
+    // screen's slider.
+    $('fx-strength').addEventListener('input', function () {
+      setStrength(Number(this.value));
+    });
+    $('fx-strength').addEventListener('change', function () {
+      setStrength(Number(this.value));
+      saveSessions();
+    });
+    // The whole-sound switch: same as Setup's — off parks the
+    // chain, and the five parts go quiet with it (their settings
+    // stay underneath).
+    $('fx-chain-on').addEventListener('change', function () {
+      state.session.chainOn = $('fx-chain-on').checked;
+      saveSessions();
+      broadcastTune();
+      renderFxPanel();
+    });
+    // The room-noise cut: its own switch, same as Setup's —
+    // checked means the cut is ON (bypass off).
+    $('fx-nr').addEventListener('change', function () {
+      state.session.bypass.nr = !$('fx-nr').checked;
+      saveSessions();
+      broadcastTune();
+    });
+    MACRO_KEYS.forEach(function (key) {
+      var slider = $('fx-macro-' + key);
+      var val = $('fx-macro-' + key + '-value');
+      slider.addEventListener('input', function () {
+        state.session.macros[key] = Number(slider.value);
+        if (val) val.textContent = slider.value + '%';
+      });
+      slider.addEventListener('change', function () {
+        state.session.macros[key] = Number(slider.value);
+        saveSessions();
+        broadcastTune();
+      });
+    });
+    TONE_KEYS.forEach(function (key) {
+      var slider = $('fx-tone-' + key);
+      var val = $('fx-tone-' + key + '-value');
+      slider.addEventListener('input', function () {
+        state.session.tone[key] = Number(slider.value);
+        if (val) val.textContent = slider.value + '%';
+      });
+      slider.addEventListener('change', function () {
+        state.session.tone[key] = Number(slider.value);
+        saveSessions();
+        broadcastTune();
+      });
+    });
+    // Swipe up on the record screen's sound strip opens the panel
+    // (the Voloco gesture). Only a swipe that starts on the strip
+    // itself — not on a button or a slider, which keep their own
+    // taps and drags — and only a mostly-upward one, so a sideways
+    // scrub never opens it by accident.
+    (function () {
+      var start = null;
+      var strip = $('preset-strip');
+      strip.addEventListener('pointerdown', function (e) {
+        if (e.target.closest('button, input, select, a')) return;
+        start = { x: e.clientX, y: e.clientY, opened: false };
+      });
+      strip.addEventListener('pointermove', function (e) {
+        if (!start || start.opened) return;
+        var dy = e.clientY - start.y;
+        var dx = e.clientX - start.x;
+        if (dy <= -50 && Math.abs(dx) <= 40) {
+          start.opened = true;
+          openFxPanel();
+        }
+      });
+      window.addEventListener('pointerup', function () { start = null; });
+      window.addEventListener('pointercancel', function () { start = null; });
+    })();
+    // Swipe down on the panel's head closes it.
+    (function () {
+      var start = null;
+      var head = $('fx-head');
+      head.addEventListener('pointerdown', function (e) {
+        if (e.target.closest('button')) return;
+        start = { x: e.clientX, y: e.clientY, closed: false };
+      });
+      head.addEventListener('pointermove', function (e) {
+        if (!start || start.closed) return;
+        var dy = e.clientY - start.y;
+        var dx = e.clientX - start.x;
+        if (dy >= 50 && Math.abs(dx) <= 40) {
+          start.closed = true;
+          closeFxPanel();
+        }
+      });
+      window.addEventListener('pointerup', function () { start = null; });
+      window.addEventListener('pointercancel', function () { start = null; });
+    })();
     $('key-sheet').addEventListener('click', function (event) {
       if (event.target === $('key-sheet')) closeKeySheet();
     });

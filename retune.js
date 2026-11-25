@@ -260,12 +260,59 @@
     return result.out;
   }
 
+  /* A Butterworth low-pass, in plain JS (v13.7). The take's small
+   * copy needs one: the resampler folds anything above the new top
+   * end back down as a phantom tone, so the take is filtered
+   * before it is resampled. It is plain JS and not a
+   * BiquadFilterNode on purpose — measured in headless Chromium
+   * (cdp-v137 probes, Nov 25): a BiquadFilterNode 'lowpass' at
+   * 8,500 Hz with Q=0.707 passed 8 kHz at 1.15× where the RBJ
+   * cookbook says 0.76×, and a 5-section Butterworth cascade built
+   * from those nodes peaked at 3.35× around 7 kHz. The same
+   * coefficients run through this loop read 0.995× at 3 kHz and
+   * 0.757× at 8 kHz — exactly the cookbook. So the filter lives
+   * here, identical in every browser, and the node is not trusted
+   * with it.
+   *
+   * `order` must be even (10 for the small copy: 8 kHz passes at
+   * ~0.88×, 12 kHz is down to ~0.03×). The sections are the
+   * Butterworth pole pairs, Q = 1 / (2 cos((2k-1)π / (2n))). The
+   * loop is Direct Form I with double-precision state, in place —
+   * the history lives in variables, so writing y[i] into the same
+   * array never corrupts x[i-1]. A cutoff at or above the top end
+   * is a no-op (nothing to filter). Returns the same array.
+   */
+  function lowpassButterworth(samples, sampleRate, cutoffHz, order) {
+    if (!samples || samples.length === 0 || !sampleRate || !cutoffHz || !order) return samples;
+    if (cutoffHz >= sampleRate / 2) return samples;
+    var n = order % 2 === 0 ? order : order + 1;
+    var sections = n / 2;
+    var w0 = 2 * Math.PI * cutoffHz / sampleRate;
+    var cosw = Math.cos(w0);
+    var sinw = Math.sin(w0);
+    var b0 = (1 - cosw) / 2, b1 = 1 - cosw, b2 = (1 - cosw) / 2;
+    for (var k = 1; k <= sections; k++) {
+      var q = 1 / (2 * Math.cos((2 * k - 1) * Math.PI / (2 * n)));
+      var alpha = sinw / (2 * q);
+      var a0 = 1 + alpha, a1 = -2 * cosw, a2 = 1 - alpha;
+      var x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+      for (var i = 0; i < samples.length; i++) {
+        var x0 = samples[i];
+        var y0 = (b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2) / a0;
+        samples[i] = y0;
+        x2 = x1; x1 = x0; y2 = y1; y1 = y0;
+      }
+    }
+    return samples;
+  }
+
   return {
     HOP: HOP,
     analyze: analyze,
     analyzeChunked: analyzeChunked,
     render: render,
     smoothTrack: smoothTrack,
-    noteName: noteName
+    noteName: noteName,
+    lowpassButterworth: lowpassButterworth // v13.7: the small copy's anti-alias filter
   };
 });

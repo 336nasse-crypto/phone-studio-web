@@ -818,6 +818,16 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
 .take-info strong { font-size: 16px; }
 .take-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
+/* v13.7 — the send choice: smaller copy vs full quality. The two
+ * buttons are full-width so the choice is one thumb-tap, not a
+ * hunt through the sheet. */
+.send-choice {
+  display: block;
+  width: 100%;
+  margin-top: 10px;
+  text-align: center;
+}
+
 /* Key picker — 16 keys as pills in a grid. */
 .key-grid {
   display: grid;
@@ -854,6 +864,45 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
   background: var(--purple-soft);
   color: #fff;
 }
+
+/* Step 5 (v13.6) — the sound panel: the whole sound on one sheet.
+ * The 5-slot chain strip: one slot per sound part, a tap turns the
+ * whole part off or on. A part that is off keeps its settings and
+ * shows a diagonal line across the slot. */
+.fx-wave { width: 100%; height: 48px; display: block; }
+.fx-key-row { display: flex; gap: 12px; align-items: center; margin: 12px 0 4px; }
+.fx-strip {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+.fx-slot {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  color: var(--text);
+  padding: 10px 2px 8px;
+  cursor: pointer;
+  min-height: 78px;
+}
+.fx-slot:active { transform: scale(.97); }
+.fx-slot svg { width: 24px; height: 24px; display: block; margin: 0 auto 5px; color: var(--purple); }
+.fx-slot span { display: block; font-size: 12px; font-weight: 700; line-height: 1.2; }
+.fx-slot.off { opacity: .55; }
+.fx-slot.off::after {
+  content: '';
+  position: absolute;
+  left: -30%;
+  top: 50%;
+  width: 160%;
+  height: 2px;
+  background: var(--text);
+  transform: rotate(-50deg);
+}
+.fx-slot:disabled { cursor: default; }
 
 @media (prefers-reduced-motion: reduce) {
   .btn-record.recording, .live-dot { animation: none; }

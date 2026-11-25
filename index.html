@@ -33,6 +33,7 @@
     <button id="topbar-key" class="topbar-key" aria-label="Change key">
       <span id="topbar-song-key">Key</span>
     </button>
+    <button id="fx-open" class="topbar-key" aria-label="Open the sound screen">Sound</button>
     <button id="setup-open" class="icon-btn" aria-label="Setup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 1-1.82-.33 1.65 1.65 0 0 1-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09a1.65 1.65 0 0 1-1-1.51 1.65 1.65 0 0 1-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 1 .33-1.82 1.65 1.65 0 0 1-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09a1.65 1.65 0 0 1 1.51-1 1.65 1.65 0 0 1-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 1 1.82.33h.01a1.65 1.65 0 0 1 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 1 1 1.51h.01a1.65 1.65 0 0 1 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 1-.33 1.82v.01a1.65 1.65 0 0 1 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 1-1.51 1z"></path></svg></button>
   </header>
 
@@ -236,6 +237,19 @@
   </div>
 </div>
 
+<div id="send-sheet" class="sheet" style="display:none">
+  <div class="sheet-card">
+    <div class="sheet-head">
+      <h2>Send this take</h2>
+      <button id="send-close" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <p class="muted">The smaller copy sends easily. Full quality keeps everything — it is the big file, for the studio archive.</p>
+    <button id="send-small" class="btn send-choice">Smaller copy — sends easily</button>
+    <button id="send-full" class="btn send-choice">Full quality</button>
+    <p id="send-status" class="status"></p>
+  </div>
+</div>
+
 <div id="comp-sheet" class="sheet" style="display:none">
   <div class="sheet-card">
     <div class="sheet-head">
@@ -245,6 +259,52 @@
     <p id="comp-intro" class="muted small">Pick the best take for each part — the app stitches them into one take. Your takes stay exactly as they are.</p>
     <div id="comp-list"></div>
     <button id="comp-make" class="btn">Make the best take</button>
+  </div>
+</div>
+
+<div id="fx-panel" class="sheet" style="display:none">
+  <div class="sheet-card">
+    <div class="sheet-head" id="fx-head">
+      <h2>Your sound</h2>
+      <button id="fx-close" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <canvas id="fx-wave" class="fx-wave" width="360" height="48" aria-hidden="true"></canvas>
+    <p id="fx-wave-hint" class="muted small">Sing to see your voice move here.</p>
+    <div id="fx-pills" class="preset-pills" role="group" aria-label="How it sounds"></div>
+    <div class="strength-row">
+      <label for="fx-strength">How much</label>
+      <span class="range-end">a little</span>
+      <input id="fx-strength" type="range" min="0" max="100" value="100" aria-label="How much tune">
+      <span class="range-end">a lot</span>
+      <span id="fx-strength-value">100%</span>
+    </div>
+    <div class="fx-key-row">
+      <button id="fx-key" class="btn">Key</button>
+      <span class="muted small">The key your voice tunes to.</span>
+    </div>
+    <label class="chain-toggle"><input id="fx-chain-on" type="checkbox" checked> Full studio sound <span class="muted">— the body, tone, echo and space, on while you sing</span></label>
+    <label class="chain-toggle"><input id="fx-nr" type="checkbox"> Cut background noise <span class="muted">— quiets the room between lines (off unless you need it)</span></label>
+    <p class="take-sound-label" style="margin-top:14px">Sound parts</p>
+    <div id="fx-strip" class="fx-strip"></div>
+    <p class="take-sound-label" style="margin-top:14px">Studio sound</p>
+    <div class="strength-row macro-row"><label for="fx-macro-even">Even</label><input id="fx-macro-even" type="range" min="0" max="100" value="50" aria-label="Even — keeps loud and quiet parts level"><span id="fx-macro-even-value">50%</span></div>
+    <p class="muted small macro-hint">Keeps loud and quiet parts level.</p>
+    <div class="strength-row macro-row"><label for="fx-macro-bright">Bright</label><input id="fx-macro-bright" type="range" min="0" max="100" value="50" aria-label="Bright — makes the voice shine"><span id="fx-macro-bright-value">50%</span></div>
+    <p class="muted small macro-hint">Makes the voice shine.</p>
+    <div class="strength-row macro-row"><label for="fx-macro-space">Space</label><input id="fx-macro-space" type="range" min="0" max="100" value="50" aria-label="Space — how much room you hear"><span id="fx-macro-space-value">50%</span></div>
+    <p class="muted small macro-hint">How much room you hear.</p>
+    <div class="strength-row macro-row"><label for="fx-macro-punch">Punch</label><input id="fx-macro-punch" type="range" min="0" max="100" value="50" aria-label="Punch — makes words hit harder"><span id="fx-macro-punch-value">50%</span></div>
+    <p class="muted small macro-hint">Makes words hit harder.</p>
+    <div class="strength-row macro-row"><label for="fx-macro-warm">Warm</label><input id="fx-macro-warm" type="range" min="0" max="100" value="50" aria-label="Warm — rounds the voice out"><span id="fx-macro-warm-value">50%</span></div>
+    <p class="muted small macro-hint">Rounds the voice out.</p>
+    <p class="take-sound-label" style="margin-top:14px">Fine tone</p>
+    <div class="strength-row macro-row"><label for="fx-tone-rumble">Cut the rumble</label><input id="fx-tone-rumble" type="range" min="0" max="100" value="50" aria-label="Cut the rumble — how much low rumble to take out"><span id="fx-tone-rumble-value">50%</span></div>
+    <p class="muted small macro-hint">How much low rumble to take out.</p>
+    <div class="strength-row macro-row"><label for="fx-tone-presence">Cut through</label><input id="fx-tone-presence" type="range" min="0" max="100" value="50" aria-label="Cut through — makes the words cut through the beat"><span id="fx-tone-presence-value">50%</span></div>
+    <p class="muted small macro-hint">Makes the words cut through the beat.</p>
+    <div class="strength-row macro-row"><label for="fx-tone-air">Shine</label><input id="fx-tone-air" type="range" min="0" max="100" value="50" aria-label="Shine — makes the voice shine on top"><span id="fx-tone-air-value">50%</span></div>
+    <p class="muted small macro-hint">Makes the voice shine on top.</p>
+    <p class="muted small">These choices shape your next take. A take you already made keeps its own sound.</p>
   </div>
 </div>
 

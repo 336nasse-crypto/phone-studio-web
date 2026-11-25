@@ -54,6 +54,50 @@
     return buffer;
   }
 
+  /* Encode mono float32 samples as a 16-bit PCM WAV file. Returns
+   * an ArrayBuffer. Layout: RIFF / fmt (PCM, format 1, 1 channel,
+   * 16-bit) / data. Values are clamped to [-1, 1] — a take that
+   * already clips stays clipped, it does not wrap. One bit of
+   * quantization noise (~-96 dB) sits far below any phone mic's own
+   * noise, so the small copy (v13.7) keeps everything the mic
+   * heard while the file shrinks to a quarter of the float32 size.
+   */
+  function encodeWav16(samples, sampleRate) {
+    var numSamples = samples.length;
+    var bytesPerSample = 2;
+    var dataBytes = numSamples * bytesPerSample;
+    var buffer = new ArrayBuffer(44 + dataBytes);
+    var view = new DataView(buffer);
+
+    function writeString(offset, str) {
+      for (var i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    }
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + dataBytes, true); // chunk size
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true); // fmt chunk size
+    view.setUint16(20, 1, true); // audio format: 1 = PCM
+    view.setUint16(22, 1, true); // channels: mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * bytesPerSample, true); // byte rate
+    view.setUint16(32, bytesPerSample, true); // block align
+    view.setUint16(34, 16, true); // bits per sample
+    writeString(36, 'data');
+    view.setUint32(40, dataBytes, true);
+
+    for (var i = 0; i < numSamples; i++) {
+      var s = samples[i];
+      if (s > 1) s = 1;
+      else if (s < -1) s = -1;
+      view.setInt16(44 + i * 2, Math.round(s * 32767), true);
+    }
+    return buffer;
+  }
+
   /* Decode a WAV file (ArrayBuffer) to mono float32 samples.
    * Supports format 1 (PCM 8/16/24/32-bit) and format 3 (float32).
    * Stereo (or more channels) is mixed to mono by averaging, exactly
@@ -150,6 +194,7 @@
 
   return {
     encodeWavFloat32: encodeWavFloat32,
+    encodeWav16: encodeWav16,
     decodeWavFloat32: decodeWavFloat32
   };
 });
