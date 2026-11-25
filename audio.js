@@ -12,10 +12,29 @@
  * - getUserMedia constraints ask for RAW audio: echoCancellation,
  *   noiseSuppression, and autoGainControl all off. Safari may still
  *   process the signal; the mic test (frequency content) is the proof.
+ *   The settings actually applied are read back with
+ *   track.getSettings() on every take and logged (Step 1B).
  * - Safari CANNOT select the input device. If iOS routes the mic to
  *   the Bluetooth headset (HFP), the recording is low-quality. The app
  *   carries a plain-words warning about this (see app.js); no hacks
  *   are attempted to force the input.
+ * - The mic is open ONLY while something needs it (a take, a
+ *   calibration, the live monitor, the ideas logger). Afterwards the
+ *   track is stopped and the AudioSession is cycled back to playback
+ *   then auto, so review plays at full quality (Step 1B): with the
+ *   mic open, iOS lowers the output sample rate and folds stereo to
+ *   mono (WebKit 311451). Re-opening the mic later re-uses the
+ *   already-granted permission — no second prompt on iOS Safari.
+ * - AudioSession routing guard (Step 1B): before/right after
+ *   getUserMedia(), the session type cycles auto -> play-and-record
+ *   so iOS locks playback to the headphones; on stop it goes
+ *   playback -> auto so iOS exits HFP/VPIO and restores full-
+ *   bandwidth A2DP stereo. Safari's AudioSession API implements
+ *   only `type` (no `state` — WebKit 283417); AudioContext.state is
+ *   watched for interruptions instead.
+ * - Takes are written to storage in 48,000-sample chunks WHILE
+ *   recording (Step 1B): the onChunk callback fires once per chunk,
+ *   so a killed take is recoverable from its chunks.
  *
  * Loads in the browser as window.PS.audio.
  */
@@ -48,15 +67,21 @@
   // what is left.
   var NOMINAL_FLOOR = 0.02;
   var NOMINAL_INPUT_ALLOWANCE = 0.01;
+  // Chunked-write size (Step 1B): one chunk per ~1 s at 48 kHz.
+  // Must match PS.safety.CHUNK_SAMPLES (kept as a local constant
+  // so this module has no load-order dependency on safety.js).
+  var PS_CHUNK_SAMPLES = 48000;
 
   var ctx = null;
   var workletReady = false;
   var stream = null;
   var sourceNode = null;
   var workletNode = null;
+  var micSettingsCache = null; // last track.getSettings() reading
+  var sessionLog = []; // AudioSession type transitions (for take metadata)
 
   // Capture state (one capture at a time — calibration or take).
-  var capture = null; // { blocks, firstTime, totalFrames, onBlock, waiters }
+  var capture = null; // { blocks, firstTime, totalFrames, onBlock, waiters, chunkBuf, chunkFill, chunkIndex, onChunk }
 
   function sampleRate() {
     return ctx ? ctx.sampleRate : 0;
@@ -109,9 +134,32 @@
     return Promise.resolve(ctx);
   }
 
+  /* AudioSession routing guard (Step 1B). Safari implements only
+   * `navigator.audioSession.type`. No-op (logged) where the API
+   * does not exist — the guard must never throw.
+   */
+  function setAudioSessionType(type) {
+    try {
+      if (navigator.audioSession && typeof navigator.audioSession.type !== 'undefined') {
+        navigator.audioSession.type = type;
+        sessionLog.push({ type: type, at: new Date().toISOString() });
+        if (sessionLog.length > 20) sessionLog.shift();
+      }
+    } catch (err) {
+      console.warn('AudioSession type could not be set to ' + type + ':', err);
+    }
+  }
+
+  function audioSessionLog() {
+    return sessionLog.slice();
+  }
+
   /* Opens the mic with raw-audio constraints (no echo cancellation,
-   * no noise suppression, no automatic gain). Keeps the stream open
-   * across takes so the user is asked once.
+   * no noise suppression, no automatic gain). Verifies the settings
+   * actually applied via track.getSettings() and logs them (Step 1B)
+   * — Safari may silently apply processing the constraints asked it
+   * not to. Locks the session to play-and-record so iOS keeps
+   * playback on the headphones.
    */
   function ensureMic() {
     if (stream && stream.active) return Promise.resolve(stream);
@@ -127,8 +175,54 @@
       }
     }).then(function (s) {
       stream = s;
+      var track = s.getAudioTracks()[0];
+      if (track && track.getSettings) {
+        try {
+          micSettingsCache = track.getSettings();
+        } catch (err) {
+          micSettingsCache = null;
+        }
+      }
+      if (micSettingsCache) {
+        console.log('Mic settings:', JSON.stringify(micSettingsCache));
+        if (micSettingsCache.echoCancellation === true) {
+          console.warn('Mic echoCancellation is ON despite the raw constraints — the take may be processed.');
+        }
+      }
+      setAudioSessionType('play-and-record');
       return s;
     });
+  }
+
+  /* The last verified mic settings (track.getSettings()), or null
+   * when the mic has never been opened.
+   */
+  function micSettings() {
+    return micSettingsCache ? JSON.parse(JSON.stringify(micSettingsCache)) : null;
+  }
+
+  /* Closes the mic: stops every track and drops the graph so the
+   * next open rebuilds it. No-op while a capture is running (the
+   * caller must stop the capture first) and when the mic is already
+   * closed. Cycles the session playback -> auto so iOS exits
+   * HFP/VPIO and restores full-bandwidth A2DP stereo for review.
+   */
+  function closeMic() {
+    if (capture) return false; // a live capture owns the mic
+    if (!stream) return false;
+    try {
+      stream.getTracks().forEach(function (t) { t.stop(); });
+    } catch (err) { /* ignore */ }
+    stream = null;
+    sourceNode = null;
+    workletNode = null;
+    setAudioSessionType('playback');
+    setTimeout(function () { setAudioSessionType('auto'); }, 500);
+    return true;
+  }
+
+  function isMicOpen() {
+    return !!(stream && stream.active);
   }
 
   function ensureGraph() {
@@ -171,19 +265,50 @@
     capture.blocks.push(data);
     capture.totalFrames += data.samples.length;
     if (capture.onBlock) capture.onBlock(data);
+    // Chunked writes (Step 1B): every 48,000 samples (~1 s) is a
+    // chunk, handed to the onChunk callback as soon as it is full —
+    // so a take killed mid-record leaves its chunks on disk.
+    if (capture.onChunk) {
+      var samples = data.samples;
+      var offset = 0;
+      while (offset < samples.length) {
+        var room = PS_CHUNK_SAMPLES - capture.chunkFill;
+        var take = Math.min(room, samples.length - offset);
+        capture.chunkBuf.set(samples.subarray(offset, offset + take), capture.chunkFill);
+        capture.chunkFill += take;
+        offset += take;
+        if (capture.chunkFill >= PS_CHUNK_SAMPLES) {
+          var chunk = capture.chunkBuf.slice();
+          var index = capture.chunkIndex;
+          capture.chunkIndex += 1;
+          capture.chunkFill = 0;
+          try {
+            capture.onChunk(index, chunk);
+          } catch (err) {
+            console.warn('Chunk write callback failed:', err);
+          }
+        }
+      }
+    }
   }
 
   /* Starts a capture run. onBlock receives each batch
-   * { time, samples, peak } as it arrives. Returns a promise that
-   * resolves with the capture handle once the first block has arrived
-   * (so the caller knows the mic is actually flowing) — or rejects if
-   * no block arrives within FIRST_BLOCK_TIMEOUT_MS.
+   * { time, samples, peak } as it arrives. opts.onChunk(index,
+   * samples) receives each full 48,000-sample chunk as it fills
+   * (Step 1B). Returns a promise that resolves with the capture
+   * handle once the first block has arrived (so the caller knows
+   * the mic is actually flowing) — or rejects if no block arrives
+   * within FIRST_BLOCK_TIMEOUT_MS.
    */
-  function startCapture(onBlock) {
+  function startCapture(onBlock, opts) {
     return ensureGraph().then(function () {
       if (capture) return Promise.reject(new Error('A recording is already running.'));
       if (!workletNode) return Promise.reject(new Error('The recorder could not start. Close the app and open it again.'));
-      capture = { blocks: [], firstTime: null, totalFrames: 0, onBlock: onBlock || null, waiters: [] };
+      capture = {
+        blocks: [], firstTime: null, totalFrames: 0, onBlock: onBlock || null, waiters: [],
+        chunkBuf: new Float32Array(PS_CHUNK_SAMPLES), chunkFill: 0, chunkIndex: 0,
+        onChunk: (opts && opts.onChunk) || null
+      };
       try {
         workletNode.port.postMessage({ type: 'start' });
       } catch (err) {
@@ -285,31 +410,39 @@
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
-  /* Runs a full acoustic calibration: 5 clicks through the output,
-   * recorded through the mic, median delay across the clicks heard.
-   * onProgress(text) reports plain-words status. Returns the
+  /* Runs a click test: N clicks through the output, recorded
+   * through the mic, median delay across the clicks heard.
+   * options: { count, spacingSeconds, firstDelaySeconds, onProgress,
+   *   progressText } — the calibration (5 clicks, 0.6 s apart) and
+   * the route lab's clap test (8 clicks at 90 BPM) are the same
+   * measurement with different counts. Returns the
    * calibrate.measureDelays result ({ ok, medianMs, medianSamples,
    * delaySeconds, delaysMs, detected, error }).
-   * (Port of LatencyCalibrator.calibrate.)
+   * (Port of LatencyCalibrator.calibrate, generalized.)
    */
-  function runCalibration(onProgress) {
+  function runClickTest(options) {
+    var opts = options || {};
+    var count = opts.count || PS.calibrate.CLICK_COUNT;
+    var spacing = opts.spacingSeconds || PS.calibrate.CLICK_SPACING;
+    var firstDelay = (typeof opts.firstDelaySeconds === 'number')
+      ? opts.firstDelaySeconds : PS.calibrate.FIRST_CLICK_DELAY;
     var C = PS.calibrate;
     var clickBuffer = null;
     var scheduledTimes = [];
     var players = [];
     function progress(text) {
-      if (onProgress) onProgress(text);
+      if (opts.onProgress) opts.onProgress(text);
     }
-    progress('Playing 5 clicks — keep the headphones still…');
+    progress(opts.progressText || ('Playing ' + count + ' clicks — keep the headphones still…'));
     return startCapture(null).then(function (cap) {
       clickBuffer = makeClickBuffer();
-      // First click 0.5 s after the first recorded sample, then one
-      // every 0.6 s. (Native schedules from the engine clock after
-      // the tap starts; the first recorded sample is the same
-      // reference point on the web.)
-      var firstClickTime = cap.firstTime + C.FIRST_CLICK_DELAY;
-      for (var i = 0; i < C.CLICK_COUNT; i++) {
-        var at = firstClickTime + i * C.CLICK_SPACING;
+      // First click firstDelay s after the first recorded sample,
+      // then one every spacing s. (Native schedules from the engine
+      // clock after the tap starts; the first recorded sample is the
+      // same reference point on the web.)
+      var firstClickTime = cap.firstTime + firstDelay;
+      for (var i = 0; i < count; i++) {
+        var at = firstClickTime + i * spacing;
         scheduledTimes.push(at);
         var player = ctx.createBufferSource();
         player.buffer = clickBuffer;
@@ -317,7 +450,7 @@
         player.start(at);
         players.push(player);
       }
-      var totalWait = C.FIRST_CLICK_DELAY + C.CLICK_COUNT * C.CLICK_SPACING + C.SEARCH_WINDOW + 0.5;
+      var totalWait = firstDelay + count * spacing + C.SEARCH_WINDOW + 0.5;
       return sleep(totalWait * 1000);
     }).then(function () {
       players.forEach(function (p) { try { p.stop(); } catch (e) { /* already stopped */ } });
@@ -335,12 +468,29 @@
     });
   }
 
+  /* Runs a full acoustic calibration: 5 clicks through the output,
+   * recorded through the mic, median delay across the clicks heard.
+   * onProgress(text) reports plain-words status. Returns the
+   * calibrate.measureDelays result. (Port of
+   * LatencyCalibrator.calibrate.)
+   */
+  function runCalibration(onProgress) {
+    return runClickTest({
+      count: PS.calibrate.CLICK_COUNT,
+      spacingSeconds: PS.calibrate.CLICK_SPACING,
+      firstDelaySeconds: PS.calibrate.FIRST_CLICK_DELAY,
+      onProgress: onProgress
+    });
+  }
+
   /* Starts a take. Options:
    *   beat: { buffer } | null — the decoded beat (plays at the anchor)
    *   overdubs: [AudioBuffer] — active takes of the other vocal tracks
    *   delaySeconds: number | null — the measured round-trip D (null
    *     when uncalibrated: pre-comp is off, nominal fallback applies)
    *   onBlock: fn(batch) — level meter updates
+   *   onChunk: fn(index, samples) — chunked-write callback (Step 1B):
+   *     one 48,000-sample chunk per call, as it fills
    *
    * Returns a promise resolving to the take handle:
    *   { anchorTime, firstSampleTime, preCompActive, delaySeconds,
@@ -356,7 +506,7 @@
     var opts = options || {};
     var players = [];
     var handle = null;
-    return startCapture(opts.onBlock || null).then(function (cap) {
+    return startCapture(opts.onBlock || null, { onChunk: opts.onChunk || null }).then(function (cap) {
       var anchorTime = cap.firstTime + ANCHOR_DELAY;
       var delaySeconds = (typeof opts.delaySeconds === 'number') ? opts.delaySeconds : null;
       var preCompActive = false;
@@ -446,19 +596,76 @@
     });
   }
 
+  /* The 60 s Audio Logger (Step 1B): a bare mic capture whose
+   * blocks feed the caller's ring buffer. startLogger returns the
+   * capture handle once the mic is flowing; stopLogger returns the
+   * recorded samples (the caller normally ignores them — the ring
+   * buffer already holds the last 60 s). The mic stays open only
+   * while the logger is armed.
+   */
+  function startLogger(onBlock) {
+    return startCapture(onBlock || null);
+  }
+
+  function stopLogger() {
+    return stopCapture();
+  }
+
+  /* Output latency in seconds (Safari 18.4+), or null when the
+   * browser does not report it. Logged on every take next to the
+   * acoustic calibration (Step 0C).
+   */
+  function outputLatency() {
+    if (ctx && typeof ctx.outputLatency === 'number' && isFinite(ctx.outputLatency)) {
+      return ctx.outputLatency;
+    }
+    return null;
+  }
+
+  function baseLatency() {
+    if (ctx && typeof ctx.baseLatency === 'number' && isFinite(ctx.baseLatency)) {
+      return ctx.baseLatency;
+    }
+    return null;
+  }
+
+  /* Everything the route lab needs about the current audio route,
+   * in one object (Step 0).
+   */
+  function contextInfo() {
+    return {
+      sampleRate: sampleRate(),
+      baseLatency: baseLatency(),
+      outputLatency: outputLatency(),
+      state: ctx ? ctx.state : null,
+      micSettings: micSettings()
+    };
+  }
+
   return {
     ANCHOR_DELAY: ANCHOR_DELAY,
     PRECOMP_GUARD: PRECOMP_GUARD,
+    CHUNK_SAMPLES: PS_CHUNK_SAMPLES,
     sampleRate: sampleRate,
     ensureContext: ensureContext,
     ensureMic: ensureMic,
+    closeMic: closeMic,
+    isMicOpen: isMicOpen,
+    micSettings: micSettings,
+    audioSessionLog: audioSessionLog,
     nominalLatency: nominalLatency,
+    outputLatency: outputLatency,
+    baseLatency: baseLatency,
+    contextInfo: contextInfo,
     decodeBeat: decodeBeat,
     decodeAudio: decodeAudio,
     runCalibration: runCalibration,
+    runClickTest: runClickTest,
     startTake: startTake,
     stopTake: stopTake,
     playTake: playTake,
+    startLogger: startLogger,
+    stopLogger: stopLogger,
     isCapturing: isCapturing,
     // Bare capture (no beat scheduling) — the mic test uses it.
     startCapture: startCapture,
