@@ -621,6 +621,10 @@ function TuneDSP(sampleRate) {
   this.preset = 'hard';
   this.strength = 1; // 0..1 (from the 0-100 slider)
   this.speedOverride = null; // null = preset default retune time
+  // --- offline re-tune (Step 3 / retune.js) ---
+  this.offline = false; // true = re-tuning a finished take, not live
+  this.externalPitchHz = null; // null = detect with YIN; a number = use this pitch
+  this.pitchTrack = null; // array or null; when set, one Hz (or null) per hop is recorded
   this.vocoderMode = 'monster'; // 'unison' | 'monster' | 'chord'
   this.liveMode = false; // chorus: 4 voices live, 7 on playback
   this.filled = 0;
@@ -745,6 +749,40 @@ TuneDSP.prototype.setVocoderMode = function (mode) {
 
 TuneDSP.prototype.setLiveMode = function (on) {
   this.liveMode = !!on;
+};
+
+/* Offline re-tune (Step 3): retune.js drives the DSP over a
+ * finished take, hop by hop, instead of live audio. Offline the
+ * chorus gets all 7 voices (the live path caps it at 4 so the
+ * phone keeps up while singing).
+ */
+TuneDSP.prototype.setOffline = function (on) {
+  this.offline = !!on;
+  if (this.offline) this.liveMode = false;
+};
+
+/* The pitch to correct from, in Hz — the smoothed pitch track
+ * from the analysis pass. Pass null to go back to live YIN
+ * detection. The track may carry nulls (breaths, pauses); a null
+ * hop is unvoiced, same as no detection.
+ */
+TuneDSP.prototype.setExternalPitchHz = function (hz) {
+  this.externalPitchHz = (hz === null || hz === undefined || isNaN(hz) || hz <= 0) ? null : hz;
+};
+
+/* Record one pitch reading per hop (Hz, or null when unvoiced)
+ * until stopPitchTrack() hands the track back. Used by the
+ * analysis pass — the track is the raw material the smoothing
+ * and the key check work from.
+ */
+TuneDSP.prototype.startPitchTrack = function () {
+  this.pitchTrack = [];
+};
+
+TuneDSP.prototype.stopPitchTrack = function () {
+  var track = this.pitchTrack;
+  this.pitchTrack = null;
+  return track || [];
 };
 
 /* The retune time in ms for the current preset: the speed
@@ -886,10 +924,19 @@ function median3(a, b, c) {
 TuneDSP.prototype.updateTarget = function () {
   var levelDb = 20 * Math.log10(this.hopRms + 1e-12);
   var found = null;
-  if (this.filled >= this.detector.spanSize) {
+  if (this.externalPitchHz !== null) {
+    // Offline re-tune: the pitch comes from the smoothed track,
+    // not the live detector — the correction can look ahead at
+    // notes the singer has already finished.
+    found = { frequency: this.externalPitchHz, confidence: 1, aperiodicity: 0 };
+  } else if (this.filled >= this.detector.spanSize) {
     found = this.detector.detect(this.history);
   }
   this.aperiodicity = found ? found.aperiodicity : 1;
+  // Record the raw pitch reading for the analysis pass.
+  if (this.pitchTrack !== null) {
+    this.pitchTrack.push(found ? found.frequency : null);
+  }
 
   // Breaths and S sounds bypass the correction with an 8 ms
   // crossfade: aperiodic (> 0.2), too quiet (< −50 dBFS), or no
@@ -1391,27 +1438,39 @@ if (typeof AudioWorkletProcessor !== 'undefined') {
   registerProcessor('tune-processor', TuneProcessor);
 }
 
-// ---------------------------------------------------------------- Node export (tests only)
+// ---------------------------------------------------------------- exports
 
+var TuneExports = {
+  YinDetector: YinDetector,
+  PsolaShifter: PsolaShifter,
+  TuneDSP: TuneDSP,
+  PRESETS: PRESETS,
+  VOCODER_MODES: VOCODER_MODES,
+  CHORUS_VOICES: CHORUS_VOICES,
+  CHORUS_LIVE_VOICES: CHORUS_LIVE_VOICES,
+  SCALE_STEPS: SCALE_STEPS,
+  parseKeyName: parseKeyName,
+  scaleMaskForKey: scaleMaskForKey,
+  nearestInScaleNote: nearestInScaleNote,
+  snapNote: snapNote,
+  scaleStep: scaleStep,
+  harmonyNotes: harmonyNotes,
+  hzForMidi: hzForMidi,
+  midiForHz: midiForHz,
+  isInScale: isInScale,
+  fft1024: fft1024
+};
+
+// Node export (tests only).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = {
-    YinDetector: YinDetector,
-    PsolaShifter: PsolaShifter,
-    TuneDSP: TuneDSP,
-    PRESETS: PRESETS,
-    VOCODER_MODES: VOCODER_MODES,
-    CHORUS_VOICES: CHORUS_VOICES,
-    CHORUS_LIVE_VOICES: CHORUS_LIVE_VOICES,
-    SCALE_STEPS: SCALE_STEPS,
-    parseKeyName: parseKeyName,
-    scaleMaskForKey: scaleMaskForKey,
-    nearestInScaleNote: nearestInScaleNote,
-    snapNote: snapNote,
-    scaleStep: scaleStep,
-    harmonyNotes: harmonyNotes,
-    hzForMidi: hzForMidi,
-    midiForHz: midiForHz,
-    isInScale: isInScale,
-    fft1024: fft1024
-  };
+  module.exports = TuneExports;
+}
+
+// Browser classic-script load (retune.js needs TuneDSP outside the
+// worklet — the app loads this file with a <script> tag as well as
+// through audioWorklet.addModule). Harmless in the worklet context
+// and in Node — neither has `window`.
+if (typeof window !== 'undefined') {
+  window.PS = window.PS || {};
+  window.PS.tune = TuneExports;
 }
