@@ -621,6 +621,13 @@ function TuneDSP(sampleRate) {
   this.preset = 'hard';
   this.strength = 1; // 0..1 (from the 0-100 slider)
   this.speedOverride = null; // null = preset default retune time
+  // B1 (v13.1) — output safety: the gain the finished block leaves
+  // through. reset() drops it to 0 and it slews back to 1 over
+  // ~10 ms, so a preset/vocoder switch or an enable never clicks;
+  // applyOutputSafety() also soft-limits peaks above 0.9, so the
+  // output can never exceed full scale (the v10 switch transient
+  // peaked at 1.47 and clipped the DAC).
+  this.outRamp = 1;
   // --- offline re-tune (Step 3 / retune.js) ---
   this.offline = false; // true = re-tuning a finished take, not live
   this.externalPitchHz = null; // null = detect with YIN; a number = use this pitch
@@ -811,6 +818,10 @@ TuneDSP.prototype.reset = function () {
     this.chorusDelays[v].pos = 0;
   }
   this.history.fill(0);
+  // B1 (v13.1): the output fades back in over ~10 ms after any
+  // reset (preset switch, vocoder-mode switch, enable) — the
+  // discontinuity that clicked on a switch is gone.
+  this.outRamp = 0;
   this.sinceLastDetect = 0;
   this.filled = 0;
   this.wasEnabled = false;
@@ -860,33 +871,63 @@ TuneDSP.prototype.process = function (samples, count) {
   // block in one pass.
   if (this.preset === 'clean') {
     this.processClean(samples, count);
-    return;
+  } else {
+    var offset = 0;
+    while (offset < count) {
+      var chunk = Math.min(count - offset, this.hop - this.sinceLastDetect);
+      var part = samples.subarray(offset, offset + chunk);
+      // The detector listens to the CLEAN input — copy it into the
+      // history before the effect rewrites the buffer. The hop RMS
+      // (the −50 dBFS breath gate) is measured on the clean chunk.
+      var sumSq = 0;
+      for (var m = 0; m < chunk; m++) sumSq += part[m] * part[m];
+      this.hopRms = Math.sqrt(sumSq / Math.max(1, chunk));
+      this.appendHistory(part, chunk);
+      if (this.preset === 'vocoder') {
+        this.processVocoder(part, chunk);
+      } else if (this.preset === 'chorus') {
+        this.processChorus(part, chunk);
+      } else {
+        this.shifter.process(part, part, chunk); // hard / natural
+      }
+      this.sinceLastDetect += chunk;
+      offset += chunk;
+      if (this.sinceLastDetect >= this.hop) {
+        this.sinceLastDetect = 0;
+        this.updateTarget();
+      }
+    }
   }
+  // B1 (v13.1): every path leaves through the output safety — the
+  // fade-in after a reset plus the soft limiter. Nothing in the
+  // worklet writes past this point.
+  this.applyOutputSafety(samples, count);
+};
 
-  var offset = 0;
-  while (offset < count) {
-    var chunk = Math.min(count - offset, this.hop - this.sinceLastDetect);
-    var part = samples.subarray(offset, offset + chunk);
-    // The detector listens to the CLEAN input — copy it into the
-    // history before the effect rewrites the buffer. The hop RMS
-    // (the −50 dBFS breath gate) is measured on the clean chunk.
-    var sumSq = 0;
-    for (var m = 0; m < chunk; m++) sumSq += part[m] * part[m];
-    this.hopRms = Math.sqrt(sumSq / Math.max(1, chunk));
-    this.appendHistory(part, chunk);
-    if (this.preset === 'vocoder') {
-      this.processVocoder(part, chunk);
-    } else if (this.preset === 'chorus') {
-      this.processChorus(part, chunk);
-    } else {
-      this.shifter.process(part, part, chunk); // hard / natural
+/* B1 (v13.1) — output safety, the last thing a block passes
+ * through. Two jobs: (1) the fade-in — after any reset() the gain
+ * slews 0 -> 1 over ~10 ms, so a preset switch never clicks;
+ * (2) the soft limiter — below 0.9 the signal is untouched (the
+ * approved preset sounds do not change); above 0.9 it bends
+ * smoothly toward 1.0 and never exceeds it, so a switch transient
+ * (v10 measured 1.47) can never clip the DAC. Transparent for
+ * normal material: test tones peak at ~1.05 only at their summed
+ * harmonics, and the loudest real vocal peaks sit well under 0.9.
+ */
+TuneDSP.prototype.applyOutputSafety = function (samples, count) {
+  var rampStep = 1 / (0.010 * this.sampleRate); // 10 ms fade-in
+  for (var i = 0; i < count; i++) {
+    if (this.outRamp < 1) {
+      this.outRamp = Math.min(1, this.outRamp + rampStep);
     }
-    this.sinceLastDetect += chunk;
-    offset += chunk;
-    if (this.sinceLastDetect >= this.hop) {
-      this.sinceLastDetect = 0;
-      this.updateTarget();
+    var x = samples[i] * this.outRamp;
+    var ax = x < 0 ? -x : x;
+    if (ax > 0.9) {
+      // Piecewise soft clip: y = 0.9 + 0.1 * tanh((|x| - 0.9) / 0.1),
+      // which approaches 1.0 from below and never reaches it.
+      x = (x < 0 ? -1 : 1) * (0.9 + 0.1 * Math.tanh((ax - 0.9) / 0.1));
     }
+    samples[i] = x;
   }
 };
 

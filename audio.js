@@ -74,10 +74,14 @@
 
   var ctx = null;
   var workletReady = false;
+  var masterGain = null; // one gain for all PLAYBACK (beat + takes) — the volume bar (v13)
+  var monitorGain = null; // B2 (v13.1): the live monitor's own gain, tied to the same volume level — one bar means one loudness everywhere he hears sound
+  var volumeLevel = 1; // 0..1 — set by setVolume(), applied when the gain nodes are built
   var stream = null;
   var sourceNode = null;
   var workletNode = null;
   var micSettingsCache = null; // last track.getSettings() reading
+  var micTrackLabel = ''; // v13.2 (item 4): the mic track's label (device name), cached when the mic opens
   var sessionLog = []; // AudioSession type transitions (for take metadata)
 
   // Capture state (one capture at a time — calibration or take).
@@ -113,7 +117,59 @@
         workletReady = true;
         return ctx;
       });
+    }).then(function () {
+      // The master gain for playback (v13): built once, fed by
+      // every playback player (beat + takes). B2 (v13.1): the live
+      // monitor gets its own gain at the SAME level — the volume
+      // bar used to leave his own live voice at full blast. The
+      // calibration clicks stay direct: they are a measurement,
+      // not a sound he listens to.
+      if (!masterGain) {
+        masterGain = ctx.createGain();
+        masterGain.gain.value = volumeLevel;
+        masterGain.connect(ctx.destination);
+      }
+      if (!monitorGain) {
+        monitorGain = ctx.createGain();
+        monitorGain.gain.value = volumeLevel;
+        monitorGain.connect(ctx.destination);
+      }
+      return ctx;
     });
+  }
+
+  /* Volume (v13): one level for all playback — the beat and the
+   * takes — and, since v13.1, the live monitor too (B2). 0..1.
+   * Safe to call before the context exists: the level is
+   * remembered and applied when the gain nodes are built.
+   */
+  function setVolume(v) {
+    volumeLevel = Math.max(0, Math.min(1, Number(v) || 0));
+    if (masterGain) masterGain.gain.value = volumeLevel;
+    if (monitorGain) monitorGain.gain.value = volumeLevel;
+  }
+
+  function volume() {
+    return volumeLevel;
+  }
+
+  /* The node playback players connect to: the master gain once the
+   * context exists, the raw destination before that (callers only
+   * use it after ensureContext, so the gain is the normal case).
+   */
+  function outputNode() {
+    if (masterGain) return masterGain;
+    return ctx ? ctx.destination : null;
+  }
+
+  /* B2 (v13.1): the node the live monitor connects to — its own
+   * gain, tied to the same volume level as playback. Before the
+   * context exists, the raw destination (callers only use it
+   * after ensureContext, so the gain is the normal case).
+   */
+  function monitorNode() {
+    if (monitorGain) return monitorGain;
+    return ctx ? ctx.destination : null;
   }
 
   /* Creates the audio context for DECODING only — never resumes it
@@ -176,6 +232,11 @@
     }).then(function (s) {
       stream = s;
       var track = s.getAudioTracks()[0];
+      // v13.2 (item 4): the track label names the mic ("AirPods
+      // Pro", "iPhone Microphone", "Microphone" when the browser
+      // cannot name it). Cached here, at open — it is the only
+      // moment the label is reliably available.
+      micTrackLabel = (track && track.label) || '';
       if (track && track.getSettings) {
         try {
           micSettingsCache = track.getSettings();
@@ -199,6 +260,40 @@
    */
   function micSettings() {
     return micSettingsCache ? JSON.parse(JSON.stringify(micSettingsCache)) : null;
+  }
+
+  /* B9 (v13.1): did the phone process the mic despite the raw
+   * constraints? True when ANY of echo cancellation, noise
+   * suppression, or automatic gain is actually on in the last
+   * verified settings — the take may sound different from what
+   * the app asked for. The take sheet says so in plain words.
+   */
+  function micProcessed() {
+    if (!micSettingsCache) return false;
+    return micSettingsCache.echoCancellation === true ||
+      micSettingsCache.noiseSuppression === true ||
+      micSettingsCache.autoGainControl === true;
+  }
+
+  /* v13.2 (item 4) — what mic recorded the take, in plain words.
+   * The track label IS the identification (it names the device
+   * once the mic is open — no device list needed). "Microphone"
+   * and "Default" are the generic labels browsers report when
+   * they cannot name the input, so they mean "cannot tell", not
+   * "built-in". Only an iPhone-named input is called the built-in
+   * mic. Anything else is the label itself (a product name).
+   * Never guesses: an unnameable input says "input unknown".
+   */
+  function micLabelFromTrackLabel(label) {
+    var l = (label || '').trim();
+    if (!l) return 'input unknown';
+    if (/iphone/i.test(l)) return 'built-in mic';
+    if (l === 'Microphone' || l === 'Default') return 'input unknown';
+    return l;
+  }
+
+  function micLabel() {
+    return micLabelFromTrackLabel(micTrackLabel);
   }
 
   /* Closes the mic: stops every track and drops the graph so the
@@ -393,6 +488,18 @@
     });
   }
 
+  /* B10 (v13.1): creates an AudioBuffer on the engine's own
+   * context (which always exists by the time the app slices —
+   * playback runs after ensureContext / ensureDecodeContext).
+   * The app used to spin up a scratch AudioContext just to slice
+   * buffers and never closed it; creating a buffer plays no
+   * audio, so the shared context is the right place for it.
+   */
+  function createBuffer(numberOfChannels, length, sampleRate) {
+    if (!ctx) throw new Error('Audio has not started yet.');
+    return ctx.createBuffer(numberOfChannels, length, sampleRate);
+  }
+
   /* Builds a stereo AudioBuffer holding one calibration click in both
    * ears. (Port of LatencyCalibrator.makeClickBuffer — the click
    * samples come from PS.calibrate.)
@@ -485,12 +592,27 @@
 
   /* Starts a take. Options:
    *   beat: { buffer } | null — the decoded beat (plays at the anchor)
-   *   overdubs: [AudioBuffer] — active takes of the other vocal tracks
+   *   overdubs: [{ buffer, sound }] — active takes of the other
+   *     vocal tracks, each with its own stamped sound (B3, v13.1)
+   *   tuneNodeFor: fn(ctx, sound) — builds a playback tune node
+   *     for an overdub (supplied by the app, which owns the tune
+   *     module); without it an overdub plays dry, as before
    *   delaySeconds: number | null — the measured round-trip D (null
    *     when uncalibrated: pre-comp is off, nominal fallback applies)
    *   onBlock: fn(batch) — level meter updates
    *   onChunk: fn(index, samples) — chunked-write callback (Step 1B):
    *     one 48,000-sample chunk per call, as it fills
+   *   loop: { start, end } | null — Step 6C (v13.3): the loop
+   *     region in song seconds. When set, the beat (and any
+   *     overdub that reaches the region) loops between start and
+   *     end for the whole take — the capture keeps running and
+   *     the app splits it into one take per pass when the take
+   *     stops. An overdub that ends before the region starts is
+   *     skipped (it has nothing to say in the part being looped).
+   *     Without a loop, an overdub starts late by its own
+   *     songOffsetSeconds, so a loop pass or a comp used as a
+   *     guide vocal lines up with the beat instead of playing
+   *     from the top.
    *
    * Returns a promise resolving to the take handle:
    *   { anchorTime, firstSampleTime, preCompActive, delaySeconds,
@@ -501,12 +623,50 @@
    * ears exactly on the anchor (see MATH.md). The guard refuses
    * pre-comp when D >= 1.1 s (never schedules in the past).
    * (Port of AudioEngineManager.beginTake.)
+   *
+   * SPEAKER ROUTE (v13): before the mic opens, a silent buffer
+   * loops through the speaker — audio is already flowing out of
+   * the speaker when capture starts, so iOS (hopefully) keeps the
+   * speaker route instead of dropping output to the earpiece,
+   * where the beat is inaudible and the take feels dead. The
+   * primer is silent (no bleed into the take) and stops with the
+   * take. UNPROVEN on a real iPhone — the web gives the app no
+   * way to force the speaker; this is the best order available.
+   * See BUILD-v13.md.
    */
+  function startPrimer() {
+    try {
+      if (!ctx) return null;
+      var buf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+      var src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.loop = true;
+      src.connect(ctx.destination);
+      src.start();
+      return src;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function stopPrimer(primer) {
+    if (!primer) return;
+    try { primer.stop(); } catch (e) { /* ignore */ }
+    try { primer.disconnect(); } catch (e) { /* ignore */ }
+  }
+
   function startTake(options) {
     var opts = options || {};
     var players = [];
     var handle = null;
-    return startCapture(opts.onBlock || null, { onChunk: opts.onChunk || null }).then(function (cap) {
+    var primer = null;
+    // Audio flowing through the speaker BEFORE the mic opens
+    // (see the speaker-route note above) — ensureContext first so
+    // there is a context to prime, then the primer, then capture.
+    return ensureContext().then(function () {
+      primer = startPrimer();
+      return startCapture(opts.onBlock || null, { onChunk: opts.onChunk || null });
+    }).then(function (cap) {
       var anchorTime = cap.firstTime + ANCHOR_DELAY;
       var delaySeconds = (typeof opts.delaySeconds === 'number') ? opts.delaySeconds : null;
       var preCompActive = false;
@@ -515,24 +675,91 @@
         preCompActive = true;
         playbackTime = anchorTime - delaySeconds;
       }
+      // Step 6C (v13.3): the loop region, validated here (the app
+      // validates it too — the engine never trusts a region it
+      // cannot play).
+      var loop = null;
+      if (opts.loop && isFinite(opts.loop.start) && isFinite(opts.loop.end) &&
+          opts.loop.end > opts.loop.start && opts.loop.start >= 0) {
+        loop = { start: opts.loop.start, end: opts.loop.end };
+      }
       function schedule(buffer) {
         var player = ctx.createBufferSource();
         player.buffer = buffer;
-        player.connect(ctx.destination);
-        player.start(playbackTime);
+        player.connect(masterGain || ctx.destination);
+        if (loop && loop.start < buffer.duration) {
+          // Loop Zone: the beat plays [start, end) over and over
+          // from the anchor — the singer hears the loop start
+          // exactly when the anchor lands, every pass.
+          player.loop = true;
+          player.loopStart = loop.start;
+          player.loopEnd = Math.min(loop.end, buffer.duration);
+          player.start(playbackTime, loop.start);
+        } else {
+          player.start(playbackTime);
+        }
+        players.push(player);
+      }
+      // B3 (v13.1): an overdub is a finished take — it plays
+      // through its own playback tune node, with its own stamped
+      // sound, so the guide vocal he sings against sounds like
+      // the finished take instead of raw. A plain AudioBuffer
+      // (no sound attached) still plays dry, as before.
+      var overdubNodes = [];
+      function scheduleOverdub(item) {
+        var buffer = item && item.buffer ? item.buffer : item;
+        var player = ctx.createBufferSource();
+        player.buffer = buffer;
+        if (item && item.sound && typeof opts.tuneNodeFor === 'function') {
+          var node = opts.tuneNodeFor(ctx, item.sound);
+          if (node && node.input && node.output) {
+            // Step 4A (v13.4): a full vocal chain, not just a tune
+            // node — the builder already wired the chain's output
+            // to the destination, so the player only connects to
+            // the chain's input. The chain object carries a
+            // disconnect() that drops the whole chain with it.
+            player.connect(node.input);
+          } else {
+            player.connect(node);
+            node.connect(masterGain || ctx.destination);
+          }
+          overdubNodes.push(node);
+        } else {
+          player.connect(masterGain || ctx.destination);
+        }
+        if (loop) {
+          // Step 6C: the guide vocal loops with the beat — but
+          // only if it reaches the part being looped at all.
+          if (buffer.duration <= loop.start) return;
+          player.loop = true;
+          player.loopStart = loop.start;
+          player.loopEnd = Math.min(loop.end, buffer.duration);
+          player.start(playbackTime, loop.start);
+        } else {
+          // A pass or a comp used as a guide vocal starts at its
+          // own place in the song, not at the top.
+          player.start(playbackTime + (item && item.songOffsetSeconds ? item.songOffsetSeconds : 0));
+        }
         players.push(player);
       }
       if (opts.beat && opts.beat.buffer) schedule(opts.beat.buffer);
-      (opts.overdubs || []).forEach(schedule);
+      (opts.overdubs || []).forEach(scheduleOverdub);
       handle = {
         anchorTime: anchorTime,
         firstSampleTime: cap.firstTime,
         preCompActive: preCompActive,
         delaySeconds: delaySeconds,
         playbackTime: playbackTime,
-        players: players
+        players: players,
+        overdubNodes: overdubNodes,
+        primer: primer
       };
       return handle;
+    }).catch(function (err) {
+      // A take that never started must not leave the primer
+      // looping — or the next attempt starts on top of it.
+      stopPrimer(primer);
+      throw err;
     });
   }
 
@@ -546,6 +773,16 @@
         try { p.disconnect(); } catch (e) { /* ignore */ }
       });
     }
+    // B3 (v13.1): the overdub tune nodes belong to the take — drop
+    // them with it, or they keep a detector running on nothing.
+    // Step 4A (v13.4): an overdub chain disconnects the same way
+    // (its disconnect() drops every node in the chain).
+    if (handle && handle.overdubNodes) {
+      handle.overdubNodes.forEach(function (n) {
+        try { n.disconnect(); } catch (e) { /* ignore */ }
+      });
+    }
+    if (handle && handle.primer) stopPrimer(handle.primer);
     var recorded = stopCapture();
     return {
       samples: recorded.samples,
@@ -560,16 +797,19 @@
   /* Plays one take against the beat, both from the same anchor, so
    * the singer hears exactly how the take sits in the song. (Port of
    * AudioEngineManager.playTake.) Returns a stop function.
+   * delaySeconds (Step 6C, v13.3): the take starts this late — a
+   * loop pass or a comp lives at its place in the song, so it
+   * starts when the playhead reaches it instead of at the top.
    */
-  function playTake(takeBuffer, beatBuffer, onEnded) {
+  function playTake(takeBuffer, beatBuffer, onEnded, delaySeconds) {
     return ensureContext().then(function () {
       var anchor = ctx.currentTime + 0.1;
       var players = [];
       function schedule(buffer, isTake) {
         var player = ctx.createBufferSource();
         player.buffer = buffer;
-        player.connect(ctx.destination);
-        player.start(anchor);
+        player.connect(masterGain || ctx.destination);
+        player.start(anchor + (isTake ? (delaySeconds || 0) : 0));
         if (isTake && onEnded) {
           player.onended = function () {
             // The take ended — the song is over. Stop the beat too
@@ -652,13 +892,21 @@
     closeMic: closeMic,
     isMicOpen: isMicOpen,
     micSettings: micSettings,
+    micProcessed: micProcessed, // B9 (v13.1): the phone processed the mic despite the raw constraints
+    micLabel: micLabel, // v13.2 (item 4): the mic that recorded the take, in plain words
+    micLabelFromTrackLabel: micLabelFromTrackLabel, // v13.2 (item 4): the label rule, unit-tested in Node
     audioSessionLog: audioSessionLog,
     nominalLatency: nominalLatency,
     outputLatency: outputLatency,
     baseLatency: baseLatency,
     contextInfo: contextInfo,
+    setVolume: setVolume,
+    volume: volume,
+    outputNode: outputNode,
+    monitorNode: monitorNode, // B2 (v13.1): the live monitor's gain — same volume level as playback
     decodeBeat: decodeBeat,
     decodeAudio: decodeAudio,
+    createBuffer: createBuffer, // B10 (v13.1): buffer creation on the engine's context, no scratch context
     runCalibration: runCalibration,
     runClickTest: runClickTest,
     startTake: startTake,

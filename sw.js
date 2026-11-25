@@ -3,7 +3,7 @@
  * ("./") because the site lives at a subpath (GitHub Pages), not a
  * domain root. Bump CACHE_NAME when the shell changes.
  */
-var CACHE_NAME = 'phone-studio-v12';
+var CACHE_NAME = 'phone-studio-v13';
 var SHELL = [
   './',
   './index.html',
@@ -18,9 +18,11 @@ var SHELL = [
   './audio.js',
   './worklet.js',
   './tune-worklet.js',
+  './vocal-chain-worklet.js',
   './key-detect.js',
   './tempo-detect.js',
   './retune.js',
+  './voice-ref.js',
   './app.js',
   './manifest.webmanifest',
   './icon.svg',
@@ -64,6 +66,29 @@ self.addEventListener('fetch', function (event) {
   // Same-origin only — never cache anything else.
   var url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
+  // v13.2 (item 8) — the voice reference is optional and
+  // replaceable: it does not exist until his voice note lands, and
+  // it is rewritten whenever a better one arrives. Never serve it
+  // from the cache (a stale reference would tune against the wrong
+  // voice), and never pass a 404 through for its absence — a
+  // missing file just means "no reference yet", so the worker
+  // answers that itself with an empty reference (200). The loader
+  // treats an empty reference as absent.
+  if (url.pathname.endsWith('voice-reference.json')) {
+    event.respondWith(
+      fetch(request).then(function (response) {
+        if (response && response.status === 200) return response;
+        return new Response(JSON.stringify({ schemaVersion: 1, pitch: null }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }).catch(function () {
+        return new Response(JSON.stringify({ schemaVersion: 1, pitch: null }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      })
+    );
+    return;
+  }
   event.respondWith(
     caches.match(request, { ignoreSearch: true }).then(function (cached) {
       if (cached) return cached;

@@ -180,20 +180,26 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   flex-direction: column;
   justify-content: center;
   gap: 2px;
-  padding: 8px 4px 8px 10px;
+  /* v13.3: the label has to fit the row's 64 px min-height — icon
+   * + name + sub + padding came to ~73 px, so the flex label
+   * shrank and the name (overflow hidden) clipped its text
+   * mid-glyph ("Beat" lost its lower half, visible in the v13.1
+   * live screenshot too). Tighter padding, a smaller icon and a
+   * 13 px name bring the content to ~60 px, inside 64. */
+  padding: 3px 4px 3px 10px;
 }
 .row-label .row-name {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 4px;
-  font-size: 14px;
+  gap: 2px;
+  font-size: 13px;
   font-weight: 700;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.row-label .row-name svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--track-accent, var(--purple)); }
+.row-label .row-name svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--track-accent, var(--purple)); }
 .row-label .row-sub {
   font-size: 11px;
   color: var(--muted);
@@ -254,9 +260,11 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
 }
 
 /* ------------------------------------------------------------ preset strip */
-/* The voice-sound picker + strength slider, between the tracks and
- * the transport. Fixed height — the track rows shrink to make
- * room, the screen never scrolls. */
+/* v13.2 (item 7) — the voice-sound picker in plain words: three
+ * full-phrase sound buttons, a "Fun sounds" row, and "How much"
+ * (strength) + Volume. The strip is taller than the old 5-pill
+ * row — the track rows shrink to make room, the screen never
+ * scrolls. */
 .preset-strip {
   flex: 0 0 auto;
   display: flex;
@@ -268,6 +276,7 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
 }
 .preset-pills {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 .preset-pill {
@@ -290,6 +299,35 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   background: var(--purple-soft);
   border-color: var(--purple);
   color: var(--text);
+}
+/* v13.2 (item 7) — the three main sound buttons are full-width
+ * rows with the whole phrase on them ("Hard — you can hear the
+ * tune"), so the choice reads in plain words at a glance. */
+.preset-pill.sound-btn {
+  flex: 1 1 100%;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 15px;
+  text-align: left;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+/* v13.2 (item 7) — the "Fun sounds" label breaks the pill row so
+ * Vocoder + Chorus sit on their own line under the main sounds. */
+.fun-label {
+  flex: 1 1 100%;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 4px 2px 0;
+}
+.range-end {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--muted);
 }
 .strength-row {
   display: flex;
@@ -321,14 +359,13 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
-#speed-value {
+#volume-value {
   flex: 0 0 44px;
   text-align: right;
   font-size: 14px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
-#speed-auto { flex: 0 0 auto; }
 
 /* ------------------------------------------------------------ Phase 1 (v12) */
 /* The key sheet's Beat block: what the detector heard, with its
@@ -374,13 +411,103 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   font-variant-numeric: tabular-nums;
 }
 
+/* Step 4A (v13.4) — the studio-sound card (Setup) + the take-sheet
+ * macros. Same row as the strength slider, with a fixed label so
+ * the sliders line up; the hint sits under its slider. */
+.chain-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  margin: 12px 0;
+  cursor: pointer;
+}
+.chain-toggle input[type="checkbox"] {
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  accent-color: var(--purple);
+  flex: 0 0 auto;
+}
+.chain-toggle .muted { font-weight: 400; }
+.macro-row { margin-top: 10px; }
+.macro-row label { flex: 0 0 64px; }
+#chain-section .strength-row span {
+  flex: 0 0 44px;
+  text-align: right;
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.macro-hint { margin: 2px 0 0 74px; }
+.take-macros { margin-top: 14px; }
+.take-macros .take-sound-label { margin-bottom: 4px; }
+
+/* Step 4B (v13.5) — "More sound choices" in the take sheet: the
+ * button that opens the fine tone + sound parts, and the box it
+ * opens. The box is a flex column like the take sound itself;
+ * the bypass rows reuse .chain-toggle, tightened for the sheet. */
+.take-more-sound { align-self: flex-start; margin-top: 4px; }
+.take-more-sound-box { flex-direction: column; gap: 8px; margin-top: 8px; }
+.take-more-sound-box .take-sound-label { margin-top: 6px; }
+.take-more-sound-box .chain-toggle { margin: 6px 0; }
+
+/* v13.2 (item 5) — timestamped notes on a take: the "Mark this
+ * moment" button (while the take plays) + one row per note — a
+ * time chip, a text box, a delete. Sits under the take's sound
+ * controls in the sheet. */
+.take-notes {
+  border-top: 1px solid var(--line);
+  margin-top: 10px;
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.take-notes:empty { display: none; }
+.take-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.take-note-time {
+  flex: 0 0 auto;
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--purple);
+  background: var(--purple-soft);
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+.take-note input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 14px;
+}
+.take-note-del {
+  flex: 0 0 auto;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 8px;
+}
+
 /* --------------------------------------------------------------- live strip */
+/* v13.1 (F1) — the live strip is IN FLOW now, between the ideas
+ * row and the transport: it pushes the track rows up (they shrink
+ * — .tracks-wrap is flex: 1 1 auto) instead of floating over them.
+ * The old absolute card sat on top of the Beat row label and the
+ * top of the preset pills for the whole take — exactly when he
+ * wants to see the beat. */
 .live-strip {
-  position: absolute;
-  left: 10px;
-  right: 10px;
-  bottom: calc(196px + env(safe-area-inset-bottom));
-  z-index: 20;
+  flex: 0 0 auto;
+  margin: 0 10px 8px;
   background: rgba(10, 10, 16, .92);
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -409,6 +536,15 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   border-radius: 999px;
   transition: width 90ms linear;
   box-shadow: 0 0 14px rgba(139, 92, 246, .7);
+}
+
+/* v13 — live waveform: the last ~9 s of singing as bars, drawn
+ * while recording so it is obvious the take is alive. */
+.live-wave {
+  flex: 1 1 100%;
+  width: 100%;
+  height: 40px;
+  display: block;
 }
 
 /* ---------------------------------------------------------------- transport */
@@ -794,3 +930,119 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
   margin-bottom: 10px;
 }
 .lab-row p { margin: 6px 0 10px; }
+
+/* --- Step 6C (v13.3): loop + comping --- */
+
+/* The ruler is a row now: Loop on the left, the clock in the
+ * middle, the loop's times on the right. Same height as before —
+ * the loop controls live in space the ruler already owned, so the
+ * track rows and the preset pills do not move (F1 geometry). */
+.ruler {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 10px 6px;
+  text-align: left;
+}
+.ruler #time-label {
+  flex: 1 1 auto;
+  text-align: center;
+}
+.loop-btn {
+  flex: 0 0 auto;
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  padding: 4px 12px;
+  min-height: 28px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.loop-btn:active { background: var(--card2); color: var(--text); }
+.loop-btn.on {
+  background: var(--purple-soft);
+  border-color: var(--purple);
+  color: var(--text);
+}
+.loop-label {
+  flex: 0 0 auto;
+  min-width: 76px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.loop-label.on { color: var(--purple); }
+
+/* The loop region on the timeline — a soft band over the lanes,
+ * under the playhead. It never takes a tap (pointer-events none)
+ * so scrubbing straight through it still works. */
+.loop-band {
+  position: absolute;
+  top: 0;
+  bottom: 8px;
+  background: rgba(139, 92, 246, .18);
+  border-left: 2px solid var(--purple);
+  border-right: 2px solid var(--purple);
+  border-radius: 6px;
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* Comp editor: one row per part — "Part 1 — 0:04–0:06" and a
+ * button per take that covers it. The chosen take reads as the
+ * current one; the rest are plain. */
+.comp-part {
+  border-top: 1px solid var(--line);
+  padding: 12px 0 4px;
+  margin-top: 12px;
+}
+.comp-part-label {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.comp-part-label span {
+  color: var(--muted);
+  font-weight: 600;
+}
+.comp-picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.comp-pick { min-height: 44px; }
+.comp-pick.current {
+  background: var(--purple-soft);
+  border-color: var(--purple);
+  color: var(--text);
+}
+#comp-make {
+  width: 100%;
+  margin-top: 18px;
+}
+#comp-intro { margin: 4px 0 0; }
+
+/* The star — one tap keeps a take as the best on its track. The
+ * starred row carries the star in its title, so the best take
+ * reads at a glance in the list. */
+.take-star {
+  background: var(--card);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 700;
+  min-height: 40px;
+  cursor: pointer;
+}
+.take-star.starred {
+  background: var(--purple-soft);
+  border-color: var(--purple);
+  color: var(--text);
+}

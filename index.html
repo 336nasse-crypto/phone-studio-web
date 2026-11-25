@@ -21,11 +21,6 @@
     <span>Safari tab: the phone can delete saved takes after 7 days. Add this app to your Home Screen to keep them.</span>
     <button id="home-banner-dismiss" class="btn-small">Got it</button>
   </div>
-  <div id="lab-banner" class="banner" style="display:none">
-    <span>New: test your headphones and find which setup sounds best — 30 seconds.</span>
-    <button id="lab-banner-run" class="btn-small">Test them</button>
-    <button id="lab-banner-dismiss" class="btn-small">Not now</button>
-  </div>
   <div id="recover-bar" class="banner recover" style="display:none">
     <span id="recover-text"></span>
     <button id="recover-keep" class="btn-small">Keep it</button>
@@ -36,30 +31,32 @@
       <span id="topbar-song-name">New Song</span>
     </button>
     <button id="topbar-key" class="topbar-key" aria-label="Change key">
-      <span id="topbar-song-key">D minor</span>
+      <span id="topbar-song-key">Key</span>
     </button>
     <button id="setup-open" class="icon-btn" aria-label="Setup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 1-1.82-.33 1.65 1.65 0 0 1-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09a1.65 1.65 0 0 1-1-1.51 1.65 1.65 0 0 1-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 1 .33-1.82 1.65 1.65 0 0 1-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09a1.65 1.65 0 0 1 1.51-1 1.65 1.65 0 0 1-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 1 1.82.33h.01a1.65 1.65 0 0 1 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 1 1 1.51h.01a1.65 1.65 0 0 1 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 1-.33 1.82v.01a1.65 1.65 0 0 1 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 1-1.51 1z"></path></svg></button>
   </header>
 
-  <div class="ruler"><span id="time-label">0:00</span></div>
+  <div class="ruler"><button id="loop-toggle" class="loop-btn" aria-label="Loop the part you are working on" aria-pressed="false">Loop</button><span id="time-label">0:00</span><span id="loop-label" class="loop-label"></span></div>
 
   <div class="tracks-wrap">
+    <div id="loop-band" class="loop-band" style="display:none" aria-hidden="true"></div>
     <div id="tracks" class="track-rows"></div>
     <div id="playhead" class="playhead"></div>
   </div>
 
   <div id="preset-strip" class="preset-strip">
-    <div id="preset-pills" class="preset-pills" role="group" aria-label="Voice sound"></div>
+    <div id="preset-pills" class="preset-pills" role="group" aria-label="How it sounds"></div>
     <div class="strength-row">
-      <label for="strength-slider">Strength</label>
-      <input id="strength-slider" type="range" min="0" max="100" value="100" aria-label="Tune strength">
+      <label for="strength-slider">How much</label>
+      <span class="range-end">a little</span>
+      <input id="strength-slider" type="range" min="0" max="100" value="100" aria-label="How much tune">
+      <span class="range-end">a lot</span>
       <span id="strength-value">100%</span>
     </div>
     <div class="strength-row">
-      <label for="speed-slider">Speed</label>
-      <input id="speed-slider" type="range" min="0" max="100" value="50" aria-label="Tune speed">
-      <span id="speed-value">Auto</span>
-      <button id="speed-auto" class="btn-small" type="button">Auto</button>
+      <label for="volume-slider">Volume</label>
+      <input id="volume-slider" type="range" min="0" max="100" value="100" aria-label="Playback volume">
+      <span id="volume-value">100%</span>
     </div>
   </div>
 
@@ -73,6 +70,7 @@
     <span id="record-timer" class="live-timer"></span>
     <span id="record-hint" class="live-hint"></span>
     <div class="meter"><div id="level-bar" class="meter-bar"></div></div>
+    <canvas id="live-wave" class="live-wave" width="360" height="40" aria-hidden="true"></canvas>
   </div>
 
   <footer class="transport">
@@ -105,6 +103,41 @@
       </div>
     </section>
 
+    <section class="card" id="chain-section">
+      <p class="eyebrow">Studio sound</p>
+      <h2>How it sounds</h2>
+      <p class="muted">Simple choices for how your voice sounds while you sing and on playback. They work with the tune, not instead of it.</p>
+      <p id="chain-slow-note" class="muted" style="display:none">These headphones add a delay, so hearing yourself live stays off. Your takes still play back with the full sound.</p>
+      <label class="chain-toggle"><input id="chain-on" type="checkbox" checked> Full studio sound <span class="muted">— the body, tone, echo and space, on while you sing</span></label>
+      <label class="chain-toggle"><input id="chain-nr" type="checkbox"> Cut background noise <span class="muted">— quiets the room between lines (off unless you need it)</span></label>
+      <div class="strength-row macro-row"><label for="macro-even">Even</label><input id="macro-even" type="range" min="0" max="100" value="50" aria-label="Even — keeps loud and quiet parts level"><span id="macro-even-value">50%</span></div>
+      <p class="muted small macro-hint">Keeps loud and quiet parts level.</p>
+      <div class="strength-row macro-row"><label for="macro-bright">Bright</label><input id="macro-bright" type="range" min="0" max="100" value="50" aria-label="Bright — makes the voice shine"><span id="macro-bright-value">50%</span></div>
+      <p class="muted small macro-hint">Makes the voice shine.</p>
+      <div class="strength-row macro-row"><label for="macro-space">Space</label><input id="macro-space" type="range" min="0" max="100" value="50" aria-label="Space — how much room you hear"><span id="macro-space-value">50%</span></div>
+      <p class="muted small macro-hint">How much room you hear.</p>
+      <div class="strength-row macro-row"><label for="macro-punch">Punch</label><input id="macro-punch" type="range" min="0" max="100" value="50" aria-label="Punch — makes words hit harder"><span id="macro-punch-value">50%</span></div>
+      <p class="muted small macro-hint">Makes words hit harder.</p>
+      <div class="strength-row macro-row"><label for="macro-warm">Warm</label><input id="macro-warm" type="range" min="0" max="100" value="50" aria-label="Warm — rounds the voice out"><span id="macro-warm-value">50%</span></div>
+      <p class="muted small macro-hint">Rounds the voice out.</p>
+      <p class="take-sound-label" style="margin-top:14px">Fine tone</p>
+      <div class="strength-row macro-row"><label for="tone-rumble">Cut the rumble</label><input id="tone-rumble" type="range" min="0" max="100" value="50" aria-label="Cut the rumble — how much low rumble to take out"><span id="tone-rumble-value">50%</span></div>
+      <p class="muted small macro-hint">How much low rumble to take out.</p>
+      <div class="strength-row macro-row"><label for="tone-presence">Cut through</label><input id="tone-presence" type="range" min="0" max="100" value="50" aria-label="Cut through — makes the words cut through the beat"><span id="tone-presence-value">50%</span></div>
+      <p class="muted small macro-hint">Makes the words cut through the beat.</p>
+      <div class="strength-row macro-row"><label for="tone-air">Shine</label><input id="tone-air" type="range" min="0" max="100" value="50" aria-label="Shine — makes the voice shine on top"><span id="tone-air-value">50%</span></div>
+      <p class="muted small macro-hint">Makes the voice shine on top.</p>
+      <p class="take-sound-label" style="margin-top:14px">Sound parts</p>
+      <label class="chain-toggle"><input id="bypass-tonefix" type="checkbox" checked> Clean up the mud <span class="muted">— takes the mud out of the voice</span></label>
+      <label class="chain-toggle"><input id="bypass-lowcut" type="checkbox" checked> Rumble cut <span class="muted">— takes out the low rumble</span></label>
+      <label class="chain-toggle"><input id="bypass-tune" type="checkbox" checked> Tune <span class="muted">— the tune itself, off is your raw voice</span></label>
+      <label class="chain-toggle"><input id="bypass-even" type="checkbox" checked> Even out <span class="muted">— keeps loud and quiet parts level</span></label>
+      <label class="chain-toggle"><input id="bypass-deess" type="checkbox" checked> Soften the sizzle <span class="muted">— softens sharp S sounds</span></label>
+      <label class="chain-toggle"><input id="bypass-tone" type="checkbox" checked> Tone shape <span class="muted">— warmth, punch and shine</span></label>
+      <label class="chain-toggle"><input id="bypass-echo" type="checkbox" checked> Echo <span class="muted">— the repeats</span></label>
+      <label class="chain-toggle"><input id="bypass-room" type="checkbox" checked> Room <span class="muted">— the space around the voice</span></label>
+    </section>
+
     <section class="card" id="headphones-section">
       <p class="eyebrow">Setup</p>
       <h2>Headphones</h2>
@@ -114,6 +147,20 @@
       </div>
       <p id="speaker-note" class="muted" style="display:none">With the phone
       speaker there is nothing to measure — the timing is handled for you.</p>
+      <p class="muted small">The headphones button on the studio screen lets
+      you hear yourself tuned while you sing.</p>
+      <p class="muted small">If the beat sounds muddy when you tap record,
+      your headphones dropped to phone-call mode — stop the take and switch
+      to the phone speaker above.</p>
+    </section>
+
+    <section class="card" id="setup-checks-section">
+      <p class="eyebrow">Setup checks</p>
+      <h2>Check my setup</h2>
+      <p class="muted">Optional — record first, check whenever. Nothing here blocks a take.</p>
+      <button id="lab-open" class="btn">Test my headphones</button>
+      <p class="muted small">Tests how far up your headphones can hear, and
+      tells you which setup sounds best. Takes about 30 seconds.</p>
       <div id="headphones-box">
         <p class="muted">Measure once and the beat plays early by exactly that
         much, so your voice lands in time.</p>
@@ -125,19 +172,11 @@
         <button id="cal-measure" class="btn">Measure my headphones</button>
         <p class="muted small">Headphones next to the phone, not on your ears.
         Volume up, keep them still — the app plays 5 clicks.</p>
-        <p class="muted small">The headphones button on the studio screen lets
-        you hear yourself tuned while you sing.</p>
-        <p class="muted small">If the beat sounds muddy when you tap record,
-        your headphones dropped to phone-call mode — stop the take and switch
-        to the phone speaker above.</p>
         <p id="cal-status" class="status"></p>
         <div id="cal-new-device" class="banner" style="display:none">
           <span>New headphones found — measure them once so your voice still lands on the beat.</span>
           <button id="cal-new-device-dismiss" class="btn-small">Later</button>
         </div>
-        <button id="lab-open" class="btn">Test my headphones</button>
-        <p class="muted small">Tests how far up your headphones can hear, and
-        tells you which setup sounds best. Takes about 30 seconds.</p>
       </div>
     </section>
 
@@ -154,6 +193,15 @@
       all the details, through the share sheet.</p>
       <button id="backup-btn" class="btn">Back up all takes</button>
       <p id="backup-status" class="status"></p>
+      <p class="muted small">Check a backup you already made: pick the backup
+      file and the sound files, and the app checks every file against
+      the list — it names any file that is missing or changed.</p>
+      <label class="field">
+        <span>Backup files to check</span>
+        <input id="backup-check-files" type="file" multiple accept=".json,.wav">
+      </label>
+      <button id="backup-check-btn" class="btn">Check these files</button>
+      <p id="backup-check-status" class="status"></p>
     </section>
   </div>
 </div>
@@ -188,6 +236,18 @@
   </div>
 </div>
 
+<div id="comp-sheet" class="sheet" style="display:none">
+  <div class="sheet-card">
+    <div class="sheet-head">
+      <h2 id="comp-title">Best of</h2>
+      <button id="comp-close" class="icon-btn" aria-label="Close">✕</button>
+    </div>
+    <p id="comp-intro" class="muted small">Pick the best take for each part — the app stitches them into one take. Your takes stay exactly as they are.</p>
+    <div id="comp-list"></div>
+    <button id="comp-make" class="btn">Make the best take</button>
+  </div>
+</div>
+
 <div id="key-sheet" class="sheet" style="display:none">
   <div class="sheet-card">
     <div class="sheet-head">
@@ -217,6 +277,7 @@
 <script src="key-detect.js"></script>
 <script src="tempo-detect.js"></script>
 <script src="retune.js"></script>
+<script src="voice-ref.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -27,6 +27,7 @@
   var CALIBRATIONS_KEY = 'ps.calibrations.v1';
   var ACTIVE_CAL_KEY = 'ps.activeCalibration.v1';
   var MODE_KEY = 'ps.outputMode.v1'; // 'headphones' | 'speaker'
+  var VOLUME_KEY = 'ps.volume.v1'; // playback volume 0-100 (v13)
   var LAB_REPORTS_KEY = 'ps.labReports.v1'; // route-lab reports, keyed by label
   var SEEN_DEVICES_KEY = 'ps.seenDevices.v1'; // audioinput deviceIds seen (Step 0C)
   var BANNER_KEY = 'ps.bannerDismissed.v1'; // which one-time banners were dismissed
@@ -61,7 +62,10 @@
   function makeSession(name) {
     var tracks = {};
     TRACKS.forEach(function (kind) {
-      tracks[kind] = { takes: [], activeTakeId: null };
+      // Step 6C (v13.3): starredTakeId is the take marked the best
+      // on this track — the default source for every part of a
+      // best-of take. One star per track; null means none yet.
+      tracks[kind] = { takes: [], activeTakeId: null, starredTakeId: null };
     });
     return {
       id: newId(),
@@ -70,7 +74,29 @@
       preset: 'hard', // the vocal effect (Voloco's Starter pack) — Hard Tune, Denasse's choice
       strength: 100, // pitch-correction strength 0-100 (100 = the full snap)
       speed: null, // tune speed 0-100; null = Auto (the preset's own retune time — v11's exact sound)
+      // Step 4A (v13.4) — the live chain's One Knob macros, 0-100
+      // each. Plain words on screen: Even (keeps loud and quiet
+      // parts level), Bright (makes the voice shine), Space (how
+      // much room you hear), Punch (makes words hit harder), Warm
+      // (rounds the voice out). 50 is the sensible middle. A take
+      // stamps the song's macros when it records, like the preset.
+      macros: { even: 50, bright: 50, space: 50, punch: 50, warm: 50 },
+      chainOn: true, // the full studio sound (not just the tune) — on by default, off on a slow (Bluetooth-like) route
+      // Step 4B (v13.5) — per-stage bypasses (true = that part of
+      // the studio sound is off) + fine tone controls (0-100,
+      // 50 = no change from the macros). A take stamps both when
+      // it records, like the macros — so changing the song's sound
+      // later never rewrites what a take sounds like. The room-
+      // noise cut is off by default (bypass.nr true) — the v13.4
+      // nrOn switch, now one entry in the bypass set.
+      bypass: { nr: true, tonefix: false, lowcut: false, tune: false, even: false, deess: false, tone: false, echo: false, room: false },
+      tone: { rumble: 50, presence: 50, air: 50 },
       keyManuallySet: false, // true once Denasse picks a key himself; the beat's detected key only auto-applies before that
+      // Step 6C (v13.3): the loop region in song seconds
+      // { start, end, on } — null until he drags one on the top
+      // bar. Recording with the loop on cycles the part and
+      // saves one take per pass.
+      loop: null,
       bpm: null,
       beatKey: null, // the key the beat detector heard (Step 9A)
       beatKeyConfidence: 0, // 0..1 — below 0.25 the app says it is not sure
@@ -146,6 +172,27 @@
     try { localStorage.setItem(MODE_KEY, mode); } catch (e) { /* ignore */ }
   }
 
+  // --- Playback volume (v13) — beat + take playback, 0-100, default 100 ---
+
+  function volume() {
+    try {
+      var raw = localStorage.getItem(VOLUME_KEY);
+      // v13 FIX: Number(null) is 0, not NaN — a fresh install with
+      // nothing stored read as volume 0 (silent). An absent value
+      // is the default 100, not 0.
+      if (raw === null || raw === undefined || raw === '') return 100;
+      var v = Number(raw);
+      if (isFinite(v) && v >= 0 && v <= 100) return Math.round(v);
+    } catch (e) { /* ignore */ }
+    return 100;
+  }
+
+  function setVolume(v) {
+    try {
+      localStorage.setItem(VOLUME_KEY, String(Math.max(0, Math.min(100, Math.round(Number(v) || 0)))));
+    } catch (e) { /* ignore */ }
+  }
+
   // --- Route-lab reports (Step 0, keyed by user-typed label) ---
 
   function loadLabReports() {
@@ -219,6 +266,8 @@
     setActiveCalibrationLabel: setActiveCalibrationLabel,
     outputMode: outputMode,
     setOutputMode: setOutputMode,
+    volume: volume,
+    setVolume: setVolume,
     loadLabReports: loadLabReports,
     saveLabReport: saveLabReport,
     deleteLabReport: deleteLabReport,
