@@ -17,6 +17,20 @@
 </head>
 <body>
 <div id="studio-view" class="studio-view">
+  <div id="home-banner" class="banner" style="display:none">
+    <span>Safari tab: the phone can delete saved takes after 7 days. Add this app to your Home Screen to keep them.</span>
+    <button id="home-banner-dismiss" class="btn-small">Got it</button>
+  </div>
+  <div id="lab-banner" class="banner" style="display:none">
+    <span>New: test your headphones and find which setup sounds best — 30 seconds.</span>
+    <button id="lab-banner-run" class="btn-small">Test them</button>
+    <button id="lab-banner-dismiss" class="btn-small">Not now</button>
+  </div>
+  <div id="recover-bar" class="banner recover" style="display:none">
+    <span id="recover-text"></span>
+    <button id="recover-keep" class="btn-small">Keep it</button>
+    <button id="recover-delete" class="btn-small danger">Delete</button>
+  </div>
   <header class="topbar">
     <button id="setup-song" class="topbar-song" aria-label="Song settings">
       <span id="topbar-song-name">New Song</span>
@@ -41,6 +55,17 @@
       <input id="strength-slider" type="range" min="0" max="100" value="100" aria-label="Tune strength">
       <span id="strength-value">100%</span>
     </div>
+    <div class="strength-row">
+      <label for="speed-slider">Speed</label>
+      <input id="speed-slider" type="range" min="0" max="100" value="50" aria-label="Tune speed">
+      <span id="speed-value">Auto</span>
+      <button id="speed-auto" class="btn-small" type="button">Auto</button>
+    </div>
+  </div>
+
+  <div id="ideas-row" class="ideas-row">
+    <button id="ideas-btn" class="btn ideas-btn">Catch ideas</button>
+    <p id="ideas-note" class="muted small">Sings something great while rehearsing? Tap once and the last 60 seconds are saved as a take.</p>
   </div>
 
   <div id="live-strip" class="live-strip" style="display:none">
@@ -106,13 +131,50 @@
         your headphones dropped to phone-call mode — stop the take and switch
         to the phone speaker above.</p>
         <p id="cal-status" class="status"></p>
+        <div id="cal-new-device" class="banner" style="display:none">
+          <span>New headphones found — measure them once so your voice still lands on the beat.</span>
+          <button id="cal-new-device-dismiss" class="btn-small">Later</button>
+        </div>
+        <button id="lab-open" class="btn">Test my headphones</button>
+        <p class="muted small">Tests how far up your headphones can hear, and
+        tells you which setup sounds best. Takes about 30 seconds.</p>
       </div>
     </section>
 
     <p id="wake-note" class="muted small" style="display:none">Your phone could
     not keep the screen awake automatically — tap the screen now and then so it
     does not lock during a take.</p>
+    <p id="ios-wake-note" class="warning-note" style="display:none"></p>
     <p class="muted small">Your takes stay on this phone until you send them.</p>
+    <p id="storage-line" class="muted small"></p>
+    <section class="card" id="backup-section">
+      <p class="eyebrow">Backup</p>
+      <h2>Back up your takes</h2>
+      <p class="muted">Sends every take as a sound file, plus one file with
+      all the details, through the share sheet.</p>
+      <button id="backup-btn" class="btn">Back up all takes</button>
+      <p id="backup-status" class="status"></p>
+    </section>
+  </div>
+</div>
+
+<div id="lab-view" class="lab-view" style="display:none">
+  <header class="topbar">
+    <button id="lab-back" class="icon-btn" aria-label="Back to the studio"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"></path><path d="M12 19l-7-7 7-7"></path></svg></button>
+    <span class="topbar-title">Headphone test</span>
+    <span class="topbar-spacer"></span>
+  </header>
+  <div class="lab-scroll">
+    <p class="muted">Three quick checks, about 30 seconds. First the room,
+    then a held "sss", then 8 clicks. Keep the headphones still and quiet.</p>
+    <label class="field">
+      <span>Name these headphones (optional)</span>
+      <input id="lab-label" type="text" placeholder="My headphones" autocomplete="off">
+    </label>
+    <button id="lab-run" class="btn">Run the test</button>
+    <p id="lab-status" class="status"></p>
+    <h2>Tested setups</h2>
+    <div id="lab-list"></div>
   </div>
 </div>
 
@@ -136,6 +198,7 @@
     <div id="tonic-list" class="key-grid tonic-grid"></div>
     <p class="key-section-label">Scale</p>
     <div id="scale-list" class="key-grid scale-grid"></div>
+    <div id="key-beat-block"></div>
   </div>
 </div>
 
@@ -147,7 +210,13 @@
 <script src="residual.js"></script>
 <script src="db.js"></script>
 <script src="store.js"></script>
+<script src="routelab.js"></script>
+<script src="safety.js"></script>
 <script src="audio.js"></script>
+<script src="tune-worklet.js"></script>
+<script src="key-detect.js"></script>
+<script src="tempo-detect.js"></script>
+<script src="retune.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
