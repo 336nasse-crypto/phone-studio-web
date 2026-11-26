@@ -604,6 +604,10 @@
   }
 
   function removeBeat() {
+    // v22 (QUEUE #45): the beat cannot change under a live take —
+    // the × button is disabled while recording too; this is the
+    // belt-and-braces guard (removeBeat's only caller is that button).
+    if (state.recording) return;
     if (!window.confirm('Remove the beat from this song? Your takes stay.')) return;
     PS.db.deleteBeat(state.session.id).catch(function () { /* ignore */ });
     state.session.beatFileName = null;
@@ -1127,6 +1131,20 @@
 
   function armLogger() {
     if (state.logger || state.recording || state.calibrating || state.loggerArming) return;
+    // v22 (QUEUE #45/#46/#48): freeze the beat + sound identity at
+    // ARM time — the logger's ring holds up to 60 s of audio sung
+    // BEFORE the save, so the save must stamp what was true when
+    // listening started, never live state at save time. Captured
+    // here, synchronously at function entry, because the mic opens
+    // in a .then below. beatless is set at freeze time, never at save.
+    var frozenBeatFileName = state.session.beatFileName || null;
+    var frozenBeatSha256 = state.session.beatSha256 || null;
+    var frozenBeatBpm = state.session.beatBpm || null;
+    var frozenBeatBpmAlt = state.session.beatBpmAlt || null;
+    var frozenBeatless = !state.session.beatFileName;
+    var frozenKey = state.session.key;
+    var frozenPreset = state.session.preset;
+    var frozenStrength = state.session.strength;
     state.loggerArming = true;
     updateIdeasUI();
     PS.audio.ensureContext().then(function (ctx) {
@@ -1136,7 +1154,13 @@
         ring.push(batch.samples);
       }).then(function () {
         state.loggerArming = false;
-        state.logger = { ring: ring, startWall: Date.now(), sampleRate: sr };
+        // v22: the arm-time freeze (QUEUE #45/#46/#48) — stamped
+        // from here at save, never from live session state.
+        state.logger = { ring: ring, startWall: Date.now(), sampleRate: sr,
+          beatFileName: frozenBeatFileName, beatSha256: frozenBeatSha256,
+          beatBpm: frozenBeatBpm, beatBpmAlt: frozenBeatBpmAlt,
+          beatless: frozenBeatless, key: frozenKey,
+          preset: frozenPreset, strength: frozenStrength };
         acquireWakeLock();
         updateIdeasUI();
         loggerTimer = setInterval(updateIdeasUI, 1000);
@@ -1193,14 +1217,17 @@
       sampleRate: sr,
       // v13.8-light: which beat this take was sung over (logger
       // takes have no beat anchor — nulls, never a guess).
-      beatFileName: state.session.beatFileName || null,
-      beatSha256: state.session.beatSha256 || null,
+      // v22 (QUEUE #45/#46): stamped from the arm-time freeze
+      // (logger.*), never from live session state.
+      beatFileName: logger.beatFileName,
+      beatSha256: logger.beatSha256,
+      beatless: !!logger.beatless,
       // v20 (QUEUE #41): the beat's tempo travels with the take —
       // the server renders the echo on this grid, never the
       // hardcoded 135. Nulls when there was no beat (or no tempo
       // detected yet); beatBpmAlt is the half/double partner.
-      beatBpm: state.session.beatBpm || null,
-      beatBpmAlt: state.session.beatBpmAlt || null,
+      beatBpm: logger.beatBpm,
+      beatBpmAlt: logger.beatBpmAlt,
       durationSeconds: durationSeconds,
       leadInSamples: 0,
       delaySamples: 0,
@@ -1240,10 +1267,11 @@
       // Step 3 — the sound this take was sung with. Playback uses
       // the TAKE's sound, not the song's current one, so changing
       // the preset later never rewrites what this take sounds like.
-      preset: state.session.preset,
-      strength: state.session.strength,
+      // v22 (QUEUE #48): stamped from the arm-time freeze.
+      preset: logger.preset,
+      strength: logger.strength,
       speed: state.session.speed,
-      key: state.session.key,
+      key: logger.key,
       macros: copySessionMacros(),
       chainOn: state.session.chainOn,
       bypass: copySessionBypass(),
@@ -1261,22 +1289,42 @@
       loopPass: false,
       comp: false
     };
-    var wav = new Blob([PS.wav.encodeWavFloat32(snapshot, sr)], { type: 'audio/wav' });
+    var wav;
+    // v21 (QUEUE #19): the encode is the only pre-save step here
+    // and the only one that allocates (~19 MiB for the 60 s ring)
+    // — a throw used to die silently and lose the only copy, since
+    // a logger take has no chunks. Now the encode + save run inside
+    // attemptLoggerSave, whose retry re-runs both from the same
+    // snapshot. The save path itself is unchanged (#10 owns it).
+    function attemptLoggerSave() {
+      try {
+        wav = new Blob([PS.wav.encodeWavFloat32(snapshot, sr)], { type: 'audio/wav' });
+      } catch (encodeErr) {
+        showSaveFailedError('Something went wrong finishing the last 60 seconds — the audio is still in memory. Tap "Try saving again" to save it now. This is the only copy — closing the app loses it.',
+          { kind: 'logger-finish', resume: function () { attemptLoggerSave(); } });
+        return;
+      }
+      var loggerRecord = {
+        id: takeId,
+        sessionId: state.session.id,
+        track: track,
+        takeNumber: takeNumber,
+        rawWav: wav,
+        alignedWav: wav,
+        metadata: metadata,
+        recordedAt: metadata.recordedAt
+      };
+      PS.db.saveTake(loggerRecord).then(completeLoggerSave).catch(function (err) {
+        console.warn('Logger take save failed:', err);
+        showSaveFailedError('The last 60 seconds could not be saved — the phone may be out of space for this site. Tap "Try saving again" — the last minute is still in memory, and this is the only copy.',
+          { kind: 'logger', record: loggerRecord, onSaved: completeLoggerSave });
+      });
+    }
     // v17 (QUEUE #10): same shape as finishTake — one record, one
     // success function, so a failed save can be retried with the
     // exact same bytes. A logger take has NO chunks, so its message
     // must not promise a boot recovery: the retry (this copy, still
     // in memory) is the only way back, and it says so.
-    var loggerRecord = {
-      id: takeId,
-      sessionId: state.session.id,
-      track: track,
-      takeNumber: takeNumber,
-      rawWav: wav,
-      alignedWav: wav,
-      metadata: metadata,
-      recordedAt: metadata.recordedAt
-    };
     function completeLoggerSave() {
       vocal.takes.push({
         id: takeId,
@@ -1296,10 +1344,11 @@
         // v13.2 (item 4) — what mic recorded the take.
         micLabel: PS.audio.micLabel(),
         // Step 3 — same sound stamp as a recorded take.
-        preset: state.session.preset,
-        strength: state.session.strength,
+        // v22 (QUEUE #48): stamped from the arm-time freeze.
+        preset: logger.preset,
+        strength: logger.strength,
         speed: state.session.speed,
-        key: state.session.key,
+        key: logger.key,
         macros: copySessionMacros(),
         chainOn: state.session.chainOn,
         bypass: copySessionBypass(),
@@ -1314,11 +1363,7 @@
       renderSheet();
       updateTransport();
     }
-    PS.db.saveTake(loggerRecord).then(completeLoggerSave).catch(function (err) {
-      console.warn('Logger take save failed:', err);
-      showSaveFailedError('The last 60 seconds could not be saved — the phone may be out of space for this site. Tap "Try saving again" — the last minute is still in memory, and this is the only copy.',
-        { kind: 'logger', record: loggerRecord, onSaved: completeLoggerSave });
-    });
+    attemptLoggerSave();
   }
 
   // ---------------------------------------------------------------- takes
@@ -1357,6 +1402,21 @@
     var vocal = state.session.tracks[track];
     var takeId = PS.store.newId();
     var takeNumber = vocal.takes.length + 1;
+    // v22 (QUEUE #45/#46/#48): the beat + sound identity is frozen at
+    // the SAME point — BEFORE recording starts, synchronously at
+    // function entry. A mid-take beat swap/remove or key-pill tap must
+    // never rewrite what the take stamps. Captured in closure
+    // variables because state.recording is only assigned in the .then
+    // after startTake resolves — reading live state there would be
+    // the same hole. beatless is set at freeze time, never at save.
+    var frozenBeatFileName = state.session.beatFileName || null;
+    var frozenBeatSha256 = state.session.beatSha256 || null;
+    var frozenBeatBpm = state.session.beatBpm || null;
+    var frozenBeatBpmAlt = state.session.beatBpmAlt || null;
+    var frozenBeatless = !state.session.beatFileName;
+    var frozenKey = state.session.key;
+    var frozenPreset = state.session.preset;
+    var frozenStrength = state.session.strength;
     var chunkState = { count: 0 }; // shared with the onChunk closure
     // No calibration gate: record anyway. With no measured
     // headphones the take uses the nominal delay and is flagged
@@ -1437,7 +1497,17 @@
         // for a normal take. finishTake splits a loop capture into
         // one take per pass.
         loop: loopOn() ? { start: state.session.loop.start, end: state.session.loop.end } : null,
-        outputLatencyAtStart: PS.audio.outputLatency()
+        outputLatencyAtStart: PS.audio.outputLatency(),
+        // v22 (QUEUE #45/#46/#48): the frozen beat + sound identity —
+        // stamped from here at save, never from live session state.
+        beatFileName: frozenBeatFileName,
+        beatSha256: frozenBeatSha256,
+        beatBpm: frozenBeatBpm,
+        beatBpmAlt: frozenBeatBpmAlt,
+        beatless: frozenBeatless,
+        key: frozenKey,
+        preset: frozenPreset,
+        strength: frozenStrength
       };
       acquireWakeLock();
       $('live-strip').style.display = 'flex';
@@ -1643,7 +1713,20 @@
     // crushed — no software recovers those frequencies. Warn him
     // plainly (and record it in the metadata) instead of silently
     // keeping a muffled take.
-    var takeAnalysis = PS.routelab.analyzeTake(result.samples, sr);
+    // v21 (QUEUE #19): the finish path used to run with zero
+    // try/catch — a throw here (FFT edge case, heap pressure)
+    // died in the console and the take vanished with no error
+    // and no retry. A failed analysis now falls back to saving
+    // the RAW take untrimmed (analysis fields null, flagged
+    // unfinished) — a raw take he can re-trim beats a lost take.
+    var finishError = null;
+    var takeAnalysis;
+    try {
+      takeAnalysis = PS.routelab.analyzeTake(result.samples, sr);
+    } catch (e) {
+      finishError = e;
+      takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null };
+    }
 
     // --- Compensation. ---
     // Pre-comp ON: the beat was played early by D, so the vocal
@@ -1678,14 +1761,28 @@
     var baseTrimSamples = result.preCompActive ? leadInSamples : leadInSamples + delaySamples;
 
     // Residual check: measure what is left after the base trim.
+    // v21 (QUEUE #19): guarded like the analysis above — a throw
+    // falls back to the raw take, it never drops the take.
     var residual;
     if (state.beat && state.beat.mono) {
-      residual = PS.residual.verify(result.samples, state.beat.mono, baseTrimSamples, sr);
+      try {
+        residual = PS.residual.verify(result.samples, state.beat.mono, baseTrimSamples, sr);
+      } catch (e) {
+        if (!finishError) finishError = e;
+        residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'no-beat' };
+      }
     } else {
       residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'no-beat' };
     }
     var trimSamples = Math.max(0, Math.min(baseTrimSamples + residual.trimSamples, result.samples.length));
     var alignedSamples = result.samples.subarray(trimSamples);
+    if (finishError) {
+      // The analysis failed — save the raw take untrimmed. The
+      // too-short check below then reads the full capture, so a
+      // take is never dropped for a trim it never got.
+      trimSamples = 0;
+      alignedSamples = result.samples;
+    }
     if (alignedSamples.length < Math.round(0.3 * sr)) {
       // A tap-and-release (or a take sung entirely inside the
       // lead-in) leaves nothing after the trim — do not save an
@@ -1716,14 +1813,18 @@
       // v13.8-light: which beat this take was sung over — the
       // server render matches on this, never guesses. Nulls when
       // there was no beat (or no fingerprint yet).
-      beatFileName: state.session.beatFileName || null,
-      beatSha256: state.session.beatSha256 || null,
+      // v22 (QUEUE #45/#46): stamped from the freeze at record
+      // start (rec.*), never from live session state — a beat
+      // swapped or removed mid-take cannot rewrite the stamp.
+      beatFileName: rec.beatFileName,
+      beatSha256: rec.beatSha256,
+      beatless: !!rec.beatless,
       // v20 (QUEUE #41): the beat's tempo travels with the take —
       // the server renders the echo on this grid, never the
       // hardcoded 135. Nulls when there was no beat (or no tempo
       // detected yet); beatBpmAlt is the half/double partner.
-      beatBpm: state.session.beatBpm || null,
-      beatBpmAlt: state.session.beatBpmAlt || null,
+      beatBpm: rec.beatBpm,
+      beatBpmAlt: rec.beatBpmAlt,
       durationSeconds: durationSeconds,
       leadInSamples: leadInSamples,
       delaySamples: delaySamples,
@@ -1732,10 +1833,14 @@
       preCompensationActive: result.preCompActive,
       preCompensationDelayMilliseconds: result.preCompActive && result.delaySeconds !== null
         ? result.delaySeconds * 1000 : null,
-      residualTrimSamples: residual.trimSamples,
-      residualMilliseconds: residual.residualSeconds !== null ? residual.residualSeconds * 1000 : null,
-      residualOnsets: residual.onsetCount,
-      residualVerdict: residual.verdict,
+      residualTrimSamples: finishError ? 0 : residual.trimSamples,
+      residualMilliseconds: finishError ? null : (residual.residualSeconds !== null ? residual.residualSeconds * 1000 : null),
+      residualOnsets: finishError ? 0 : residual.onsetCount,
+      residualVerdict: finishError ? 'unfinished' : residual.verdict,
+      // v21 (QUEUE #19): a take saved raw because the finish
+      // checks threw — the sheet says so in plain words.
+      unfinished: !!finishError,
+      finishError: finishError ? String(finishError && finishError.message || finishError) : null,
       calibrationDeviceUID: null, // the web has no device identity
       calibrationLabel: active ? active.label : null,
       calibrationDeviceName: active ? active.label : null,
@@ -1775,10 +1880,11 @@
       // Step 3 — the sound this take was sung with. Playback uses
       // the TAKE's sound, not the song's current one, so changing
       // the preset later never rewrites what this take sounds like.
-      preset: state.session.preset,
-      strength: state.session.strength,
+      // v22 (QUEUE #48): stamped from the record-start freeze.
+      preset: rec.preset,
+      strength: rec.strength,
       speed: state.session.speed,
-      key: state.session.key,
+      key: rec.key,
       macros: copySessionMacros(),
       chainOn: state.session.chainOn,
       bypass: copySessionBypass(),
@@ -1797,8 +1903,12 @@
       comp: false
     };
 
-    var rawWav = new Blob([PS.wav.encodeWavFloat32(result.samples, sr)], { type: 'audio/wav' });
-    var alignedWav = new Blob([PS.wav.encodeWavFloat32(alignedSamples, sr)], { type: 'audio/wav' });
+    // v21 (QUEUE #19): the blobs are built inside attemptTakeSave
+    // below, so a throw in the encode can offer the #10 retry
+    // instead of dropping the take. Declared here so the success
+    // path (completeTakeSave) still sees the saved blobs.
+    var rawWav;
+    var alignedWav;
     var takeId = rec.takeId;
     var takeMeta = {
       id: takeId,
@@ -1809,7 +1919,8 @@
       calibrated: calibrated,
       delayMilliseconds: metadata.delayMilliseconds,
       durationSeconds: durationSeconds,
-      residualVerdict: residual.verdict,
+      residualVerdict: finishError ? 'unfinished' : residual.verdict,
+      unfinished: !!finishError,
       partial: !!interrupted,
       savedUpToSeconds: metadata.savedUpToSeconds,
       narrowbandWarn: takeAnalysis.narrowbandWarn,
@@ -1819,10 +1930,11 @@
       micLabel: metadata.micLabel,
       outputLatencyDrift: drifted,
       // Step 3 — the take's own sound + its one-line summary.
-      preset: state.session.preset,
-      strength: state.session.strength,
+      // v22 (QUEUE #48): stamped from the record-start freeze.
+      preset: rec.preset,
+      strength: rec.strength,
       speed: state.session.speed,
-      key: state.session.key,
+      key: rec.key,
       macros: copySessionMacros(),
       chainOn: state.session.chainOn,
       bypass: copySessionBypass(),
@@ -1840,16 +1952,47 @@
     // save can be retried with the exact same bytes + metadata —
     // and the success path is one function, run by the first save
     // or by the retry, never duplicated.
-    var takeRecord = {
-      id: takeId,
-      sessionId: state.session.id,
-      track: track,
-      takeNumber: takeNumber,
-      rawWav: rawWav,
-      alignedWav: alignedWav,
-      metadata: metadata,
-      recordedAt: metadata.recordedAt
-    };
+    // v21 (QUEUE #19): the encode is the last pre-save step and
+    // the only one that allocates ~38 MiB in two fresh ArrayBuffers
+    // at the fattest moment of the tab — the likeliest throw in the
+    // whole finish path. If it throws, the take is still whole in
+    // memory: hold it and offer the #10 retry, whose resume re-runs
+    // this encode + save from the same samples. Chunks are NOT
+    // deleted here — the boot recovery the message names is still
+    // true. The save path itself is unchanged (#10 owns it).
+    function attemptTakeSave() {
+      try {
+        rawWav = new Blob([PS.wav.encodeWavFloat32(result.samples, sr)], { type: 'audio/wav' });
+        alignedWav = new Blob([PS.wav.encodeWavFloat32(alignedSamples, sr)], { type: 'audio/wav' });
+      } catch (encodeErr) {
+        showSaveFailedError('Something went wrong finishing the take — your audio is still here. Tap "Try saving again" to save it now, or close the app and reopen it — your take is kept as a recovery.',
+          { kind: 'take-finish', resume: function () { attemptTakeSave(); } });
+        renderTracks();
+        updateTransport();
+        return;
+      }
+      var takeRecord = {
+        id: takeId,
+        sessionId: state.session.id,
+        track: track,
+        takeNumber: takeNumber,
+        rawWav: rawWav,
+        alignedWav: alignedWav,
+        metadata: metadata,
+        recordedAt: metadata.recordedAt
+      };
+      PS.db.saveTake(takeRecord).then(completeTakeSave).catch(function (err) {
+        console.warn('Take save failed:', err);
+        // v17 (QUEUE #10): hold the take in memory and offer the
+        // retry — the blobs are the only full copy (the chunks hold
+        // it up to the last full second). Do NOT delete the orphan
+        // chunks here: they are the boot recovery the message names.
+        showSaveFailedError('The take recorded but could not be saved — the phone may be out of space for this site. Tap "Try saving again" to save it now, or close the app and reopen it — your take is kept as a recovery.',
+          { kind: 'take', record: takeRecord, onSaved: completeTakeSave });
+        renderTracks();
+        updateTransport();
+      });
+    }
     function completeTakeSave() {
       vocal.takes.push(takeMeta);
       vocal.activeTakeId = takeId;
@@ -1870,23 +2013,15 @@
       // write one plain-words line about it. Playback already
       // started, so this runs after it and never blocks the screen.
       runTakeAnalysis(takeMeta, metadata, alignedSamples, sr, track, takeId, rawWav, alignedWav);
-      if (takeAnalysis.narrowbandWarn) {
+      if (metadata.unfinished) {
+        showError('Saved raw — something went wrong finishing the take, so it was saved untrimmed and unchecked. It is in the list below; re-trim it or record it again if it sounds off.');
+      } else if (takeAnalysis.narrowbandWarn) {
         showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.');
       } else if (drifted) {
         showError('The timing may have drifted since you measured these headphones — measure them again before the next take.');
       }
     }
-    PS.db.saveTake(takeRecord).then(completeTakeSave).catch(function (err) {
-      console.warn('Take save failed:', err);
-      // v17 (QUEUE #10): hold the take in memory and offer the
-      // retry — the blobs are the only full copy (the chunks hold
-      // it up to the last full second). Do NOT delete the orphan
-      // chunks here: they are the boot recovery the message names.
-      showSaveFailedError('The take recorded but could not be saved — the phone may be out of space for this site. Tap "Try saving again" to save it now, or close the app and reopen it — your take is kept as a recovery.',
-        { kind: 'take', record: takeRecord, onSaved: completeTakeSave });
-      renderTracks();
-      updateTransport();
-    });
+    attemptTakeSave();
   }
 
   /* Step 3 — listen to a finished take once, in slices, and write
@@ -1900,7 +2035,10 @@
     if (!PS.retune) return;
     setTimeout(function () {
       try {
-        PS.retune.analyzeChunked(alignedSamples, sr, state.session.key, function (summary) {
+        // v22 (QUEUE #49): the verdict is graded against the
+        // TAKE's own frozen key — never live session state, which
+        // a key-pill tap in the analysis window could have moved.
+        PS.retune.analyzeChunked(alignedSamples, sr, (metadata && metadata.key) || (takeMeta && takeMeta.key) || state.session.key, function (summary) {
           takeMeta.analysis = summary;
           metadata.analysis = summary;
           saveSessions();
@@ -1948,7 +2086,20 @@
 
     // Narrowband check (Step 1B) — once, on the whole capture:
     // every pass shares the same mic.
-    var takeAnalysis = PS.routelab.analyzeTake(result.samples, sr);
+    // v21 (QUEUE #19): the head used to run before the promise
+    // chain was built, so a throw here sat outside the chain's
+    // catch and dropped the whole capture silently. A failed
+    // analysis now flags every pass unfinished (check fields null)
+    // instead — the trim never depended on the analysis, so the
+    // passes still save.
+    var finishError = null;
+    var takeAnalysis;
+    try {
+      takeAnalysis = PS.routelab.analyzeTake(result.samples, sr);
+    } catch (e) {
+      finishError = e;
+      takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null };
+    }
 
     // Compensation — the same math as finishTake. After the base
     // trim, sample 0 is the moment the loop region starts at the
@@ -2039,7 +2190,9 @@
       // hears the finished sound without tapping Play.
       var last = saved[saved.length - 1];
       if (last && last.durationSeconds >= 2) playTake(last.id);
-      if (takeAnalysis.narrowbandWarn) {
+      if (finishError) {
+        showError('Saved without its finish check — something went wrong checking the loop take, so the passes were saved unchecked. They are in the list below; record them again if they sound off.');
+      } else if (takeAnalysis.narrowbandWarn) {
         showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.');
       } else if (drifted) {
         showError('The timing may have drifted since you measured these headphones — measure them again before the next take.');
@@ -2070,14 +2223,17 @@
         // v13.8-light: which beat this take was sung over — the
         // server render matches on this, never guesses. Nulls when
         // there was no beat (or no fingerprint yet).
-        beatFileName: state.session.beatFileName || null,
-        beatSha256: state.session.beatSha256 || null,
+        // v22 (QUEUE #45/#46): stamped from the freeze at record
+        // start (rec.*), never from live session state.
+        beatFileName: rec.beatFileName,
+        beatSha256: rec.beatSha256,
+        beatless: !!rec.beatless,
         // v20 (QUEUE #41): the beat's tempo travels with the take —
         // the server renders the echo on this grid, never the
         // hardcoded 135. Nulls when there was no beat (or no tempo
         // detected yet); beatBpmAlt is the half/double partner.
-        beatBpm: state.session.beatBpm || null,
-        beatBpmAlt: state.session.beatBpmAlt || null,
+        beatBpm: rec.beatBpm,
+        beatBpmAlt: rec.beatBpmAlt,
         durationSeconds: durationSeconds,
         leadInSamples: leadInSamples,
         delaySamples: delaySamples,
@@ -2090,6 +2246,11 @@
         residualMilliseconds: residual.residualSeconds !== null ? residual.residualSeconds * 1000 : null,
         residualOnsets: residual.onsetCount,
         residualVerdict: residual.verdict,
+        // v21 (QUEUE #19): the loop head's analysis failed — this
+        // pass was saved without its tune/timing check (fields
+        // null); the trim itself never depended on the analysis.
+        unfinished: !!finishError,
+        finishError: finishError ? String(finishError && finishError.message || finishError) : null,
         calibrationDeviceUID: null,
         calibrationLabel: active ? active.label : null,
         calibrationDeviceName: active ? active.label : null,
@@ -2116,10 +2277,11 @@
         outputLatencyDrift: drifted,
         recordedAt: new Date().toISOString(),
         appVersion: 'pwa-1.1',
-        preset: state.session.preset,
-        strength: state.session.strength,
+        // v22 (QUEUE #48): stamped from the record-start freeze.
+        preset: rec.preset,
+        strength: rec.strength,
         speed: state.session.speed,
-        key: state.session.key,
+        key: rec.key,
         macros: copySessionMacros(),
         chainOn: state.session.chainOn,
         bypass: copySessionBypass(),
@@ -2147,16 +2309,18 @@
         delayMilliseconds: metadata.delayMilliseconds,
         durationSeconds: durationSeconds,
         residualVerdict: residual.verdict,
+        unfinished: !!finishError,
         partial: !!rec.interrupted,
         savedUpToSeconds: durationSeconds,
         narrowbandWarn: takeAnalysis.narrowbandWarn,
         micProcessed: metadata.micProcessed,
         micLabel: metadata.micLabel,
         outputLatencyDrift: drifted,
-        preset: state.session.preset,
-        strength: state.session.strength,
+        // v22 (QUEUE #48): stamped from the record-start freeze.
+        preset: rec.preset,
+        strength: rec.strength,
         speed: state.session.speed,
-        key: state.session.key,
+        key: rec.key,
         macros: copySessionMacros(),
         chainOn: state.session.chainOn,
         bypass: copySessionBypass(),
@@ -4371,6 +4535,12 @@
    * playback).
    */
   function applyKey(key, manual) {
+    // v22 (QUEUE #48): the key cannot change under a live take.
+    // The freeze protects the stamp; this keeps the session (and
+    // the monitor tune, via broadcastTune) from moving under it.
+    // No legitimate caller runs mid-take: the beat Import button
+    // is disabled while recording, and the key sheet cannot open.
+    if (state.recording) return;
     var parsed = parseKey(key);
     var composed = parsed.tonic + ' ' + parsed.scale;
     state.session.key = composed;
@@ -4515,6 +4685,8 @@
     beatLane.appendChild(document.createElement('canvas'));
     if (!state.beat) {
       var importBtn = el('button', 'btn-small lane-btn', 'Import a beat');
+      // v22 (QUEUE #45): the beat cannot change under a live take.
+      importBtn.disabled = !!state.recording;
       importBtn.addEventListener('click', function (ev) {
         ev.stopPropagation();
         $('beat-file').click();
@@ -4524,6 +4696,8 @@
     beatRow.appendChild(beatLane);
     if (state.beat) {
       var remove = el('button', 'row-more', '×');
+      // v22 (QUEUE #45): the beat cannot change under a live take.
+      remove.disabled = !!state.recording;
       remove.setAttribute('aria-label', 'Remove beat');
       remove.addEventListener('click', function (ev) {
         ev.stopPropagation();
@@ -4885,6 +5059,7 @@
       // app asked for. Said plainly, on the take, not in a log.
       if (take.micProcessed) subBits.push('The phone processed this take — it may sound different');
       if (take.recoveredLate) subBits.push('recovered — may sit slightly late, re-record if it sounds off');
+      if (take.unfinished) subBits.push('Saved raw — the finish check failed, re-trim or re-record if it sounds off');
       // v13.2 (item 4) — what mic recorded the take, when the app
       // could tell. Takes saved before v13.2 carry no label and
       // show no Mic line (nothing guessed after the fact).
@@ -5121,7 +5296,10 @@
           var from = Math.max(0, Math.round((segment.start - offset) * sr));
           var to = Math.min(buffer.length, Math.round((segment.end - offset) * sr));
           if (to - from < Math.round(0.1 * sr)) return null;
-          return { samples: buffer.getChannelData(0).subarray(from, to), take: take };
+          // v22 (QUEUE #45/#46/#48): carry the piece's stamped
+          // metadata so the comp can inherit its beat/key from the
+          // takes it is made of, never from live session state.
+          return { samples: buffer.getChannelData(0).subarray(from, to), take: take, meta: record.metadata };
         });
       }).catch(function () { return null; }); // a missing take never kills the comp
     });
@@ -5131,6 +5309,33 @@
         showError('Nothing to stitch yet — pick a take for at least one part.');
         return null;
       }
+      // v22 (QUEUE #45/#46/#48): the comp's beat + sound come from
+      // its pieces' own stamps when EVERY piece agrees — the pieces
+      // are saved takes, each frozen at its own record start. When
+      // the pieces disagree (different beats/keys across takes) there
+      // is no single truthful value, so the comp keeps the song's
+      // current stamp (today's behavior) — a first-piece or majority
+      // pick would be a guess, and the stamp must never guess.
+      // beatless is true only when every piece carries the marker.
+      function unanimousPiece(field) {
+        var val = (good[0].meta || {})[field];
+        for (var i = 1; i < good.length; i++) {
+          if (((good[i].meta || {})[field]) !== val) return { agree: false, value: null };
+        }
+        return { agree: true, value: (val === undefined ? null : val) };
+      }
+      function pieceStamp(field, fallback) {
+        var u = unanimousPiece(field);
+        return u.agree ? u.value : fallback;
+      }
+      var compBeatFileName = pieceStamp('beatFileName', state.session.beatFileName || null);
+      var compBeatSha256 = pieceStamp('beatSha256', state.session.beatSha256 || null);
+      var compBeatBpm = pieceStamp('beatBpm', state.session.beatBpm || null);
+      var compBeatBpmAlt = pieceStamp('beatBpmAlt', state.session.beatBpmAlt || null);
+      var compKey = pieceStamp('key', state.session.key);
+      var compPreset = pieceStamp('preset', state.session.preset);
+      var compStrength = pieceStamp('strength', state.session.strength);
+      var compBeatless = good.every(function (p) { return (p.meta || {}).beatless === true; });
       var composite = buildCompSamples(good, sr);
       var durationSeconds = composite.length / sr;
       var region = compRegion(track);
@@ -5151,14 +5356,17 @@
         sampleRate: sr,
         // v13.8-light: the comp inherits its song's beat — the
         // server render matches on this, never guesses.
-        beatFileName: state.session.beatFileName || null,
-        beatSha256: state.session.beatSha256 || null,
+        // v22 (QUEUE #45/#46): from the pieces' own stamps when
+        // they agree, else the song's current stamp (see above).
+        beatFileName: compBeatFileName,
+        beatSha256: compBeatSha256,
+        beatless: compBeatless,
         // v20 (QUEUE #41): the beat's tempo travels with the take —
         // the server renders the echo on this grid, never the
         // hardcoded 135. Nulls when there was no beat (or no tempo
         // detected yet); beatBpmAlt is the half/double partner.
-        beatBpm: state.session.beatBpm || null,
-        beatBpmAlt: state.session.beatBpmAlt || null,
+        beatBpm: compBeatBpm,
+        beatBpmAlt: compBeatBpmAlt,
         durationSeconds: durationSeconds,
         leadInSamples: 0,
         delaySamples: 0,
@@ -5193,10 +5401,11 @@
         outputLatencyDrift: false,
         recordedAt: new Date().toISOString(),
         appVersion: 'pwa-1.1',
-        preset: state.session.preset,
-        strength: state.session.strength,
+        // v22 (QUEUE #48): from the pieces' stamps when they agree.
+        preset: compPreset,
+        strength: compStrength,
         speed: state.session.speed,
-        key: state.session.key,
+        key: compKey,
         macros: copySessionMacros(),
         chainOn: state.session.chainOn,
         bypass: copySessionBypass(),
@@ -5230,10 +5439,11 @@
         micProcessed: false,
         micLabel: null,
         outputLatencyDrift: false,
-        preset: state.session.preset,
-        strength: state.session.strength,
+        // v22 (QUEUE #48): from the pieces' stamps when they agree.
+        preset: compPreset,
+        strength: compStrength,
         speed: state.session.speed,
-        key: state.session.key,
+        key: compKey,
         macros: copySessionMacros(),
         chainOn: state.session.chainOn,
         bypass: copySessionBypass(),
@@ -5281,6 +5491,11 @@
    * screen; ours is in the top bar, always visible.)
    */
   function openKeySheet() {
+    // v22 (QUEUE #48): the key cannot change under a live take —
+    // the pills go quiet while recording too (updateTransport);
+    // the freeze is the real fix, this keeps the session from
+    // moving under it (and the monitor from retuning mid-take).
+    if (state.recording) return;
     renderKeySheet();
     $('key-sheet').style.display = 'flex';
   }
@@ -5692,6 +5907,9 @@
     play.setAttribute('aria-label', playing ? 'Stop' : 'Play');
     share.disabled = !take;
     rewind.disabled = !!state.recording;
+    // v22 (QUEUE #48): the key sheet cannot open mid-take.
+    $('topbar-key').disabled = !!state.recording;
+    $('fx-key').disabled = !!state.recording;
     phones.classList.toggle('active', state.monitorOn);
     updateIdeasUI();
   }
@@ -6147,6 +6365,9 @@
             narrowbandWarn: !!m.narrowbandWarn,
             outputLatencyDrift: !!m.outputLatencyDrift,
             recovered: !!m.recovered,
+            // v21 (QUEUE #19): a take saved raw/unchecked keeps
+            // its flag across a reload, so the sheet still says so.
+            unfinished: !!m.unfinished,
             loggerRecovery: !!m.loggerRecovery,
             // Step 3 — the take's own sound, backfilled from the
             // stored record. Takes saved before v12 have none of
@@ -6279,9 +6500,22 @@
       return;
     }
     var sr = next.rows[0].sampleRate || 48000;
-    var samples = PS.safety.reassembleChunks(next.rows.map(function (r) {
-      return { index: r.index, data: r.data };
-    }));
+    // v21 (QUEUE #19): the recovery path used to run with zero
+    // try/catch — a throw here killed the recovery itself. The
+    // chunks stay in IndexedDB, so a failure that cannot be
+    // worked around puts this orphan back at the head of the queue
+    // and lets Keep try again, instead of dropping it.
+    var samples;
+    try {
+      samples = PS.safety.reassembleChunks(next.rows.map(function (r) {
+        return { index: r.index, data: r.data };
+      }));
+    } catch (e) {
+      state.recoverQueue.unshift(next);
+      showError('The recovered take could not be put back together — it is still saved as a recovery. Tap "Keep" to try again.');
+      showRecoverBar();
+      return;
+    }
     var session = state.sessions.find(function (s) { return s.id === next.sessionId; }) || state.session;
     var vocal = session.tracks[next.track];
     if (!vocal) {
@@ -6303,9 +6537,18 @@
     // then the timing cannot be verified and the take is flagged
     // in plain words instead of guessed.
     var leadInSamples = Math.round(PS.audio.ANCHOR_DELAY * sr);
+    // v21 (QUEUE #19): guarded like finishTake — a failed check
+    // falls back to saving the raw chunks untrimmed (flagged
+    // unfinished), it never kills the recovery.
+    var recoverError = null;
     var residual;
     if (state.beat && state.beat.mono && session.id === state.session.id) {
-      residual = PS.residual.verify(samples, state.beat.mono, leadInSamples, sr);
+      try {
+        residual = PS.residual.verify(samples, state.beat.mono, leadInSamples, sr);
+      } catch (e) {
+        recoverError = e;
+        residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'no-beat' };
+      }
     } else {
       residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'no-beat' };
     }
@@ -6322,7 +6565,20 @@
     }
     var alignedSamples = samples.subarray(trimSamples);
     var durationSeconds = alignedSamples.length / sr;
-    var takeAnalysis = PS.routelab.analyzeTake(samples, sr);
+    var takeAnalysis;
+    try {
+      takeAnalysis = PS.routelab.analyzeTake(samples, sr);
+    } catch (e) {
+      if (!recoverError) recoverError = e;
+      takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null };
+    }
+    if (recoverError) {
+      // A check failed — save the raw chunks untrimmed.
+      trimSamples = 0;
+      alignedSamples = samples;
+      durationSeconds = alignedSamples.length / sr;
+      recoveredLate = true;
+    }
     // v18 (QUEUE #20): the recovered take reuses its original take
     // id (the orphan chunks are keyed by it), so its filename is
     // unique to this take even though the take number is recomputed.
@@ -6349,10 +6605,14 @@
       trimSamples: trimSamples,
       preCompensationActive: null, // unknown after a crash — the trim starts from the lead-in and the residual check measures the rest
       preCompensationDelayMilliseconds: null,
-      residualTrimSamples: residual.trimSamples,
-      residualMilliseconds: residual.residualSeconds !== null ? residual.residualSeconds * 1000 : null,
-      residualOnsets: residual.onsetCount,
-      residualVerdict: residual.verdict,
+      residualTrimSamples: recoverError ? 0 : residual.trimSamples,
+      residualMilliseconds: recoverError ? null : (residual.residualSeconds !== null ? residual.residualSeconds * 1000 : null),
+      residualOnsets: recoverError ? 0 : residual.onsetCount,
+      residualVerdict: recoverError ? 'unfinished' : residual.verdict,
+      // v21 (QUEUE #19): a recovery saved raw because a finish
+      // check threw — the sheet says so in plain words.
+      unfinished: !!recoverError,
+      finishError: recoverError ? String(recoverError && recoverError.message || recoverError) : null,
       calibrationDeviceUID: null,
       calibrationLabel: null,
       calibrationDeviceName: null,
@@ -6386,8 +6646,21 @@
     // The raw recording stays whole; the lined-up take is the
     // trimmed one (before v13.1 both files were the same
     // untrimmed chunks).
-    var rawWav = new Blob([PS.wav.encodeWavFloat32(samples, sr)], { type: 'audio/wav' });
-    var wav = new Blob([PS.wav.encodeWavFloat32(alignedSamples, sr)], { type: 'audio/wav' });
+    // v21 (QUEUE #19): the encode allocates ~2× the take in fresh
+    // ArrayBuffers — if it throws, the chunks are still in
+    // IndexedDB, so put this orphan back at the head of the queue
+    // and let Keep try again.
+    var rawWav;
+    var wav;
+    try {
+      rawWav = new Blob([PS.wav.encodeWavFloat32(samples, sr)], { type: 'audio/wav' });
+      wav = new Blob([PS.wav.encodeWavFloat32(alignedSamples, sr)], { type: 'audio/wav' });
+    } catch (encodeErr) {
+      state.recoverQueue.unshift(next);
+      showError('The recovered take could not be finished — your audio is still saved as a recovery. Tap "Keep" to try again.');
+      showRecoverBar();
+      return;
+    }
     PS.db.saveTake({
       id: next.takeId,
       sessionId: session.id,
@@ -6407,7 +6680,8 @@
         calibrated: false,
         delayMilliseconds: metadata.delayMilliseconds,
         durationSeconds: durationSeconds,
-        residualVerdict: residual.verdict,
+        residualVerdict: recoverError ? 'unfinished' : residual.verdict,
+        unfinished: !!recoverError,
         partial: true,
         savedUpToSeconds: durationSeconds,
         narrowbandWarn: takeAnalysis.narrowbandWarn,
