@@ -132,9 +132,24 @@
     newDeviceDetected: false, // a never-seen audio input appeared (Step 0C)
     logger: null, // { ring, startWall, sampleRate } while the ideas logger is armed
     loggerArming: false,
+    // v17 (QUEUE #10) — a take whose save failed, held in memory
+    // for the retry button: { kind, record, onSaved } for a
+    // single save, or { kind, resume } for a multi-save job (loop
+    // passes) whose chain re-runs from the failed pass.
+    // kind is 'take', 'logger' or 'loop-pass'. The record is the
+    // exact saveTake record (blobs + metadata); onSaved is the
+    // success path the save would have run. Cleared by a
+    // successful retry, by dismissing the error, or by starting a
+    // new take (the error box is gone by then, so the retry is
+    // unreachable — the take is still recoverable from its chunks
+    // on the next boot; logger takes have no chunks, so dismissing
+    // a logger failure really does drop it, and its message says so
+    // in plain words by NOT promising a boot recovery).
+    pendingFailedTake: null,
     recoverQueue: [], // orphaned chunk groups found on boot, one at a time
     recovering: false,
-    voiceReference: null // v13.2 (item 8, scaffolding): Denasse's measured voice, when voice-reference.json exists — held for the later wiring, never read for sound yet
+    overdubCache: {}, // v13.8-light: takeId -> decoded overdub {buffer, sound, songOffsetSeconds} — a take's audio never changes after save, so re-decoding it on every record tap is pure waste
+    voiceReference: null // v13.2 (item 8): Denasse's measured voice, when voice-reference.json exists — v16 WIRED it: new songs open on Natural / E minor from his voice (QUEUE #3); the reference itself is still held here for later use
   };
 
   // ---------------------------------------------------------------- helpers
@@ -148,12 +163,74 @@
 
   function showError(message) {
     $('error-text').textContent = message;
+    // Hide the retry button AND reset it: a later showError (the
+    // narrowband warning after a successful retry, say) must never
+    // leave it stuck on "Saving…" + disabled behind the box.
+    var retryBtn = $('error-retry');
+    retryBtn.style.display = 'none';
+    retryBtn.textContent = 'Try saving again';
+    retryBtn.disabled = false;
     $('error-box').style.display = 'flex';
   }
 
   function clearError() {
     $('error-text').textContent = '';
+    var retryBtn = $('error-retry');
+    retryBtn.style.display = 'none';
+    retryBtn.textContent = 'Try saving again';
+    retryBtn.disabled = false;
     $('error-box').style.display = 'none';
+  }
+
+  /* v17 (QUEUE #10) — a failed take save is not the end of the
+   * take. The blobs + metadata stay in state.pendingFailedTake and
+   * the error box grows a "Try saving again" button that re-runs
+   * the exact same saveTake. The message always names the other
+   * way back: for a recorded take, close the app and reopen it —
+   * the take is kept as a chunk recovery (checkOrphanChunks).
+   * "Got it" dismisses AND drops the held copy (dismissError) —
+   * the retry is unreachable once the box is gone, so holding the
+   * blobs would only leak ~37 MB.
+   */
+  function showSaveFailedError(message, pending) {
+    state.pendingFailedTake = pending;
+    $('error-text').textContent = message;
+    var btn = $('error-retry');
+    btn.textContent = 'Try saving again';
+    btn.disabled = false;
+    btn.style.display = '';
+    $('error-box').style.display = 'flex';
+  }
+
+  function dismissError() {
+    state.pendingFailedTake = null;
+    clearError();
+  }
+
+  function retryFailedTakeSave() {
+    var pending = state.pendingFailedTake;
+    if (!pending) return;
+    var btn = $('error-retry');
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+    if (pending.resume) {
+      // A multi-save job (loop passes): re-run the chain from the
+      // failed pass. Its own catch re-holds + re-shows on failure.
+      state.pendingFailedTake = null;
+      clearError();
+      pending.resume();
+      return;
+    }
+    PS.db.saveTake(pending.record).then(function () {
+      state.pendingFailedTake = null;
+      clearError();
+      pending.onSaved();
+    }).catch(function (err) {
+      console.warn('Take save retry failed:', err);
+      if (btn) { btn.disabled = false; btn.textContent = 'Try saving again'; }
+      // The box is still showing with the same message — the
+      // recovery it names (close + reopen, chunk recovery for a
+      // recorded take) is still true.
+    });
   }
 
   function fmtClock(seconds) {
@@ -299,10 +376,20 @@
   function loadSessions() {
     state.sessions = PS.store.loadSessions();
     // Songs saved before step 2 have no preset/strength — backfill
-    // the defaults (Hard Tune, 100%) so the picker and the worklet
-    // always have something real to use.
+    // the defaults so the picker and the worklet always have
+    // something real to use.
     state.sessions.forEach(function (s) {
-      if (PRESET_IDS.indexOf(s.preset) === -1) s.preset = 'hard';
+      if (PRESET_IDS.indexOf(s.preset) === -1) {
+        // v16 (QUEUE #3): a song with no (or an invalid) preset
+        // never had a real sound picked — it gets his voice
+        // defaults, the same as a new song: Natural / E minor,
+        // key settled from his voice. A song WITH a valid preset
+        // keeps its pick (his current song: Clean/40 + E minor).
+        s.preset = 'natural';
+        s.key = 'E minor';
+        s.keyManuallySet = true;
+        s.keySource = 'voice';
+      }
       if (typeof s.strength !== 'number' || s.strength < 0 || s.strength > 100) s.strength = 100;
       // v13 — Speed is gone from the app (Denasse: the knob is
       // useless; a singer should not have to think about it). Every
@@ -313,9 +400,19 @@
       if (typeof s.keyManuallySet !== 'boolean') {
         // Songs saved before Step 9A have no flag — a key other
         // than the default D minor means he picked it himself.
+        // v16: the baseline stays D minor on purpose. D minor WAS
+        // the default when these songs were created, so inferring
+        // vs the new default (E minor) would mark a hand-picked
+        // E-minor song as unsettled and re-open the exact hole #3
+        // closes (a beat import flipping his song's key). The
+        // backfill above is the only place a key is re-settled.
         s.keyManuallySet = s.key !== 'D minor';
       }
       if (typeof s.beatKeyConfidence !== 'number') s.beatKeyConfidence = 0;
+      // v13.8-light: beats imported before the fingerprint existed
+      // have no hash — it is computed on the next beat load, and
+      // takes saved before then carry beatSha256: null.
+      if (typeof s.beatSha256 !== 'string') s.beatSha256 = null;
       if (typeof s.keySource !== 'string') s.keySource = null;
       // Step 4A (v13.4): the live chain's One Knob macros +
       // toggles. Old songs get the defaults (all 50, chain on,
@@ -324,6 +421,11 @@
       if (!s.macros || typeof s.macros !== 'object') s.macros = { even: 50, bright: 50, space: 50, punch: 50, warm: 50 };
       s.macros = clampMacros(s.macros);
       if (typeof s.chainOn !== 'boolean') s.chainOn = true;
+      // v13.8-light: live sound is tune-only by default — the full
+      // 9-stage chain runs on playback, where latency does not
+      // matter. Old songs get the light default; the switch lives
+      // in Setup ("Light live sound").
+      if (typeof s.lightLive !== 'boolean') s.lightLive = true;
       // Step 4B (v13.5): per-stage bypasses + fine tone. Old
       // songs get the defaults; a song saved by v13.4 keeps its
       // room-noise cut — it becomes the nr bypass (cut on means
@@ -353,6 +455,13 @@
         });
       });
     });
+    // v16 (QUEUE #3): the backfill above rewrites what the app
+    // shows — persist it, so the stored record matches the screen.
+    // A backfill that lives only in memory leaves the ledger lying
+    // (the QUEUE #7 class: localStorage still says 'bogus' / D
+    // minor while the app shows Natural / E minor). Best-effort:
+    // a full store must never block boot — the next save persists it.
+    try { saveSessions(); } catch (e) { /* the next save persists it */ }
     var currentId = PS.store.currentSessionId();
     state.session = state.sessions.find(function (s) { return s.id === currentId; }) || state.sessions[0];
     PS.store.setCurrentSessionId(state.session.id);
@@ -388,8 +497,18 @@
     return PS.db.getBeat(state.session.id).then(function (row) {
       if (!row || !row.blob) return;
       return row.blob.arrayBuffer().then(function (buf) {
-        return PS.audio.decodeBeat(buf);
-      }).then(function (decoded) {
+        // v13.8-light: fingerprint the beat BEFORE decoding (the
+        // decode can detach the buffer) — a beat imported before
+        // fingerprints existed gets its hash on this load.
+        return hashBeatBytes(buf).then(function (sha) { return { buf: buf, sha: sha }; });
+      }).then(function (hashed) {
+        return PS.audio.decodeBeat(hashed.buf).then(function (decoded) { return { decoded: decoded, sha: hashed.sha }; });
+      }).then(function (pair) {
+        var decoded = pair.decoded;
+        if (pair.sha && state.session.beatSha256 !== pair.sha) {
+          state.session.beatSha256 = pair.sha;
+          saveSessions();
+        }
         state.beat = {
           buffer: decoded.buffer,
           mono: decoded.mono,
@@ -428,8 +547,14 @@
     state.beatLoading = true;
     renderTracks(); // the beat row shows "Loading…" while it decodes
     var importJob = file.arrayBuffer().then(function (buf) {
-      return PS.audio.decodeBeat(buf);
-    }).then(function (decoded) {
+      // v13.8-light: fingerprint the beat BEFORE decoding (the
+      // decode can detach the buffer), then carry the hash into
+      // the session next to the file name.
+      return hashBeatBytes(buf).then(function (sha) { return { buf: buf, sha: sha }; });
+    }).then(function (hashed) {
+      return PS.audio.decodeBeat(hashed.buf).then(function (decoded) { return { decoded: decoded, sha: hashed.sha }; });
+    }).then(function (pair) {
+      var decoded = pair.decoded;
       return PS.db.saveBeat({
         sessionId: state.session.id,
         fileName: 'beat.' + (file.name.split('.').pop() || 'audio').toLowerCase(),
@@ -439,6 +564,7 @@
         addedAt: new Date().toISOString()
       }).then(function () {
         state.session.beatFileName = 'beat.' + (file.name.split('.').pop() || 'audio').toLowerCase();
+        state.session.beatSha256 = pair.sha; // null when the browser could not hash — never a guess
         state.session.beatOriginalName = file.name;
         state.session.beatDuration = decoded.duration;
         saveSessions();
@@ -481,6 +607,7 @@
     if (!window.confirm('Remove the beat from this song? Your takes stay.')) return;
     PS.db.deleteBeat(state.session.id).catch(function () { /* ignore */ });
     state.session.beatFileName = null;
+    state.session.beatSha256 = null; // v13.8-light: the fingerprint goes with the beat
     state.session.beatOriginalName = null;
     state.session.beatDuration = null;
     // The key + tempo came from that beat — they go with it.
@@ -635,7 +762,13 @@
    * guessing. Nothing here touches the recorded takes.
    */
   function detectBeatKeyTempo() {
-    if (!state.beat || !state.beat.mono || !PS.keydetect || !PS.tempodetect) return;
+    if (!state.beat || !state.beat.mono) return;
+    // v13.8-light: the detectors load after first paint — if a beat
+    // lands before they do, load them now and run the analysis once.
+    if (!PS.keydetect || !PS.tempodetect) {
+      loadHeavyModules().then(function () { detectBeatKeyTempo(); });
+      return;
+    }
     var s = state.session;
     var keyResult = null;
     var tempoResult = null;
@@ -1052,11 +1185,22 @@
     var takeNumber = vocal.takes.length + 1;
     var takeId = PS.store.newId();
     var durationSeconds = snapshot.length / sr;
+    var baseName = takeFileBase(state.session.name, track, takeNumber, takeId);
     var metadata = {
       trackKind: track,
-      rawFileName: 'take-' + takeNumber + '-raw.wav',
-      alignedFileName: 'take-' + takeNumber + '.wav',
+      rawFileName: baseName + '-raw.wav',
+      alignedFileName: baseName + '.wav',
       sampleRate: sr,
+      // v13.8-light: which beat this take was sung over (logger
+      // takes have no beat anchor — nulls, never a guess).
+      beatFileName: state.session.beatFileName || null,
+      beatSha256: state.session.beatSha256 || null,
+      // v20 (QUEUE #41): the beat's tempo travels with the take —
+      // the server renders the echo on this grid, never the
+      // hardcoded 135. Nulls when there was no beat (or no tempo
+      // detected yet); beatBpmAlt is the half/double partner.
+      beatBpm: state.session.beatBpm || null,
+      beatBpmAlt: state.session.beatBpmAlt || null,
       durationSeconds: durationSeconds,
       leadInSamples: 0,
       delaySamples: 0,
@@ -1118,7 +1262,12 @@
       comp: false
     };
     var wav = new Blob([PS.wav.encodeWavFloat32(snapshot, sr)], { type: 'audio/wav' });
-    PS.db.saveTake({
+    // v17 (QUEUE #10): same shape as finishTake — one record, one
+    // success function, so a failed save can be retried with the
+    // exact same bytes. A logger take has NO chunks, so its message
+    // must not promise a boot recovery: the retry (this copy, still
+    // in memory) is the only way back, and it says so.
+    var loggerRecord = {
       id: takeId,
       sessionId: state.session.id,
       track: track,
@@ -1127,7 +1276,8 @@
       alignedWav: wav,
       metadata: metadata,
       recordedAt: metadata.recordedAt
-    }).then(function () {
+    };
+    function completeLoggerSave() {
       vocal.takes.push({
         id: takeId,
         takeNumber: takeNumber,
@@ -1163,9 +1313,11 @@
       renderTracks();
       renderSheet();
       updateTransport();
-    }).catch(function (err) {
+    }
+    PS.db.saveTake(loggerRecord).then(completeLoggerSave).catch(function (err) {
       console.warn('Logger take save failed:', err);
-      showError('The last 60 seconds could not be saved — the phone may be out of space for this site.');
+      showSaveFailedError('The last 60 seconds could not be saved — the phone may be out of space for this site. Tap "Try saving again" — the last minute is still in memory, and this is the only copy.',
+        { kind: 'logger', record: loggerRecord, onSaved: completeLoggerSave });
     });
   }
 
@@ -1194,6 +1346,12 @@
     // The ideas logger owns the mic while armed — stop it first so
     // the take can open the mic (one capture at a time).
     if (state.logger) disarmLogger(false);
+    // v17 (QUEUE #10): a new take supersedes a failed save still
+    // waiting on its retry — the error box is already hidden
+    // (startTakeRequest called clearError), so the retry is
+    // unreachable from here. The failed take is still recoverable
+    // from its chunks on the next boot.
+    state.pendingFailedTake = null;
     // The take id + number are fixed BEFORE recording starts, so the
     // chunked writes (Step 1B) can be keyed while the take records.
     var vocal = state.session.tracks[track];
@@ -1239,7 +1397,10 @@
         // reaches the part) while this take records — the app
         // splits the capture into one take per pass at the end.
         loop: loopOn() ? { start: state.session.loop.start, end: state.session.loop.end } : null,
-        onBlock: function (batch) { setMeter(batch.peak); accumulateLivePeak(batch.peak); },
+        onBlock: function (batch) {
+          if (window.PSPerf) PSPerf.noteBlock(batch.time);
+          setMeter(batch.peak); accumulateLivePeak(batch.peak);
+        },
         // Chunked writes (Step 1B): one 48,000-sample chunk per
         // second, straight to storage while recording. A write
         // failure never fails the take — the in-memory recording
@@ -1261,6 +1422,7 @@
       });
     }).then(function (handle) {
       state.startingTake = false;
+      if (window.PSPerf) { PSPerf.mark('record-started'); PSPerf.measure('record-start-ms', 'record-tap', 'record-started'); PSPerf.measure('tap-to-first-block-ms', 'record-tap', 'record-first-block'); }
       state.recording = {
         track: track,
         handle: handle,
@@ -1312,6 +1474,12 @@
       if (!vocal) return;
       var takeId = vocal.activeTakeId || (vocal.takes.length ? vocal.takes[vocal.takes.length - 1].id : null);
       if (!takeId) return;
+      // v13.8-light: a take's audio never changes after save, so a
+      // decoded overdub is cached by take id — the record tap no
+      // longer re-reads IndexedDB + re-decodes every guide vocal
+      // on every take. The cache clears on song switch.
+      var cached = state.overdubCache[takeId];
+      if (cached) { jobs.push(Promise.resolve(cached)); return; }
       jobs.push(
         PS.db.getTake(takeId).then(function (record) {
           if (!record || !record.alignedWav) return null;
@@ -1327,7 +1495,9 @@
             // in the song, so the engine can start it late — a
             // loop pass or a best-of take used as a guide vocal
             // lines up with the beat instead of playing from 0.
-            return { buffer: buffer, sound: sound, songOffsetSeconds: take ? (take.songOffsetSeconds || 0) : 0 };
+            var item = { buffer: buffer, sound: sound, songOffsetSeconds: take ? (take.songOffsetSeconds || 0) : 0 };
+            state.overdubCache[takeId] = item;
+            return item;
           });
         }).catch(function () { return null; }) // a missing overdub never kills the take
       );
@@ -1385,9 +1555,19 @@
   // replaced this one and the live canvas stayed blank. Renamed.
   // Step 5 (v13.6): the rolling peaks draw into any canvas — the
   // record strip and the sound panel's wave share this one draw.
+  // v13.8-light: the live wave draws at most every 200 ms (5 fps
+  // still reads as movement) and never while the page is hidden;
+  // the 2d context is cached instead of fetched on every draw.
+  // Two 100 ms ticks (record timer + monitor analyser) used to
+  // draw both canvases each — 20 canvas draws a second, on the
+  // same main thread the audio callbacks need.
   function drawLivePeaksInto(canvas) {
     if (!canvas) return;
-    var c2d = canvas.getContext('2d');
+    if (document.hidden) return;
+    var nowMs = performance.now();
+    if (canvas._psLastDraw && nowMs - canvas._psLastDraw < 200) return;
+    canvas._psLastDraw = nowMs;
+    var c2d = canvas._psCtx || (canvas._psCtx = canvas.getContext('2d'));
     if (!c2d) return;
     var w = canvas.width;
     var h = canvas.height;
@@ -1519,7 +1699,7 @@
 
     var vocal = state.session.tracks[track];
     var takeNumber = rec.takeNumber;
-    var baseName = 'take-' + takeNumber;
+    var baseName = takeFileBase(state.session.name, track, takeNumber, rec.takeId);
     var durationSeconds = alignedSamples.length / sr;
     // outputLatency drift (Step 0C): recalibrate when it has moved
     // more than 20 ms from the calibration's value.
@@ -1533,6 +1713,17 @@
       rawFileName: baseName + '-raw.wav',
       alignedFileName: baseName + '.wav',
       sampleRate: sr,
+      // v13.8-light: which beat this take was sung over — the
+      // server render matches on this, never guesses. Nulls when
+      // there was no beat (or no fingerprint yet).
+      beatFileName: state.session.beatFileName || null,
+      beatSha256: state.session.beatSha256 || null,
+      // v20 (QUEUE #41): the beat's tempo travels with the take —
+      // the server renders the echo on this grid, never the
+      // hardcoded 135. Nulls when there was no beat (or no tempo
+      // detected yet); beatBpmAlt is the half/double partner.
+      beatBpm: state.session.beatBpm || null,
+      beatBpmAlt: state.session.beatBpmAlt || null,
       durationSeconds: durationSeconds,
       leadInSamples: leadInSamples,
       delaySamples: delaySamples,
@@ -1645,7 +1836,11 @@
       comp: false
     };
 
-    PS.db.saveTake({
+    // v17 (QUEUE #10): the save record is built once, so a failed
+    // save can be retried with the exact same bytes + metadata —
+    // and the success path is one function, run by the first save
+    // or by the retry, never duplicated.
+    var takeRecord = {
       id: takeId,
       sessionId: state.session.id,
       track: track,
@@ -1654,7 +1849,8 @@
       alignedWav: alignedWav,
       metadata: metadata,
       recordedAt: metadata.recordedAt
-    }).then(function () {
+    };
+    function completeTakeSave() {
       vocal.takes.push(takeMeta);
       vocal.activeTakeId = takeId;
       saveSessions();
@@ -1679,9 +1875,15 @@
       } else if (drifted) {
         showError('The timing may have drifted since you measured these headphones — measure them again before the next take.');
       }
-    }).catch(function (err) {
+    }
+    PS.db.saveTake(takeRecord).then(completeTakeSave).catch(function (err) {
       console.warn('Take save failed:', err);
-      showError('The take recorded but could not be saved — the phone may be out of space for this site.');
+      // v17 (QUEUE #10): hold the take in memory and offer the
+      // retry — the blobs are the only full copy (the chunks hold
+      // it up to the last full second). Do NOT delete the orphan
+      // chunks here: they are the boot recovery the message names.
+      showSaveFailedError('The take recorded but could not be saved — the phone may be out of space for this site. Tap "Try saving again" to save it now, or close the app and reopen it — your take is kept as a recovery.',
+        { kind: 'take', record: takeRecord, onSaved: completeTakeSave });
       renderTracks();
       updateTransport();
     });
@@ -1703,17 +1905,17 @@
           metadata.analysis = summary;
           saveSessions();
           // The stored record keeps the same summary, so the line
-          // survives a reload (put() rewrites the whole record —
-          // the sound files go back unchanged).
-          PS.db.saveTake({
-            id: takeId,
-            sessionId: state.session.id,
-            track: track,
-            takeNumber: takeMeta.takeNumber,
-            rawWav: rawWav,
-            alignedWav: alignedWav,
-            metadata: metadata,
-            recordedAt: metadata.recordedAt
+          // survives a reload. v19 (QUEUE #25): merged into the
+          // CURRENT stored record (read-then-write, the same pattern
+          // as persistNotesToDb) — the old code re-saved the stale
+          // metadata object from finish time, which would erase a
+          // sent stamp (or a note) added after the take saved but
+          // before the analysis finished.
+          PS.db.getTake(takeId).then(function (record) {
+            if (!record) return;
+            record.metadata = record.metadata || {};
+            record.metadata.analysis = summary;
+            return PS.db.saveTake(record);
           }).catch(function () { /* the line still shows this session */ });
           renderSheet();
         });
@@ -1803,13 +2005,28 @@
     var drifted = PS.safety.outputLatencyDrifted(calibrationOutputLatency, outputLatencyNow);
     var micSettings = PS.audio.micSettings();
     var saved = [];
-    var chain = Promise.resolve();
-    passes.forEach(function (pass, i) {
-      chain = chain.then(function () {
-        return saveLoopPass(pass, i);
+    var failedPass = -1; // v17 (QUEUE #10): the pass whose save broke the chain
+    // v17 (QUEUE #10): the pass chain is one function, so a failed
+    // pass can be retried together with the passes after it — the
+    // passes saved so far stay saved, the rest re-run.
+    function runLoopFrom(startIdx) {
+      var chain = Promise.resolve();
+      for (var i = startIdx; i < passes.length; i++) {
+        (function (idx) {
+          chain = chain.then(function () { return saveLoopPass(passes[idx], idx); });
+        })(i);
+      }
+      chain.then(finishLoopSaved).catch(function (err) {
+        console.warn('Loop pass save failed:', err);
+        // The chunks belong to the whole recording and are NOT
+        // deleted here — they are the boot recovery the message names.
+        showSaveFailedError('The passes recorded but could not be saved — the phone may be out of space for this site. Tap "Try saving again" to save the rest, or close the app and reopen it — your take is kept as a recovery.',
+          { kind: 'loop-pass', resume: function () { runLoopFrom(failedPass < 0 ? 0 : failedPass); } });
+        renderTracks();
+        updateTransport();
       });
-    });
-    chain.then(function () {
+    }
+    function finishLoopSaved() {
       vocal.activeTakeId = saved.length ? saved[saved.length - 1].id : vocal.activeTakeId;
       saveSessions();
       // The passes are saved — the chunks have done their job.
@@ -1827,12 +2044,8 @@
       } else if (drifted) {
         showError('The timing may have drifted since you measured these headphones — measure them again before the next take.');
       }
-    }).catch(function (err) {
-      console.warn('Loop pass save failed:', err);
-      showError('The passes recorded but could not be saved — the phone may be out of space for this site.');
-      renderTracks();
-      updateTransport();
-    });
+    }
+    runLoopFrom(0);
 
     function saveLoopPass(pass, i) {
       // Each pass gets its own residual check against the loop's
@@ -1846,13 +2059,25 @@
       var trimSamples = Math.max(0, Math.min(residual.trimSamples, pass.samples.length - Math.round(0.3 * sr)));
       var alignedSamples = pass.samples.subarray(trimSamples);
       var takeNumber = baseNumber + i;
-      var baseName = 'take-' + takeNumber;
+      var takeId = PS.store.newId();
+      var baseName = takeFileBase(state.session.name, track, takeNumber, takeId);
       var durationSeconds = alignedSamples.length / sr;
       var metadata = {
         trackKind: track,
         rawFileName: baseName + '-raw.wav',
         alignedFileName: baseName + '.wav',
         sampleRate: sr,
+        // v13.8-light: which beat this take was sung over — the
+        // server render matches on this, never guesses. Nulls when
+        // there was no beat (or no fingerprint yet).
+        beatFileName: state.session.beatFileName || null,
+        beatSha256: state.session.beatSha256 || null,
+        // v20 (QUEUE #41): the beat's tempo travels with the take —
+        // the server renders the echo on this grid, never the
+        // hardcoded 135. Nulls when there was no beat (or no tempo
+        // detected yet); beatBpmAlt is the half/double partner.
+        beatBpm: state.session.beatBpm || null,
+        beatBpmAlt: state.session.beatBpmAlt || null,
         durationSeconds: durationSeconds,
         leadInSamples: leadInSamples,
         delaySamples: delaySamples,
@@ -1912,7 +2137,6 @@
       };
       var rawWav = new Blob([PS.wav.encodeWavFloat32(pass.samples, sr)], { type: 'audio/wav' });
       var alignedWav = new Blob([PS.wav.encodeWavFloat32(alignedSamples, sr)], { type: 'audio/wav' });
-      var takeId = PS.store.newId();
       var takeMeta = {
         id: takeId,
         takeNumber: takeNumber,
@@ -1944,6 +2168,10 @@
         passIndex: pass.index,
         comp: false
       };
+      // v17 (QUEUE #10): remember which pass this is before the
+      // save — if the chain breaks here, the retry resumes from
+      // this pass, not from the start.
+      failedPass = i;
       return PS.db.saveTake({
         id: takeId,
         sessionId: state.session.id,
@@ -2241,55 +2469,81 @@
   var SMALL_COPY_CUTOFF_HZ = 8500;
   var SMALL_COPY_FILTER_ORDER = 10;
 
+  /* v18 (QUEUE #20): a take's filenames are unique per take — song
+   * name + track + take number + the first 8 chars of the take id.
+   * Before this, every song named its takes take-1/take-2, so the
+   * second song's take-2 overwrote the first in the Drive inbox
+   * (same name, flat folder) and the server then rendered the wrong
+   * take — and the take-sha dedupe refused the right take as a
+   * "duplicate". The small-copy name and the JSON name derive from
+   * alignedFileName (smallCopyFileName + the .wav -> .json replace
+   * in sendSmallCopy/shareTake), so they follow automatically.
+   * Same sanitize as the bulk-export path, and the song part is
+   * capped at 40 chars so a long song name can't push the name
+   * past Drive's limits. */
+  function takeFileBase(sessionName, track, takeNumber, takeId) {
+    var song = String(sessionName || 'song').slice(0, 40);
+    var idPart = String(takeId || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'notake';
+    return (song + '-' + String(track || 'lead') + '-take' + takeNumber + '-' + idPart)
+      .replace(/[^A-Za-z0-9._-]+/g, '-');
+  }
+  PS.takeFileBase = takeFileBase; // v18: exposed for the CDP tests
+
   function smallCopyFileName(alignedFileName) {
     return String(alignedFileName || 'take.wav').replace(/\.wav$/i, '-small.wav');
   }
 
   /* A WAV Blob in, a small WAV Blob out. Returns a promise of
    * { blob, fileName, sampleRate, bitsPerSample, durationSeconds,
-   * sizeBytes }. Throws when the file cannot be read, the filter
-   * is not loaded, or this browser cannot render offline.
+   * sizeBytes }. Waits for the heavy modules (v13.8 loads retune.js
+   * after first paint) instead of failing when the Send sheet opens
+   * fast; throws when the file cannot be read, the filter fails to
+   * load, or this browser cannot render offline.
    */
   function makeSmallCopy(wavBlob, alignedFileName) {
     if (!wavBlob) return Promise.reject(new Error('No take to copy.'));
-    if (!PS.retune || !PS.retune.lowpassButterworth) {
-      return Promise.reject(new Error('This browser cannot make the smaller copy.'));
-    }
     if (typeof OfflineAudioContext === 'undefined') {
       return Promise.reject(new Error('This browser cannot make the smaller copy.'));
     }
-    return wavBlob.arrayBuffer().then(function (buf) {
-      var decoded = PS.wav.decodeWavFloat32(buf);
-      if (!decoded || !decoded.samples || decoded.samples.length === 0) {
-        throw new Error('That take could not be read.');
+    // v13.8-light: retune.js loads after first paint — wait for the
+    // heavy modules instead of failing when the Send sheet opens fast.
+    return loadHeavyModules().then(function () {
+      if (!PS.retune || !PS.retune.lowpassButterworth) {
+        throw new Error('This browser cannot make the smaller copy.');
       }
-      // The anti-alias filter, in plain JS at the take's own rate —
-      // anything above the new top end is filtered, not folded back.
-      PS.retune.lowpassButterworth(decoded.samples, decoded.sampleRate,
-        SMALL_COPY_CUTOFF_HZ, SMALL_COPY_FILTER_ORDER);
-      // The rate change, on the already-filtered take.
-      var target = SMALL_COPY_SAMPLE_RATE;
-      var outLen = Math.max(1, Math.round(decoded.samples.length * target / decoded.sampleRate));
-      var off = new OfflineAudioContext(1, outLen, target);
-      var srcBuf = off.createBuffer(1, decoded.samples.length, decoded.sampleRate);
-      srcBuf.getChannelData(0).set(decoded.samples);
-      var src = off.createBufferSource();
-      src.buffer = srcBuf;
-      src.connect(off.destination);
-      src.start(0);
-      return off.startRendering();
-    }).then(function (rendered) {
-      var samples = rendered.getChannelData(0);
-      var bytes = PS.wav.encodeWav16(samples, SMALL_COPY_SAMPLE_RATE);
-      var blob = new Blob([bytes], { type: 'audio/wav' });
-      return {
-        blob: blob,
-        fileName: smallCopyFileName(alignedFileName),
-        sampleRate: SMALL_COPY_SAMPLE_RATE,
-        bitsPerSample: SMALL_COPY_BITS,
-        durationSeconds: samples.length / SMALL_COPY_SAMPLE_RATE,
-        sizeBytes: blob.size
-      };
+      return wavBlob.arrayBuffer().then(function (buf) {
+        var decoded = PS.wav.decodeWavFloat32(buf);
+        if (!decoded || !decoded.samples || decoded.samples.length === 0) {
+          throw new Error('That take could not be read.');
+        }
+        // The anti-alias filter, in plain JS at the take's own rate —
+        // anything above the new top end is filtered, not folded back.
+        PS.retune.lowpassButterworth(decoded.samples, decoded.sampleRate,
+          SMALL_COPY_CUTOFF_HZ, SMALL_COPY_FILTER_ORDER);
+        // The rate change, on the already-filtered take.
+        var target = SMALL_COPY_SAMPLE_RATE;
+        var outLen = Math.max(1, Math.round(decoded.samples.length * target / decoded.sampleRate));
+        var off = new OfflineAudioContext(1, outLen, target);
+        var srcBuf = off.createBuffer(1, decoded.samples.length, decoded.sampleRate);
+        srcBuf.getChannelData(0).set(decoded.samples);
+        var src = off.createBufferSource();
+        src.buffer = srcBuf;
+        src.connect(off.destination);
+        src.start(0);
+        return off.startRendering();
+      }).then(function (rendered) {
+        var samples = rendered.getChannelData(0);
+        var bytes = PS.wav.encodeWav16(samples, SMALL_COPY_SAMPLE_RATE);
+        var blob = new Blob([bytes], { type: 'audio/wav' });
+        return {
+          blob: blob,
+          fileName: smallCopyFileName(alignedFileName),
+          sampleRate: SMALL_COPY_SAMPLE_RATE,
+          bitsPerSample: SMALL_COPY_BITS,
+          durationSeconds: samples.length / SMALL_COPY_SAMPLE_RATE,
+          sizeBytes: blob.size
+        };
+      });
     });
   }
   PS.makeSmallCopy = makeSmallCopy; // v13.7: exposed for the CDP tests
@@ -2351,6 +2605,9 @@
         if (navigator.canShare && navigator.canShare({ files: files })) {
           return navigator.share({ files: files, title: 'Phone Studio take' }).then(function () {
             closeSendSheet();
+            // v19 (QUEUE #25): the share sheet resolving is the only
+            // proof the files left the app — mark the take sent.
+            stampSentTake(takeId, 'small');
           }).catch(function (err) {
             if (err && err.name === 'AbortError') {
               setSendButtonsEnabled(true);
@@ -2402,7 +2659,12 @@
         files.push(new File([record.rawWav], record.metadata.rawFileName, { type: 'audio/wav' }));
       }
       if (navigator.canShare && navigator.canShare({ files: files })) {
-        return navigator.share({ files: files, title: 'Phone Studio take' }).catch(function (err) {
+        return navigator.share({ files: files, title: 'Phone Studio take' }).then(function () {
+          // v19 (QUEUE #25): resolved means sent — mark it. An abort
+          // never reaches here (it lands in the catch below, which
+          // swallows it without stamping).
+          stampSentTake(takeId, 'full');
+        }).catch(function (err) {
           if (err && err.name !== 'AbortError') throw err;
         });
       }
@@ -2415,6 +2677,50 @@
       showError('Sharing failed. Try again, or back up the take from Setup.');
     });
   }
+
+  /* v19 (QUEUE #25) — a sent take is marked sent, so he can tell it
+   * from one that never left the phone, and Setup can clear sent
+   * takes later. The stamp is the share sheet RESOLVING: it closed
+   * with the files handed over. An abort stamps nothing (the caller
+   * never reaches here on abort); a download fallback stamps nothing
+   * either — the files landed in the phone's Files, not in Drive,
+   * and the backup path never stamps (a backup is not a send). The
+   * stamp lives in two places: the stored record's metadata (the
+   * IDB record is the truth — a reload or a boot reconcile reads it
+   * back) and the take list entry (so the badge shows without a
+   * reload, and saveSessions keeps it across one). A stamp failure
+   * never reports the send as failed — the files already left; the
+   * take just stays unstamped and can be sent again (a second stamp
+   * overwrites, never duplicates).
+   */
+  function stampSentTake(takeId, via) {
+    var sentAt = new Date().toISOString();
+    return PS.db.getTake(takeId).then(function (record) {
+      if (!record) return;
+      record.metadata = record.metadata || {};
+      record.metadata.sentAt = sentAt;
+      record.metadata.sentVia = via;
+      return PS.db.saveTake(record).then(function () {
+        var found = null;
+        state.sessions.forEach(function (session) {
+          Object.keys(session.tracks || {}).forEach(function (track) {
+            (session.tracks[track].takes || []).forEach(function (t) {
+              if (t.id === takeId) found = t;
+            });
+          });
+        });
+        if (found) {
+          found.sentAt = sentAt;
+          found.sentVia = via;
+          saveSessions();
+        }
+        renderSheet();
+      });
+    }).catch(function (err) {
+      console.warn('Sent stamp failed:', err);
+    });
+  }
+  PS.stampSentTake = stampSentTake; // v19: exposed for the CDP tests
 
   function shareSelected() {
     var take = activeTakeOf(state.selectedTrack);
@@ -2540,6 +2846,21 @@
     }).join('');
   }
 
+  /* v13.8-light — fingerprint a beat's bytes (SHA-256 hex, or null
+   * when the browser cannot hash). The beat file is fingerprinted
+   * ONCE, at import / on the next load, and stored on the session;
+   * every take saved after that stamps the fingerprint into its
+   * metadata, so the server render can match a take to its beat
+   * without guessing. A take saved with no beat, or before the
+   * fingerprint existed, carries nulls — never a guess.
+   */
+  function hashBeatBytes(buf) {
+    if (!window.crypto || !window.crypto.subtle || !window.crypto.subtle.digest) return Promise.resolve(null);
+    return window.crypto.subtle.digest('SHA-256', buf).then(function (digest) {
+      return toHex(digest);
+    }).catch(function () { return null; });
+  }
+
   /* v13.2 (item 3) — check a backup against its list. Pure: takes
    * the manifest object + an array of { name, size, sha256 } for
    * the files actually picked, and returns { ok, missing, changed }
@@ -2569,6 +2890,9 @@
   PS.toneToChain = toneToChain; // Step 4B: the fine-tone mapping, for the CDP tests
   PS.makeVocalChain = makeVocalChain; // Step 4B: build a chain in any context — the CDP tests render it offline through the real worklets
   PS.chainInfo = chainInfo; // Step 4A: the chain as the app wired it (stages in order, switches, latencies)
+  PS.perfReport = function () { return window.PSPerf ? PSPerf.report() : null; }; // v13.8-light: probe readout
+  PS.lightLive = function () { return state.session.lightLive !== false; }; // v13.8-light
+  PS.setLightLive = setLightLive; // v13.8-light: flip live tune-only/full + re-park live chains
   PS.chainProbe = chainProbe; // Step 4A: the live node values of the playback/monitor chain
   PS.fxPanelState = function () { // Step 5: the panel as the app sees it — open, the song sound, each part on/off
     var slots = {};
@@ -2683,6 +3007,99 @@
     updateTransport();
   }
 
+  /* v19 (QUEUE #25) — the sent takes, across all songs: every take
+   * whose list entry carries sentAt. The stamp is set by
+   * stampSentTake (share sheet resolved) and survives a reload via
+   * saveSessions / the boot reconcile.
+   */
+  function collectSentTakes() {
+    var sent = [];
+    state.sessions.forEach(function (session) {
+      Object.keys(session.tracks || {}).forEach(function (track) {
+        (session.tracks[track].takes || []).forEach(function (take) {
+          if (take.sentAt) sent.push({ session: session, track: track, take: take });
+        });
+      });
+    });
+    return sent;
+  }
+  PS.collectSentTakes = collectSentTakes; // v19: exposed for the CDP tests
+
+  /* The sent-takes list in Setup. Sizes are estimated from the take
+   * length (two 32-bit float files at 48 kHz — about 38 MB for a
+   * 104 s take) because weighing the blobs would load every take's
+   * audio into memory on every Setup open (QUEUE #31's cost, for a
+   * number). The estimate is labelled as one; the count is exact.
+   */
+  function renderSentTakesList() {
+    var box = $('sent-takes-list');
+    if (!box) return;
+    var sent = collectSentTakes();
+    box.innerHTML = '';
+    if (!sent.length) {
+      box.appendChild(el('p', 'muted small', 'No sent takes yet — nothing has been marked sent.'));
+      return;
+    }
+    var estBytes = 0;
+    sent.forEach(function (entry) {
+      estBytes += 2 * (entry.take.durationSeconds || 0) * 48000 * 4;
+      box.appendChild(el('p', 'muted small', takeLabel(entry.take) + ' — ' + entry.session.name +
+        ' — Sent ' + fmtTime(entry.take.sentAt) +
+        (entry.take.sentVia ? ' (' + (entry.take.sentVia === 'small' ? 'smaller copy' : 'full quality') + ')' : '')));
+    });
+    var estMb = Math.round(estBytes / 1048576);
+    box.appendChild(el('p', 'muted small', sent.length + ' sent take' + (sent.length > 1 ? 's' : '') +
+      ' — about ' + estMb + ' MB on this phone.'));
+  }
+
+  /* v19 (QUEUE #25) — one tap clears every SENT take: the raw +
+   * aligned sound files leave the phone (IDB delete) and the take
+   * leaves its track's list. Unstamped takes are never touched —
+   * they are the only copy. Deliberately NOT automatic: sent does
+   * not mean rendered, and the phone cannot see Drive — deleting a
+   * sent-but-unrendered take would destroy the only copy. One
+   * confirm names the count + the estimate; the per-take removal
+   * mirrors deleteTake (active/star fixup, wave cache, stop
+   * playback) for every session, not just the current one.
+   */
+  function clearSentTakes() {
+    var status = $('clear-sent-status');
+    var sent = collectSentTakes();
+    if (!sent.length) {
+      if (status) status.textContent = 'No sent takes to clear — nothing has been marked sent yet.';
+      return;
+    }
+    var estBytes = 0;
+    sent.forEach(function (entry) { estBytes += 2 * (entry.take.durationSeconds || 0) * 48000 * 4; });
+    var estMb = Math.round(estBytes / 1048576);
+    if (!window.confirm('Clear ' + sent.length + ' sent take' + (sent.length > 1 ? 's' : '') +
+        ' (about ' + estMb + ' MB)? They were already sent — the sound files leave this phone. ' +
+        'Takes that never went out stay put.')) return;
+    var removed = 0;
+    var jobs = sent.map(function (entry) {
+      var vocal = entry.session.tracks[entry.track];
+      vocal.takes = vocal.takes.filter(function (t) { return t.id !== entry.take.id; });
+      if (vocal.activeTakeId === entry.take.id) {
+        vocal.activeTakeId = vocal.takes.length ? vocal.takes[vocal.takes.length - 1].id : null;
+      }
+      if (vocal.starredTakeId === entry.take.id) vocal.starredTakeId = null;
+      delete state.waveCache[entry.take.id];
+      state.waveCacheOrder = state.waveCacheOrder.filter(function (id) { return id !== entry.take.id; });
+      if (state.playingTakeId === entry.take.id) stopPlayback();
+      return PS.db.deleteTake(entry.take.id).then(function () { removed += 1; }).catch(function () { /* ignore */ });
+    });
+    Promise.all(jobs).then(function () {
+      saveSessions();
+      renderTracks();
+      renderSheet();
+      updateTransport();
+      renderSentTakesList();
+      if (status) status.textContent = 'Cleared ' + removed + ' sent take' + (removed > 1 ? 's' : '') +
+        ' (about ' + estMb + ' MB). Takes that never went out are untouched.';
+    });
+  }
+  PS.clearSentTakes = clearSentTakes; // v19: exposed for the CDP tests
+
   /* Step 6C (v13.3) — what a take is called, in plain words: a
    * best-of take is "Best of 1", a loop pass is "Pass 2", anything
    * else is "Take 3". Used on the track rows, in the take sheet,
@@ -2734,6 +3151,48 @@
    * live mode — Big Chorus renders 4 voices there to save phone
    * CPU; playback renders the full 7.
    */
+  /* v13.8-light — heavy modules AFTER first paint.
+   *
+   * tune-worklet.js (58 KB, the tune DSP), key-detect.js,
+   * tempo-detect.js and retune.js are NOT in index.html's
+   * synchronous scripts any more: they parse after the first
+   * paint, in order, on idle — the record screen never waits
+   * for them. Every call site already guards on their absence
+   * (detectBeatKeyTempo, analyzeChunked, makeSmallCopy), and
+   * the beat-analysis path re-runs itself once they land.
+   * loadHeavyModules() is idempotent; warmWorklets() pre-loads
+   * the two audio worklets (fetch + compile) off the record
+   * tap — on iOS the context resume may never settle outside a
+   * gesture, so the warmup races a 3 s timeout and fails
+   * silently; the tap path is unchanged when it does.
+   */
+  var heavyModulesPromise = null;
+  function loadHeavyModules() {
+    if (heavyModulesPromise) return heavyModulesPromise;
+    heavyModulesPromise = new Promise(function (resolve) {
+      var files = ['tune-worklet.js', 'key-detect.js', 'tempo-detect.js', 'retune.js'];
+      var i = 0;
+      function next() {
+        if (i >= files.length) { resolve(true); return; }
+        var script = document.createElement('script');
+        script.src = files[i++];
+        script.onload = next;
+        script.onerror = next; // a missing module never blocks the rest — call sites guard
+        document.head.appendChild(script);
+      }
+      next();
+    });
+    return heavyModulesPromise;
+  }
+  function warmWorklets() {
+    if (window.PSPerf) PSPerf.mark('worklet-warm-start');
+    var job = ensureTuneModule().then(function () {
+      if (window.PSPerf) { PSPerf.mark('worklet-warm-end'); PSPerf.measure('worklet-warm-ms', 'worklet-warm-start', 'worklet-warm-end'); }
+      return true;
+    }).catch(function () { return false; });
+    return Promise.race([job, new Promise(function (resolve) { setTimeout(function () { resolve(false); }, 3000); })]);
+  }
+
   function ensureTuneModule() {
     if (state.tuneModuleReady && state.chainModuleReady) return PS.audio.ensureContext();
     return PS.audio.ensureContext().then(function (ctx) {
@@ -2779,6 +3238,16 @@
     node.port.postMessage({ type: 'live', on: !!isLive });
     node.port.postMessage({ type: 'enabled', on: true });
     return node;
+  }
+
+  /* v13.8-light — flip the live sound between tune-only (smooth)
+   * and the full chain, and re-park the live chains in place.
+   * Playback chains are never light, so they do not move.
+   */
+  function setLightLive(on) {
+    state.session.lightLive = !!on;
+    saveSessions();
+    broadcastTune();
   }
 
   function broadcastTune() {
@@ -3045,7 +3514,19 @@
    * carry the room with them. One line of difference, same
    * sound family; the offline render is the honest judge).
    */
-  function makeVocalChain(ctx, isLive, sound, destination) {
+  /* v13.8-light — `lightOpt`: true forces the tune-only live
+   * path, false forces the full chain, undefined means "live
+   * chains follow the song's Light live sound switch (on by
+   * default), playback/offline chains are always full".
+   * A light chain keeps the tune + the two native biquads that
+   * protect it (corrective EQ, low cut — ~free, and the low cut
+   * keeps rumble out of YIN) and parks everything else: the
+   * chain worklet is a bit-exact passthrough, the tone biquads
+   * sit at 0, the echo send is dry. Playback is untouched — the
+   * finished sound is heard on playback, where a few ms of
+   * latency cost nothing.
+   */
+  function makeVocalChain(ctx, isLive, sound, destination, lightOpt) {
     var s = sound || {
       key: state.session.key,
       preset: state.session.preset,
@@ -3140,6 +3621,8 @@
     delayFb.connect(delayNode);
     var chainObj = {
       ctx: ctx,
+      isLive: !!isLive,
+      lightOpt: lightOpt, // v13.8-light: explicit true/false, or undefined = live follows the song switch
       input: corrective,
       output: highShelf,
       tune: tune,
@@ -3152,7 +3635,7 @@
         presence: presence,
         highShelf: highShelf
       },
-      delay: { node: delayNode, wet: delayWet, seconds: delaySeconds, bpm: bpm },
+      delay: { node: delayNode, wet: delayWet, fb: delayFb, seconds: delaySeconds, bpm: bpm },
       macros: clampMacros(s.macros),
       bypass: clampBypass(s.bypass),
       tone: clampTone(s.tone),
@@ -3197,6 +3680,13 @@
     var bypass = clampBypass(s.bypass || copySessionBypass());
     var tone = clampTone(s.tone || copySessionTone());
     var chainOn = typeof s.chainOn === 'boolean' ? s.chainOn : state.session.chainOn;
+    // v13.8-light: a light chain is tune-only live. Recomputed on
+    // every setSound, so flipping the Setup switch re-parks the
+    // live chains in place — no rebuild, no click. An explicit
+    // lightOpt (the CDP light render) always wins.
+    var light = chainObj.lightOpt !== undefined ? !!chainObj.lightOpt :
+      (chainObj.isLive && state.session.lightLive !== false);
+    chainObj.light = light;
     var c = macrosToChain(macros);
     var tc = toneToChain(tone);
     var ctx = chainObj.ctx;
@@ -3212,19 +3702,22 @@
     chainObj.chain.port.postMessage({
       type: 'params',
       params: {
-        ratio: bypass.even ? 1 : c.ratio,
+        ratio: (light || bypass.even) ? 1 : c.ratio,
         diffDb: c.diffDb,
         attackMs: c.attackMs,
         releaseMs: c.releaseMs,
-        makeupDb: bypass.even ? 0 : c.makeupDb,
+        makeupDb: (light || bypass.even) ? 0 : c.makeupDb,
         drive: c.drive,
-        satMix: bypass.tone ? 0 : c.satMix,
-        reverbWet: (chainOn && !bypass.room) ? c.reverbWet : 0
+        satMix: (light || bypass.tone) ? 0 : c.satMix,
+        reverbWet: (light || !chainOn || bypass.room) ? 0 : c.reverbWet
       }
     });
-    chainObj.chain.port.postMessage({ type: 'nr', on: chainOn && !bypass.nr });
-    chainObj.chain.port.postMessage({ type: 'deess', on: chainOn && !bypass.deess });
-    chainObj.chain.port.postMessage({ type: 'enabled', on: chainOn });
+    chainObj.chain.port.postMessage({ type: 'nr', on: !light && chainOn && !bypass.nr });
+    chainObj.chain.port.postMessage({ type: 'deess', on: !light && chainOn && !bypass.deess });
+    // Light = the worklet is a bit-exact passthrough (its `enabled:
+    // false` path touches nothing) — the tune still tunes, the
+    // native biquads still shape, nothing else spends CPU live.
+    chainObj.chain.port.postMessage({ type: 'enabled', on: !light && chainOn });
     function setGain(node, v) {
       try { node.gain.setTargetAtTime(v, t, 0.01); } catch (e) { node.gain.value = v; }
     }
@@ -3240,13 +3733,18 @@
     function setFreq(node, v) {
       node.frequency.value = v;
     }
-    setGain(chainObj.eq.corrective, (chainOn && !bypass.tonefix) ? -2 : 0);
-    setFreq(chainObj.eq.lowCut1, (chainOn && !bypass.lowcut) ? tc.lowCutHz : 10);
-    setFreq(chainObj.eq.lowCut2, (chainOn && !bypass.lowcut) ? tc.lowCutHz : 10);
-    setGain(chainObj.eq.lowShelf, (chainOn && !bypass.tone) ? c.lowShelfDb : 0);
-    setGain(chainObj.eq.presence, (chainOn && !bypass.tone) ? c.presenceDb + tc.presenceDb : 0);
-    setGain(chainObj.eq.highShelf, (chainOn && !bypass.tone) ? c.shelfDb + tc.shelfDb : 0);
-    setGain(chainObj.delay.wet, (chainOn && !bypass.echo) ? c.delayWet : 0);
+    // Light keeps the corrective cut + the low cut (native biquads,
+    // ~free, and the low cut keeps rumble out of YIN) and parks the
+    // tone biquads + the echo at 0 — the graph stays wired, so the
+    // switch itself is silent.
+    setGain(chainObj.eq.corrective, ((light || chainOn) && !bypass.tonefix) ? -2 : 0);
+    setFreq(chainObj.eq.lowCut1, ((light || chainOn) && !bypass.lowcut) ? tc.lowCutHz : 10);
+    setFreq(chainObj.eq.lowCut2, ((light || chainOn) && !bypass.lowcut) ? tc.lowCutHz : 10);
+    setGain(chainObj.eq.lowShelf, (light || !chainOn || bypass.tone) ? 0 : c.lowShelfDb);
+    setGain(chainObj.eq.presence, (light || !chainOn || bypass.tone) ? 0 : c.presenceDb + tc.presenceDb);
+    setGain(chainObj.eq.highShelf, (light || !chainOn || bypass.tone) ? 0 : c.shelfDb + tc.shelfDb);
+    setGain(chainObj.delay.wet, (light || !chainOn || bypass.echo) ? 0 : c.delayWet);
+    setGain(chainObj.delay.fb, (light || !chainOn || bypass.echo) ? 0 : 0.25);
     chainObj.macros = macros;
     chainObj.bypass = bypass;
     chainObj.tone = tone;
@@ -3265,8 +3763,10 @@
     var c = macrosToChain(ch.macros);
     var b = clampBypass(ch.bypass);
     var tc = toneToChain(ch.tone);
+    var light = !!ch.light; // v13.8-light: what applyChainSettings actually parked
     return {
       chainOn: ch.chainOn,
+      light: light,
       macros: ch.macros,
       bypass: b,
       tone: ch.tone,
@@ -3279,15 +3779,15 @@
       delaySeconds: ch.delay.seconds,
       delayBpm: ch.delay.bpm,
       worklet: {
-        ratio: b.even ? 1 : c.ratio,
+        ratio: (light || b.even) ? 1 : c.ratio,
         diffDb: c.diffDb,
         attackMs: c.attackMs,
         releaseMs: c.releaseMs,
-        makeupDb: b.even ? 0 : c.makeupDb,
-        satMix: b.tone ? 0 : c.satMix,
-        reverbWet: (ch.chainOn && !b.room) ? c.reverbWet : 0,
-        nrOn: ch.chainOn && !b.nr,
-        deessOn: ch.chainOn && !b.deess
+        makeupDb: (light || b.even) ? 0 : c.makeupDb,
+        satMix: (light || b.tone) ? 0 : c.satMix,
+        reverbWet: (light || !ch.chainOn || b.room) ? 0 : c.reverbWet,
+        nrOn: !light && ch.chainOn && !b.nr,
+        deessOn: !light && ch.chainOn && !b.deess
       }
     };
   }
@@ -3306,6 +3806,7 @@
     // is its own switch), so they report only their bypass.
     var bypass = copySessionBypass();
     var chainOn = state.session.chainOn;
+    var lightLive = state.session.lightLive !== false; // v13.8-light
     return {
       stages: [
         { name: 'Room noise cut', on: !bypass.nr },
@@ -3318,6 +3819,13 @@
         { name: 'Echo', on: chainOn && !bypass.echo },
         { name: 'Room', on: chainOn && !bypass.room }
       ],
+      // The stages above are the song's sound (what playback
+      // plays). What he hears LIVE while singing is narrower
+      // when lightLive is on: tune + tone fix + low cut only.
+      lightLive: lightLive,
+      liveStages: lightLive ?
+        ['Tone fix', 'Low cut', 'Tune'] :
+        ['Tone fix', 'Low cut', 'Tune', 'Even out', 'Sizzle cut', 'Tone', 'Echo', 'Room'],
       chainOn: chainOn,
       macros: copySessionMacros(),
       bypass: bypass,
@@ -4361,6 +4869,9 @@
       // stay in the take's saved details — a singer does not need
       // to read them on a take.
       var subBits = [fmtTime(take.recordedAt)];
+      // v19 (QUEUE #25): a sent take says so, with the date it went
+      // out — so he can tell it from a take that never left the phone.
+      if (take.sentAt) subBits.push('Sent ✓ ' + fmtTime(take.sentAt));
       // Step 6C (v13.3): where the take sits in the song, and what
       // a best-of take was made from — plain words, no segment or
       // sample talk.
@@ -4628,7 +5139,8 @@
         if (t.comp && t.compNumber >= compNumber) compNumber = t.compNumber + 1;
       });
       var takeNumber = vocal.takes.length + 1;
-      var baseName = 'take-' + takeNumber;
+      var takeId = PS.store.newId();
+      var baseName = takeFileBase(state.session.name, track, takeNumber, takeId);
       var sources = good.map(function (p) {
         return { takeId: p.take.id, takeNumber: p.take.takeNumber, label: takeLabel(p.take) };
       });
@@ -4637,6 +5149,16 @@
         rawFileName: baseName + '-raw.wav',
         alignedFileName: baseName + '.wav',
         sampleRate: sr,
+        // v13.8-light: the comp inherits its song's beat — the
+        // server render matches on this, never guesses.
+        beatFileName: state.session.beatFileName || null,
+        beatSha256: state.session.beatSha256 || null,
+        // v20 (QUEUE #41): the beat's tempo travels with the take —
+        // the server renders the echo on this grid, never the
+        // hardcoded 135. Nulls when there was no beat (or no tempo
+        // detected yet); beatBpmAlt is the half/double partner.
+        beatBpm: state.session.beatBpm || null,
+        beatBpmAlt: state.session.beatBpmAlt || null,
         durationSeconds: durationSeconds,
         leadInSamples: 0,
         delaySamples: 0,
@@ -4692,7 +5214,6 @@
         compRegionEnd: region.end
       };
       var wav = new Blob([PS.wav.encodeWavFloat32(composite, sr)], { type: 'audio/wav' });
-      var takeId = PS.store.newId();
       var takeMeta = {
         id: takeId,
         takeNumber: takeNumber,
@@ -5191,6 +5712,8 @@
     $('chain-on').checked = state.session.chainOn;
     // Checked = the noise cut is ON (bypass off).
     $('chain-nr').checked = !bypass.nr;
+    // v13.8-light: checked = tune-only live (the smooth default).
+    $('light-live').checked = state.session.lightLive !== false;
     MACRO_KEYS.forEach(function (key) {
       var slider = $('macro-' + key);
       var val = $('macro-' + key + '-value');
@@ -5221,6 +5744,28 @@
     // Step 4A (v13.4): the studio-sound card always shows the
     // song's current knobs + switches (a reload re-reads them).
     renderChainCard();
+    renderPerfReadout();
+    // v19 (QUEUE #25): the sent-takes list is rebuilt every time
+    // Setup opens, so a take sent since last time shows up.
+    renderSentTakesList();
+  }
+
+  /* v13.8-light — the probe's numbers in plain words, in Setup.
+   * The same numbers PS.perfReport() returns for the CDP harness.
+   * On his phone this is the only way to see whether recording
+   * is actually smooth — no computer needed.
+   */
+  function renderPerfReadout() {
+    var line = $('perf-readout');
+    if (!line || !window.PSPerf) return;
+    var r = PSPerf.report();
+    var bits = [];
+    if (r.paints['first-contentful-paint'] !== undefined) bits.push('First paint ' + Math.round(r.paints['first-contentful-paint']) + ' ms');
+    if (r.measures['record-start-ms'] !== undefined) bits.push('Last take started in ' + Math.round(r.measures['record-start-ms']) + ' ms');
+    if (r.blocks.blocks > 1) bits.push(r.blocks.blocks + ' mic blocks, longest gap ' + Math.round(r.blocks.gapMaxMs) + ' ms');
+    bits.push(r.longtasks.count + ' slow moments over ' + Math.round(r.longtasks.totalMs) + ' ms');
+    bits.push(r.frames.dropped50 + ' dropped frames');
+    line.textContent = 'Speed check: ' + bits.join(' — ') + '.';
   }
 
   function showStudio() {
@@ -5253,6 +5798,12 @@
       state.session.bypass.nr = !$('chain-nr').checked;
       saveSessions();
       broadcastTune();
+    });
+    // v13.8-light: flipping the switch re-parks the live chains
+    // in place (applyChainSettings recomputes light on every
+    // setSound) — no rebuild, no click.
+    $('light-live').addEventListener('change', function () {
+      setLightLive($('light-live').checked);
     });
     // Step 4B (v13.5): the fine tone sliders + the sound-part
     // switches. A slider drag retunes every live chain at once
@@ -5294,6 +5845,7 @@
       });
     });
     $('transport-record').addEventListener('click', function () {
+      if (window.PSPerf) PSPerf.mark('record-tap');
       if (state.recording) stopTakeRequest();
       else startTakeRequest(state.selectedTrack);
     });
@@ -5510,7 +6062,8 @@
       updateMonitor();
     });
     $('cal-measure').addEventListener('click', startCalibration);
-    $('error-dismiss').addEventListener('click', clearError);
+    $('error-dismiss').addEventListener('click', dismissError);
+    $('error-retry').addEventListener('click', retryFailedTakeSave);
     // Phase 0 wiring.
     $('lab-open').addEventListener('click', openLab);
     $('lab-back').addEventListener('click', closeLab);
@@ -5519,6 +6072,8 @@
     $('backup-btn').addEventListener('click', backupAllTakes);
     // v13.2 (item 3) — check a backup against its list.
     $('backup-check-btn').addEventListener('click', checkBackupFiles);
+    // v19 (QUEUE #25): clear only the takes already marked sent.
+    $('clear-sent-btn').addEventListener('click', clearSentTakes);
     $('home-banner-dismiss').addEventListener('click', function () {
       PS.store.dismissBanner('home-screen');
       $('home-banner').style.display = 'none';
@@ -5547,6 +6102,7 @@
     var session = state.sessions.find(function (s) { return s.id === id; });
     if (!session) return;
     state.session = session;
+    state.overdubCache = {}; // v13.8-light: cached overdubs belong to the old song
     PS.store.setCurrentSessionId(id);
     setPlayhead(0);
     broadcastTune(); // the new song may be in a different key, preset, or strength — retune the monitor + playback
@@ -5627,7 +6183,12 @@
             compNumber: typeof m.compNumber === 'number' ? m.compNumber : null,
             compSources: Array.isArray(m.compSources)
               ? m.compSources.map(function (s) { return typeof s === 'string' ? s : (s.label || ''); }).filter(function (s) { return !!s; })
-              : null
+              : null,
+            // v19 (QUEUE #25): the sent stamp, backfilled from the
+            // stored record — a take whose list entry was lost in a
+            // forced close gets its badge back from IDB on boot.
+            sentAt: m.sentAt || null,
+            sentVia: m.sentVia || null
           });
           changed = true;
         });
@@ -5762,11 +6323,25 @@
     var alignedSamples = samples.subarray(trimSamples);
     var durationSeconds = alignedSamples.length / sr;
     var takeAnalysis = PS.routelab.analyzeTake(samples, sr);
+    // v18 (QUEUE #20): the recovered take reuses its original take
+    // id (the orphan chunks are keyed by it), so its filename is
+    // unique to this take even though the take number is recomputed.
+    var baseName = takeFileBase(session.name, next.track, takeNumber, next.takeId);
     var metadata = {
       trackKind: next.track,
-      rawFileName: 'take-' + takeNumber + '-raw.wav',
-      alignedFileName: 'take-' + takeNumber + '.wav',
+      rawFileName: baseName + '-raw.wav',
+      alignedFileName: baseName + '.wav',
       sampleRate: sr,
+      // v13.8-light: a recovered take keeps its song's beat stamp
+      // (from the session it belonged to — never guessed).
+      beatFileName: session.beatFileName || null,
+      beatSha256: session.beatSha256 || null,
+      // v20 (QUEUE #41): the beat's tempo travels with the take —
+      // the server renders the echo on this grid, never the
+      // hardcoded 135. Nulls when there was no beat (or no tempo
+      // detected yet); beatBpmAlt is the half/double partner.
+      beatBpm: session.beatBpm || null,
+      beatBpmAlt: session.beatBpmAlt || null,
       durationSeconds: durationSeconds,
       leadInSamples: leadInSamples,
       delaySamples: residual.trimSamples,
@@ -5876,16 +6451,26 @@
     }
     wire();
     renderAll();
+    // v13.8-light: the heavy modules (tune DSP, key/tempo detect,
+    // offline re-tune) parse AFTER first paint, on idle — and the
+    // worklets warm up (fetch + compile) off the record tap.
+    // Neither blocks the first screen; neither opens the mic.
+    if (window.requestIdleCallback) {
+      requestIdleCallback(function () { loadHeavyModules().then(function () { warmWorklets(); }); }, { timeout: 2000 });
+    } else {
+      setTimeout(function () { loadHeavyModules().then(function () { warmWorklets(); }); }, 800);
+    }
     // v13 — Volume: hand the saved level to the engine at boot so
     // the first thing he plays is already at his volume (the engine
     // remembers it until the master gain is built).
     PS.audio.setVolume(PS.store.volume() / 100);
-    // v13.2 (item 8, scaffolding) — read the reference voice when
-    // one is present (voice-reference.json next to the app). The
-    // loader never throws: no file yet means null, and the app's
-    // defaults stay v13 until his voice note lands. The reference
-    // is held in state.voiceReference for the later wiring — nothing
-    // reads it for sound yet.
+    // v13.2 (item 8) — read the reference voice when one is
+    // present (voice-reference.json next to the app). The loader
+    // never throws: no file yet means null. v16: the wiring is
+    // DONE — the note landed and EC1/EC2/EC3 passed, so new songs
+    // open on Natural / E minor from his voice (store.js +
+    // loadSessions backfill). The reference is still held in
+    // state.voiceReference for later use.
     if (window.PS && PS.voiceRef) {
       PS.voiceRef.load().then(function (ref) { state.voiceReference = ref; });
     }

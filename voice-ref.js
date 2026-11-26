@@ -1,18 +1,20 @@
-/* voice-ref.js — the reference-voice loader (v13.2 item 8, scaffolding).
+/* voice-ref.js — the reference-voice loader (v13.2 item 8).
  *
  * Denasse's voice is the missing test material: the tune, the
  * presets and the mic model are all unproven on his real voice.
  * When his voice note lands, Jim measures it (test/voice-measure.js)
  * and writes the result to voice-reference.json next to this app.
  * This loader reads that file when it is present — and returns null
- * when it is not, so the app behaves exactly as v13.1 until then.
+ * when it is not. A failed or missing file is never an error: the
+ * loader resolves null and the app carries on.
  *
- * SCAFFOLDING ONLY: the loaded reference is held for the later
- * wiring (defaults from HIS voice, test signals from HIS voice).
- * Nothing in the app reads it for sound yet — the defaults stay
- * v13 (Hard + Auto) until the voice note lands and the ear check
- * passes. A failed or missing file is never an error: the loader
- * resolves null and the app carries on.
+ * v16 (QUEUE #3) — the wiring is DONE. The voice note landed
+ * (take-2) and EC1/EC2/EC3 passed, so new songs open on Natural /
+ * E minor from his voice (store.js makeSession + app.js backfill)
+ * and a beat import never overrides his voice's key. The settled
+ * defaults live in the code, not in this file — the reference is
+ * the measurement record, and the loader still holds it in
+ * state.voiceReference for later use (test signals from HIS voice).
  *
  * Reference format (schemaVersion 1, written by
  * test/voice-measure.js --ref):

@@ -776,6 +776,7 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
   box-shadow: 0 12px 32px rgba(0, 0, 0, .5);
 }
 #error-text { flex: 1 1 auto; }
+#error-retry { flex: 0 0 auto; margin: 0; }
 #error-dismiss { flex: 0 0 auto; margin: 0; }
 
 /* -------------------------------------------------------------- take sheet */

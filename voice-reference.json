@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "source": "12924E28-E412-4532-8ECD-D157F480044C-take-2.wav",
+  "durationSeconds": 54.55,
+  "sampleRate": 48000,
+  "pitch": {
+    "medianHz": 219.4,
+    "medianNote": "A3",
+    "minHz": 97.6,
+    "minNote": "G2",
+    "maxHz": 744.3,
+    "maxNote": "F#5",
+    "rangeSemitones": 35.2,
+    "voicedFraction": 0.675,
+    "voicedSeconds": 36.8
+  },
+  "vibrato": {
+    "present": true,
+    "rateHz": 5.5,
+    "depthCents": 117.9,
+    "segmentSeconds": 4.32
+  },
+  "tone": {
+    "spectralCentroidHz": 532,
+    "bandShares": {
+      "low": 0.016,
+      "mid": 0.967,
+      "high": 0.016,
+      "air": 0
+    },
+    "windows": 78
+  },
+  "dynamics": {
+    "rmsDbfs": -18.8,
+    "peakDbfs": 0.2,
+    "crestDb": 19
+  }
+}

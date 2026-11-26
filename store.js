@@ -70,8 +70,18 @@
     return {
       id: newId(),
       name: name || 'New Song',
-      key: 'D minor',
-      preset: 'hard', // the vocal effect (Voloco's Starter pack) — Hard Tune, Denasse's choice
+      // v16 (QUEUE #3) — HIS voice defaults. The v13.2 gate is MET:
+      // the voice note landed (voice-reference.json, take-2) and
+      // EC1/EC2/EC3 settled Natural + E minor (subtle beat hard in
+      // both keys; E minor beat D minor in both; take-2 ladder in-key
+      // E minor 69.2% vs D minor 60.7%). A new song opens on HIS
+      // sound now — never the old Hard / D minor placeholder.
+      // The key is settled from the start (keySource 'voice'), so a
+      // beat import can never override his voice's key. Strength
+      // stays 100; tone and macros are untouched (the reference tone
+      // is mic-limited: mid 96.7%, air 0% — it must NOT set EQ).
+      key: 'E minor',
+      preset: 'natural', // Natural Tune — smooth, keeps his vibrato
       strength: 100, // pitch-correction strength 0-100 (100 = the full snap)
       speed: null, // tune speed 0-100; null = Auto (the preset's own retune time — v11's exact sound)
       // Step 4A (v13.4) — the live chain's One Knob macros, 0-100
@@ -91,7 +101,7 @@
       // nrOn switch, now one entry in the bypass set.
       bypass: { nr: true, tonefix: false, lowcut: false, tune: false, even: false, deess: false, tone: false, echo: false, room: false },
       tone: { rumble: 50, presence: 50, air: 50 },
-      keyManuallySet: false, // true once Denasse picks a key himself; the beat's detected key only auto-applies before that
+      keyManuallySet: true, // v16: his voice's key is settled from the start — a beat import never overrides it (QUEUE #3)
       // Step 6C (v13.3): the loop region in song seconds
       // { start, end, on } — null until he drags one on the top
       // bar. Recording with the loop on cycles the part and
@@ -103,8 +113,9 @@
       beatBpm: null, // the tempo the beat detector heard
       beatBpmAlt: null, // its half/double partner (68 <-> 136)
       beatGridOffset: null, // where the first real hit lands, seconds (Step 9A; the mixer uses it in Phase 4)
-      keySource: null, // 'beat' when the key came from the beat, 'manual' when picked by hand
+      keySource: 'voice', // v16: the key came from his measured voice (EC1/EC2/EC3) — 'beat' when from the beat, 'manual' when picked by hand
       beatFileName: null,
+      beatSha256: null, // v13.8-light: SHA-256 of the beat file as imported — the take JSON carries it so the server render knows which beat a take belongs to
       beatOriginalName: null,
       beatDuration: null,
       tracks: tracks,
