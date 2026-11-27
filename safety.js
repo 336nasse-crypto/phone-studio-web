@@ -78,18 +78,62 @@
     return chunkCount * CHUNK_SAMPLES / sampleRate;
   }
 
+  /* Which chunk indices are missing from a set of rows. Chunks are
+   * indexed from 0 (one per second of the take), so any index the
+   * sorted rows skip is a hole: a chunk put that failed while later
+   * puts kept landing (#82's transient failure + a kill before
+   * finish). Returns the missing indices, in order; [] when the
+   * rows are contiguous. The index IS the position in seconds
+   * (one chunk = one second of the take).
+   */
+  function findChunkGaps(rows) {
+    var sorted = rows.slice().sort(function (a, b) { return a.index - b.index; });
+    var gaps = [];
+    var expected = 0;
+    for (var i = 0; i < sorted.length; i++) {
+      while (expected < sorted[i].index) {
+        gaps.push(expected);
+        expected++;
+      }
+      expected = sorted[i].index + 1;
+    }
+    return gaps;
+  }
+
   /* Reassemble chunk rows (each { index, data: Float32Array }) into
    * one Float32Array, in index order. Rows may arrive unsorted.
+   * v26 (QUEUE #91): a missing middle index used to splice
+   * silently — the rows after the hole landed one second early
+   * against the beat and nothing flagged it. Now the hole is
+   * filled with silence (one nominal chunk per missing index, the
+   * first row's length), so the vocal stays in time and the
+   * assembled length is the true span. Contiguous rows are
+   * byte-identical to before (no gap, no fill, same loop).
    */
   function reassembleChunks(rows) {
     var sorted = rows.slice().sort(function (a, b) { return a.index - b.index; });
+    if (sorted.length === 0) return new Float32Array(0);
+    var chunkLen = sorted[0].data.length;
     var total = 0;
-    for (var i = 0; i < sorted.length; i++) total += sorted[i].data.length;
+    var expected = 0;
+    for (var i = 0; i < sorted.length; i++) {
+      if (sorted[i].index > expected) total += (sorted[i].index - expected) * chunkLen;
+      total += sorted[i].data.length;
+      expected = sorted[i].index + 1;
+    }
     var out = new Float32Array(total);
     var offset = 0;
+    expected = 0;
     for (var j = 0; j < sorted.length; j++) {
+      // Silence for any missing index: the output is zero-filled,
+      // so just advance the offset past the hole.
+      while (expected < sorted[j].index) {
+        offset += chunkLen;
+        expected++;
+      }
       out.set(sorted[j].data, offset);
       offset += sorted[j].data.length;
+      expected = sorted[j].index + 1;
     }
     return out;
   }
@@ -161,6 +205,7 @@
     chunkKey: chunkKey,
     chunkedSeconds: chunkedSeconds,
     reassembleChunks: reassembleChunks,
+    findChunkGaps: findChunkGaps,
     hasEnoughFree: hasEnoughFree,
     parseIOSVersion: parseIOSVersion,
     wakeLockWarnNeeded: wakeLockWarnNeeded,

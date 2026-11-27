@@ -241,22 +241,240 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
 }
 .row-more:active { color: var(--text); }
 
-/* Track accent colors (lead purple, ad-libs orange, harmonies teal). */
-.track-row[data-track="lead"] { --track-accent: var(--purple); }
-.track-row[data-track="adlibs"] { --track-accent: var(--orange); }
-.track-row[data-track="harmonies"] { --track-accent: var(--teal); }
+/* Track accent colors (v29 mockup 12: Main vocal warm orange,
+ * Ad-libs teal, Harmonies violet — the same hexes as
+ * store.TRACK_COLORS, so the lane, the wave and the blocks match). */
+.track-row[data-track="lead"] { --track-accent: #fb923c; }
+.track-row[data-track="adlibs"] { --track-accent: #2dd4bf; }
+.track-row[data-track="harmonies"] { --track-accent: #a78bfa; }
 .track-row[data-track="beat"] { --track-accent: #e5e5e5; }
 
-/* The playhead — one white line across all rows. */
+/* v29 (mockup 12): the beat is a lane, not a background — darker
+ * and thinner than the vocal lanes, so the voices read as the
+ * working area and the beat reads as the floor they sit on. */
+.track-row.beat-row {
+  background: rgba(255, 255, 255, 0.03);
+  min-height: 44px;
+  flex: 0 0 auto;
+  height: 52px;
+}
+.track-row.beat-row .wave-lane canvas { opacity: 0.55; }
+.track-row.beat-row .row-label .row-name { color: var(--muted); }
+/* v29: the beat row is only 52 px tall — the label (icon above
+ * text, ~34 px, plus the sub) is ~56 px and the name clips 8 px
+ * (v133 check 0). On the beat row the icon sits BESIDE the name,
+ * so the label is ~38 px and fits. */
+.track-row.beat-row .row-label .row-name {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+/* v29: the + Add layer button sits in the lane column, under the
+ * last vocal layer — it reads as "another voice row here", not a
+ * floating action. */
+.add-layer-row {
+  display: flex;
+  align-items: center;
+  padding: 2px 4px;
+}
+.add-layer-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  color: var(--teal);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 6px 4px;
+}
+.add-layer-btn .plus {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid var(--teal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  line-height: 1;
+}
+.add-layer-btn:active { opacity: 0.7; }
+.add-layer-btn:disabled { opacity: 0.35; }
+
+/* The playhead — v29 (mockup 12): a fat, grabbable blue line with
+ * a pill handle on the ruler. Drag it (or anywhere on a lane) to
+ * scrub; Play starts from wherever it sits. */
 .playhead {
   position: absolute;
   top: 0;
   bottom: 8px;
-  width: 2px;
-  background: #fff;
-  box-shadow: 0 0 6px rgba(255, 255, 255, .6);
+  width: 4px;
+  margin-left: -2px;
+  background: #38bdf8;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.8);
   z-index: 5;
   pointer-events: none;
+}
+.playhead-handle {
+  position: absolute;
+  top: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 30px;
+  height: 12px;
+  border-radius: 999px;
+  background: #38bdf8;
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.9);
+  pointer-events: auto;
+  cursor: grab;
+  touch-action: none;
+}
+
+/* v29 (mockup 12): the whole-song overview strip — a thin waveform
+ * of the full song above the transport, with a window showing where
+ * the line is. Tap it to move the line. */
+.overview-strip {
+  flex: 0 0 auto;
+  position: relative;
+  height: 34px;
+  margin: 0 10px 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+  cursor: pointer;
+}
+.overview-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.overview-window {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  border: 2px solid #38bdf8;
+  border-radius: 6px;
+  background: rgba(56, 189, 248, 0.08);
+  pointer-events: none;
+}
+
+/* v29 (mockup 12): a take is a block on its lane — a rounded
+ * region in the lane's color, with the take's waveform inside.
+ * Tap to select it (and make it the lane's take); press-hold and
+ * drag to move it; drag the round handles to trim it. Handles and
+ * the menu show only on the selected block. */
+.take-block {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  overflow: visible;
+  cursor: pointer;
+  touch-action: none;
+  z-index: 2;
+}
+.take-block canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: 7px;
+}
+.take-block.selected {
+  box-shadow: 0 0 0 2px #fff;
+  z-index: 3;
+}
+.take-block.dragging { opacity: 0.75; }
+.block-handle {
+  position: absolute;
+  top: 50%;
+  width: 22px;
+  height: 22px;
+  margin-top: -11px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #38bdf8;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  cursor: ew-resize;
+  z-index: 4;
+  touch-action: none;
+}
+.block-handle.left { left: -11px; }
+.block-handle.right { right: -11px; }
+.block-menu {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: flex;
+  gap: 4px;
+  z-index: 4;
+}
+.block-menu .btn-small {
+  font-size: 11px;
+  padding: 3px 8px;
+  background: rgba(0, 0, 0, 0.65);
+}
+
+/* v29 (mockup 12): takes live on their own screen — a full view
+ * with a tab per vocal layer and the take list below it. */
+.takes-view {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+}
+.takes-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  padding: 8px 16px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.takes-tab {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.takes-tab.active {
+  background: var(--purple-soft);
+  border-color: var(--purple);
+  color: var(--text);
+}
+.takes-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  max-width: 640px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 4px 16px calc(24px + env(safe-area-inset-bottom));
+}
+
+/* v29: the sound strip lives inside the sound panel now — it flows
+ * as a plain block there, not a black bar with a top border. */
+#fx-panel .preset-strip {
+  background: transparent;
+  border-top: none;
+  padding: 0;
+  gap: 10px;
 }
 
 /* ------------------------------------------------------------ preset strip */

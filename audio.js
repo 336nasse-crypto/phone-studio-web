@@ -465,8 +465,24 @@
 
   /* Decodes an audio file (ArrayBuffer) to an AudioBuffer at the
    * context's sample rate, plus a mono mix for the residual check.
-   * (decodeAudioData resamples to the context rate — the web
-   * equivalent of BeatImporter converting to the engine rate.)
+   * v24 (QUEUE #53): do NOT trust the browser to resample — the old
+   * comment asserted decodeAudioData resamples to the context rate,
+   * and Chromium does, but Safari is unverified and his phone runs
+   * Safari. If the decoded beat arrives at its native rate, resample
+   * the mono mix to the context rate explicitly (OfflineAudioContext
+   * render, the same technique as makeSmallCopy) and stamp the
+   * resampled rate — the residual check reads beat onsets at the
+   * context rate, so a native-rate mono would mis-trim the take by
+   * ~8% (a 120 ms-late vocal never corrected, an on-time take
+   * flagged off-beat; auditor probe, cycle 66). The returned
+   * `buffer` stays the decoded buffer (playback resamples it); only
+   * `mono` — what the check and the key/tempo listeners read — is
+   * forced to the context rate. If this browser cannot render
+   * offline, the mono stays native and `sampleRate` says so
+   * honestly — finishTake then refuses the check with
+   * 'unverified-rate-mismatch' instead of verifying on mismatched
+   * arrays. `resampledFrom` is the file's native rate when a
+   * resample ran, else null.
    */
   function decodeBeat(arrayBuffer) {
     return ensureDecodeContext().then(function () {
@@ -478,7 +494,28 @@
         for (var i = 0; i < buffer.length; i++) mono[i] += data[i];
       }
       for (var j = 0; j < buffer.length; j++) mono[j] /= buffer.numberOfChannels;
-      return { buffer: buffer, mono: mono, duration: buffer.duration, sampleRate: buffer.sampleRate };
+      if (buffer.sampleRate === ctx.sampleRate) {
+        return { buffer: buffer, mono: mono, duration: buffer.duration, sampleRate: buffer.sampleRate, resampledFrom: null };
+      }
+      if (typeof OfflineAudioContext === 'undefined') {
+        // Cannot resample here — report the true (native) rate so
+        // the caller refuses the residual check instead of running
+        // it on mismatched arrays.
+        return { buffer: buffer, mono: mono, duration: buffer.duration, sampleRate: buffer.sampleRate, resampledFrom: null, resampleUnavailable: true };
+      }
+      var target = ctx.sampleRate;
+      var nativeRate = buffer.sampleRate;
+      var outLen = Math.max(1, Math.round(mono.length * target / nativeRate));
+      var off = new OfflineAudioContext(1, outLen, target);
+      var srcBuf = off.createBuffer(1, mono.length, nativeRate);
+      srcBuf.getChannelData(0).set(mono);
+      var src = off.createBufferSource();
+      src.buffer = srcBuf;
+      src.connect(off.destination);
+      src.start(0);
+      return off.startRendering().then(function (rendered) {
+        return { buffer: buffer, mono: rendered.getChannelData(0), duration: rendered.length / target, sampleRate: target, resampledFrom: nativeRate };
+      });
     });
   }
 

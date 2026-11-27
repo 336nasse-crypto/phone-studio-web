@@ -238,6 +238,11 @@
     STUDIO_GRADE_HZ: STUDIO_GRADE_HZ,
     NARROWBAND_FREQ_HZ: NARROWBAND_FREQ_HZ,
     CLAP_SPREAD_PASS_MS: CLAP_SPREAD_PASS_MS,
+    // v25 (QUEUE #70): the floor the finish path uses for "this
+    // take has no sound in it" — the same -50 dB line the
+    // narrowband check already uses for "the take must have real
+    // content". Exported so app.js never hard-codes a second copy.
+    NARROWBAND_MIN_RMS_DB: NARROWBAND_MIN_RMS_DB,
     fft: fft,
     magnitudeSpectrum: magnitudeSpectrum,
     bandwidth: bandwidth,

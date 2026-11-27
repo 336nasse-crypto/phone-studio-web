@@ -11,6 +11,12 @@
  *     takeId, so a take killed mid-record can be rebuilt from its
  *     chunks on the next boot — at most the last partial second is
  *     lost. Chunk rows are deleted once the take is saved.
+ *   takeRecovery: one record per take (v25, QUEUE #59) — the sound
+ *     identity frozen at record start (key/preset/strength/macros/
+ *     chainOn/bypass/tone + the beat fields), keyed by takeId, so
+ *     a take killed mid-record and rebuilt from its chunks stamps
+ *     what he sang in, not the song's live fields (which may have
+ *     changed since the crash). Deleted once the take is saved.
  *
  * Loads in the browser as window.PS.db. Promise-based.
  */
@@ -26,7 +32,7 @@
   'use strict';
 
   var DB_NAME = 'phone-studio';
-  var DB_VERSION = 2;
+  var DB_VERSION = 3;
   var dbPromise = null;
 
   function open() {
@@ -48,6 +54,13 @@
         if (!db.objectStoreNames.contains('takeChunks')) {
           var chunks = db.createObjectStore('takeChunks', { keyPath: 'key' });
           chunks.createIndex('takeId', 'takeId', { unique: false });
+        }
+        // v25 (QUEUE #59): one at-record sound-identity row per
+        // take, keyed by takeId. Created on upgrade only — a
+        // take recorded before v25 simply has no row (the recovery
+        // falls back to the session's fields + flags the take).
+        if (!db.objectStoreNames.contains('takeRecovery')) {
+          db.createObjectStore('takeRecovery', { keyPath: 'takeId' });
         }
       };
       request.onsuccess = function () { resolve(request.result); };
@@ -134,6 +147,12 @@
           });
         });
       });
-    }
+    },
+    // --- Take recovery record (v25, QUEUE #59): the at-record
+    // sound identity, one row per take, keyed by takeId. Written
+    // when the first chunk lands; deleted once the take is saved.
+    saveTakeRecovery: function (record) { return put('takeRecovery', record); },
+    getTakeRecovery: function (takeId) { return get('takeRecovery', takeId); },
+    deleteTakeRecovery: function (takeId) { return remove('takeRecovery', takeId); }
   };
 });

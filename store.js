@@ -33,7 +33,53 @@
   var BANNER_KEY = 'ps.bannerDismissed.v1'; // which one-time banners were dismissed
 
   var TRACKS = ['lead', 'adlibs', 'harmonies'];
-  var TRACK_NAMES = { lead: 'Lead', adlibs: 'Ad-libs', harmonies: 'Harmonies' };
+  // v29 (mockup 12): the layers are named like a song — "Main
+  // vocal", not "Lead". The mockup's colors: warm orange for the
+  // main vocal, teal for ad-libs, violet for harmonies/doubles.
+  var TRACK_NAMES = { lead: 'Main vocal', adlibs: 'Ad-libs', harmonies: 'Harmonies' };
+  var TRACK_COLORS = { lead: '#fb923c', adlibs: '#2dd4bf', harmonies: '#a78bfa' };
+  // v29: the + Add layer button adds a vocal lane. Names are song
+  // parts (not "Layer 4"); colors cycle the palette below.
+  var EXTRA_TRACK_NAMES = ['Doubles', 'Harmony', 'Ad-libs 2', 'Backing', 'Layer 5', 'Layer 6', 'Layer 7', 'Layer 8'];
+  var EXTRA_TRACK_COLORS = ['#a78bfa', '#f472b6', '#60a5fa', '#4ade80', '#facc15', '#fb7185'];
+  var MAX_TRACKS = 8; // 3 built-in + up to 5 added by the + button
+
+  // v29: the ordered lane list for a session — the three built-in
+  // vocal tracks plus any lanes the + button added. Old sessions
+  // (saved before v29) have no extraTracks; they read as [].
+  function trackKinds(session) {
+    var kinds = TRACKS.slice();
+    (session.extraTracks || []).forEach(function (t) { kinds.push(t.kind); });
+    return kinds;
+  }
+
+  function trackName(session, kind) {
+    if (TRACK_NAMES[kind]) return TRACK_NAMES[kind];
+    var extra = (session.extraTracks || []).filter(function (t) { return t.kind === kind; })[0];
+    return extra ? extra.name : kind;
+  }
+
+  function trackColor(session, kind) {
+    if (TRACK_COLORS[kind]) return TRACK_COLORS[kind];
+    var extra = (session.extraTracks || []).filter(function (t) { return t.kind === kind; })[0];
+    return extra ? extra.color : '#a78bfa';
+  }
+
+  // v29: add a vocal lane. Returns the new kind, or null at the cap.
+  // The kind is 'extra1', 'extra2', ...; the name comes from the
+  // song-part suggestions in order; the color cycles the palette.
+  function addExtraTrack(session) {
+    if (!session.extraTracks) session.extraTracks = [];
+    if (trackKinds(session).length >= MAX_TRACKS) return null;
+    var n = session.extraTracks.length + 1;
+    var kind = 'extra' + n;
+    var name = EXTRA_TRACK_NAMES[session.extraTracks.length] || ('Layer ' + (3 + n));
+    var color = EXTRA_TRACK_COLORS[(session.extraTracks.length) % EXTRA_TRACK_COLORS.length];
+    session.extraTracks.push({ kind: kind, name: name, color: color });
+    if (!session.tracks) session.tracks = {};
+    session.tracks[kind] = { takes: [], activeTakeId: null, starredTakeId: null };
+    return kind;
+  }
 
   function readJSON(key, fallback) {
     try {
@@ -92,6 +138,13 @@
       // stamps the song's macros when it records, like the preset.
       macros: { even: 50, bright: 50, space: 50, punch: 50, warm: 50 },
       chainOn: true, // the full studio sound (not just the tune) — on by default, off on a slow (Bluetooth-like) route
+      // v23 (QUEUE #58, Denasse's order 09:19 — "I want it to sound
+      // good while I'm recording"): the full chain runs LIVE by
+      // default now — what he hears while singing is the studio
+      // sound, not the tune-only light version. lightLive false
+      // from the start, so a new song never passes through the
+      // light default. Old songs keep their stored flag.
+      lightLive: false,
       // Step 4B (v13.5) — per-stage bypasses (true = that part of
       // the studio sound is off) + fine tone controls (0-100,
       // 50 = no change from the macros). A take stamps both when
@@ -119,6 +172,9 @@
       beatOriginalName: null,
       beatDuration: null,
       tracks: tracks,
+      // v29 (mockup 12): lanes added by the + Add layer button —
+      // [{ kind, name, color }]. Old sessions load without it.
+      extraTracks: [],
       createdAt: new Date().toISOString()
     };
   }
@@ -264,6 +320,12 @@
   return {
     TRACKS: TRACKS,
     TRACK_NAMES: TRACK_NAMES,
+    TRACK_COLORS: TRACK_COLORS,
+    MAX_TRACKS: MAX_TRACKS,
+    trackKinds: trackKinds,
+    trackName: trackName,
+    trackColor: trackColor,
+    addExtraTrack: addExtraTrack,
     newId: newId,
     makeSession: makeSession,
     loadSessions: loadSessions,
