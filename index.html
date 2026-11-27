@@ -27,24 +27,42 @@
     <button id="recover-keep" class="btn-small">Keep it</button>
     <button id="recover-delete" class="btn-small danger">Delete</button>
   </div>
+  <!-- v31 (mockup 12 fix): the song title is big and centered like
+       the approved photo, with the navigation (Key / Sound / Takes /
+       Loop / headphones / gear) on a clean row under it. The ids stay
+       the same so the song, key, sound, takes and loop still work. -->
   <header class="topbar">
-    <button id="setup-song" class="topbar-song" aria-label="Song settings">
-      <span id="topbar-song-name">New Song</span>
-    </button>
-    <button id="topbar-key" class="topbar-key" aria-label="Change key">
-      <span id="topbar-song-key">Key</span>
-    </button>
-    <button id="fx-open" class="topbar-key" aria-label="Open the sound screen">Sound</button>
-    <button id="takes-open" class="topbar-key" aria-label="Open your takes">Takes</button>
-    <button id="setup-open" class="icon-btn" aria-label="Setup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 1-1.82-.33 1.65 1.65 0 0 1-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09a1.65 1.65 0 0 1-1-1.51 1.65 1.65 0 0 1-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 1 .33-1.82 1.65 1.65 0 0 1-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09a1.65 1.65 0 0 1 1.51-1 1.65 1.65 0 0 1-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 1 1.82.33h.01a1.65 1.65 0 0 1 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 1 1 1.51h.01a1.65 1.65 0 0 1 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 1-.33 1.82v.01a1.65 1.65 0 0 1 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 1-1.51 1z"></path></svg></button>
+    <div class="topbar-title-row">
+      <button id="setup-song" class="topbar-song" aria-label="Song settings">
+        <span id="topbar-song-name">New Song</span>
+      </button>
+    </div>
+    <div class="topbar-controls">
+      <button id="topbar-key" class="topbar-key" aria-label="Change key">
+        <span id="topbar-song-key">Key</span>
+      </button>
+      <button id="fx-open" class="topbar-key" aria-label="Open the sound screen">Sound</button>
+      <button id="takes-open" class="topbar-key" aria-label="Open your takes">Takes</button>
+      <button id="loop-toggle" class="topbar-key loop-btn" aria-label="Loop the part you are working on" aria-pressed="false">Loop</button>
+      <button id="transport-headphones" class="icon-btn topbar-phones" aria-label="Hear your tuned voice while you sing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg></button>
+      <button id="setup-open" class="icon-btn" aria-label="Setup"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 1-1.82-.33 1.65 1.65 0 0 1-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09a1.65 1.65 0 0 1-1-1.51 1.65 1.65 0 0 1-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 1 .33-1.82 1.65 1.65 0 0 1-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09a1.65 1.65 0 0 1 1.51-1 1.65 1.65 0 0 1-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 1 1.82.33h.01a1.65 1.65 0 0 1 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 1 1 1.51h.01a1.65 1.65 0 0 1 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 1-.33 1.82v.01a1.65 1.65 0 0 1 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 1-1.51 1z"></path></svg></button>
+    </div>
   </header>
 
-  <div class="ruler"><button id="loop-toggle" class="loop-btn" aria-label="Loop the part you are working on" aria-pressed="false">Loop</button><span id="time-label">0:00</span><span id="loop-label" class="loop-label"></span></div>
+  <!-- v31 (mockup 12 fix): a real time ruler — tick marks + 0:00 /
+       0:02 / 0:04 / 0:06 / 0:08 labels, drawn by renderRuler() and
+       aligned to the lanes. The Loop pill moved to the top bar and
+       the playhead time moved onto the line itself, so the ruler is
+       just time now. Dragging the ruler still sets a loop region. -->
+  <div class="ruler" id="ruler">
+    <div class="ruler-ticks" id="ruler-ticks" aria-hidden="true"></div>
+    <span id="loop-label" class="loop-label"></span>
+  </div>
 
   <div class="tracks-wrap">
     <div id="loop-band" class="loop-band" style="display:none" aria-hidden="true"></div>
     <div id="tracks" class="track-rows"></div>
-    <div id="playhead" class="playhead"><span id="playhead-handle" class="playhead-handle" aria-hidden="true"></span></div>
+    <div id="playhead" class="playhead"><span id="time-label" class="playhead-time" aria-hidden="true">0:00</span><span id="playhead-handle" class="playhead-handle" aria-hidden="true"></span></div>
   </div>
 
   <div id="overview-strip" class="overview-strip" aria-label="Whole song — tap to move the line">
@@ -54,7 +72,7 @@
 
   <div id="ideas-row" class="ideas-row">
     <button id="ideas-btn" class="btn ideas-btn">Catch ideas</button>
-    <p id="ideas-note" class="muted small">Sings something great while rehearsing? Tap once and the last 60 seconds are saved as a take.</p>
+    <p id="ideas-note" class="muted small">Tap once — the last 60 seconds are saved as a take.</p>
   </div>
 
   <div id="live-strip" class="live-strip" style="display:none">
@@ -65,12 +83,13 @@
     <canvas id="live-wave" class="live-wave" width="360" height="40" aria-hidden="true"></canvas>
   </div>
 
+  <!-- v31 (mockup 12 fix): the transport is Rewind | Record | Play
+       only, in the dark rounded bar. Headphones moved to the top bar;
+       Send lives on the takes screen (per-take Send), not here. -->
   <footer class="transport">
-    <button id="transport-headphones" class="t-btn" aria-label="Hear your tuned voice while you sing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-6a9 9 0 0 1 18 0v6"></path><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path></svg></button>
     <button id="transport-rewind" class="t-btn" aria-label="Back to the start"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M11 18V6l-8.5 6L11 18zm9 0V6l-8.5 6L20 18z"></path></svg></button>
     <button id="transport-record" class="btn-record" aria-label="Record">Record</button>
     <button id="transport-play" class="t-btn" aria-label="Play"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"></path></svg></button>
-    <button id="transport-share" class="t-btn share" aria-label="Send the take"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16"></path><path d="M13 5l7 7-7 7"></path></svg></button>
   </footer>
 </div>
 

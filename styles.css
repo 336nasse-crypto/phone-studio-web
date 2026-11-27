@@ -67,7 +67,11 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   position: relative;
 }
 
-/* Slim top bar: song name left, gear right. No big title. */
+/* v31 (mockup 12 fix): the studio top bar is two rows — the song
+ * title big and centered like the approved photo, with the
+ * navigation (Key / Sound / Takes / Loop / headphones / gear) on a
+ * clean row under it. The setup / lab / takes headers keep the
+ * single-row bar (back + title + spacer). */
 .topbar {
   flex: 0 0 auto;
   display: flex;
@@ -76,6 +80,41 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   gap: 12px;
   padding: calc(10px + env(safe-area-inset-top)) 14px 8px;
 }
+.studio-view > .topbar {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 2px;
+  padding-top: calc(6px + env(safe-area-inset-top));
+  padding-bottom: 2px;
+}
+.topbar-title-row {
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+}
+.studio-view .topbar-song #topbar-song-name {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 1.15;
+}
+.topbar-controls {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+/* v31: the controls row is compact — the gear and headphones are
+ * 36px here (not the 44px icon-btn), so the two-row bar stays
+ * short and the lanes keep their room. */
+.topbar-controls .icon-btn {
+  width: 36px;
+  height: 36px;
+}
+.topbar-controls .icon-btn svg { width: 20px; height: 20px; }
+.topbar-phones.active { color: var(--purple); }
 .topbar-song {
   display: flex;
   align-items: baseline;
@@ -128,25 +167,79 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
 .icon-btn:active { background: var(--card); }
 .icon-btn svg { width: 24px; height: 24px; }
 
-/* Time ruler — one shared time for all tracks. */
+/* v31 (mockup 12 fix): a real time ruler — tick marks + 0:00 /
+ * 0:02 / 0:04 / 0:06 / 0:08 labels, drawn by renderRuler() and
+ * aligned to the lanes (the ticks live in #ruler-ticks, positioned
+ * from the lane geometry). The playhead time rides on the line
+ * itself as a small bubble; the loop range sits top-right. */
 .ruler {
   flex: 0 0 auto;
-  text-align: center;
-  padding: 2px 0 6px;
+  position: relative;
+  height: 28px;
+  margin: 0 10px;
 }
-#time-label {
-  font-size: 15px;
+.ruler-ticks {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+}
+.ruler-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 28px;
+  margin-left: -14px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  pointer-events: none;
+}
+.ruler-tick::before {
+  content: '';
+  display: block;
+  width: 1px;
+  height: 8px;
+  margin: 0 auto 2px;
+  background: var(--line);
+}
+/* The playhead time — a small bubble riding on the line, above its
+ * handle. fmtPlayhead() still sets it by id. */
+.playhead-time {
+  position: absolute;
+  top: -26px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--text);
+  background: rgba(0, 0, 0, 0.75);
+  border: 1px solid var(--line);
+  padding: 2px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 /* -------------------------------------------------------------- track rows */
+/* v31 (mockup 12 fix): the lanes scroll INSIDE the wrap now. The
+ * rows used to spill past the wrap's bottom edge when the screen
+ * was short (the Safari banner) and paint over the overview strip
+ * and the Catch ideas row — that is how the beat lane and the ideas
+ * button ended up on top of each other on Denasse's phone. With
+ * overflow contained, the beat lane and the ideas row can never
+ * overlap again. */
 .tracks-wrap {
   flex: 1 1 auto;
   min-height: 0;
   position: relative;
   padding: 0 10px 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .track-rows {
   height: 100%;
@@ -173,6 +266,10 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   background: var(--row-selected);
 }
 .track-row.beat-row { cursor: default; }
+/* v31 (mockup 12 fix): with no beat, the whole beat row is the
+ * import button — the "tap to import MP3" label says so, and the
+ * floating Import pill is gone. */
+.track-row.beat-row.no-beat { cursor: pointer; }
 .row-label {
   flex: 0 0 96px;
   min-width: 0;
@@ -276,7 +373,7 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
 .add-layer-row {
   display: flex;
   align-items: center;
-  padding: 2px 4px;
+  padding: 0 4px;
 }
 .add-layer-btn {
   display: flex;
@@ -288,7 +385,7 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   font-size: 15px;
   font-weight: 600;
   cursor: pointer;
-  padding: 6px 4px;
+  padding: 4px;
 }
 .add-layer-btn .plus {
   width: 26px;
@@ -766,15 +863,20 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
 }
 
 /* ---------------------------------------------------------------- transport */
+/* v31 (mockup 12 fix): the transport is the dark rounded bar from
+ * the approved photo — Rewind | Record | Play only. Headphones
+ * moved to the top bar; Send lives on the takes screen. */
 .transport {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-around;
   gap: 4px;
-  padding: 8px 10px calc(10px + env(safe-area-inset-bottom));
-  border-top: 1px solid var(--line);
-  background: #000;
+  padding: 8px 10px;
+  margin: 0 10px calc(10px + env(safe-area-inset-bottom));
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 20px;
 }
 .t-btn {
   width: 52px;
@@ -1037,6 +1139,22 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
 .take-info strong { font-size: 16px; }
 .take-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
+/* v30 (QUEUE #4) — the take action row sticks to the bottom of the
+ * takes scroll area so Send is visible on first open. Measured on
+ * v29 (probe /tmp/fold-probe-v29.js, 390x844): the first take's row
+ * is 775 px tall in a 732 px scroll area, so its Send button sat
+ * top 815 / bottom 855 — 11 px below the fold. Sticky keeps the row
+ * pinned to the scrollport bottom while its take scrolls through;
+ * the opaque background + top border keep scrolled content from
+ * showing through under the buttons. */
+.take-actions {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+  padding: 8px 0 4px;
+}
+
 /* v13.7 — the send choice: smaller copy vs full quality. The two
  * buttons are full-width so the choice is one thumb-tap, not a
  * hunt through the sheet. */
@@ -1201,48 +1319,24 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
 
 /* --- Step 6C (v13.3): loop + comping --- */
 
-/* The ruler is a row now: Loop on the left, the clock in the
- * middle, the loop's times on the right. Same height as before —
- * the loop controls live in space the ruler already owned, so the
- * track rows and the preset pills do not move (F1 geometry). */
-.ruler {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 2px 10px 6px;
-  text-align: left;
-}
-.ruler #time-label {
-  flex: 1 1 auto;
-  text-align: center;
-}
-.loop-btn {
-  flex: 0 0 auto;
-  background: var(--card);
-  border: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 700;
-  padding: 4px 12px;
-  min-height: 28px;
-  border-radius: 999px;
-  cursor: pointer;
-}
-.loop-btn:active { background: var(--card2); color: var(--text); }
+/* v31 (mockup 12 fix): the Loop pill moved to the top bar (it is
+ * styled by .topbar-key now) — only its on-state lives here. The
+ * loop range sits top-right of the ruler, above the tick labels, and
+ * collapses to nothing when there is no loop. */
 .loop-btn.on {
   background: var(--purple-soft);
   border-color: var(--purple);
   color: var(--text);
 }
 .loop-label {
-  flex: 0 0 auto;
-  min-width: 76px;
-  text-align: right;
-  font-size: 12px;
+  position: absolute;
+  right: 0;
+  top: 1px;
+  font-size: 11px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--muted);
+  pointer-events: none;
 }
 .loop-label.on { color: var(--purple); }
 

@@ -1262,7 +1262,7 @@
     } else {
       btn.textContent = 'Catch ideas';
       btn.classList.remove('active');
-      if (note) note.textContent = 'Sings something great while rehearsing? Tap once and the last 60 seconds are saved as a take.';
+      if (note) note.textContent = 'Tap once — the last 60 seconds are saved as a take.';
     }
     btn.disabled = !!state.recording || !!state.calibrating || state.loggerArming || state.beatLoading;
     // v28 (QUEUE #102): the Ideas button stays live while a beat
@@ -4722,13 +4722,15 @@
       state.timelineSeconds = longest;
       drawAllWaves();
       renderPlayhead();
+      renderRuler();
     }
   }
 
-  /* Draws one lane: real bars where the audio is, a dotted baseline
-   * where it is not. The wave occupies [0, duration] on the shared
-   * timeline — every lane is on the same time scale, like Voloco.
-   */
+  /* Draws one lane: real bars where the audio is, clean dark
+   * everywhere else — like the approved photo, where a lane is a
+   * solid dark row with solid blocks on it. v31 removed the dotted
+   * baseline: on an empty lane it read as unfinished, and the
+   * mockup has no dots. No wave means nothing is drawn. */
   function drawWave(canvas, wave, color) {
     if (!canvas) return;
     var dpr = window.devicePixelRatio || 1;
@@ -4744,13 +4746,6 @@
     ctx.clearRect(0, 0, w, h);
     var mid = h / 2;
     var maxBar = h * 0.42;
-    // Dotted baseline across the whole lane (the empty-region look).
-    ctx.fillStyle = 'rgba(255,255,255,0.22)';
-    for (var x = 2; x < w; x += 7) {
-      ctx.beginPath();
-      ctx.arc(x, mid, 1.1, 0, Math.PI * 2);
-      ctx.fill();
-    }
     if (!wave || !wave.peaks) return;
     // Step 6C (v13.3): a pass or a best-of take draws at its place
     // in the song, not at 0 — the bars start where the take does.
@@ -4793,9 +4788,11 @@
         drawWave(canvas, getBeatWave(), '#e5e5e5');
         return;
       }
-      // v29: a vocal lane's canvas is just the dotted baseline now —
-      // the takes draw as BLOCKS on top of it (renderTakeBlocks /
+      // v29: a vocal lane's canvas draws nothing now — the takes
+      // draw as BLOCKS on top of it (renderTakeBlocks /
       // drawBlockWaves), so the lane never paints a take twice.
+      // v31: and no dotted baseline either — an empty lane is clean
+      // solid dark, like the approved photo.
       drawWave(canvas, null, color);
     });
   }
@@ -4839,6 +4836,44 @@
     renderPlayhead();
   }
 
+  /* v31 (mockup 12 fix): the time ruler — tick marks + 0:00 / 0:02 /
+   * 0:04 / 0:06 / 0:08 labels, aligned to the lanes. The ticks live
+   * in #ruler-ticks, positioned from the lane canvas geometry (the
+   * same geometry the playhead uses), so a tick sits exactly over
+   * its second on every lane. At least 0:00–0:08 always shows; a
+   * longer song extends the ruler in 2s steps. Called after layout
+   * (renderTracks), when the song gets longer (updateTimeline) and
+   * on resize — never on every playhead move (the ticks do not move). */
+  function renderRuler() {
+    var ticks = $('ruler-ticks');
+    var ruler = $('ruler');
+    if (!ticks || !ruler) return;
+    var canvas = document.querySelector('.track-row .wave-lane > canvas');
+    if (!canvas) return;
+    var c = canvas.getBoundingClientRect();
+    var r = ruler.getBoundingClientRect();
+    if (c.width <= 0 || r.width <= 0) return;
+    ticks.style.left = (c.left - r.left) + 'px';
+    ticks.style.width = c.width + 'px';
+    var end = Math.max(8, Math.floor(state.timelineSeconds / 2) * 2);
+    // v31: the labels thin out on a long song so they never run
+    // together — a 30s song labels every 6s, an 8s song every 2s
+    // (the mockup's ruler), always at least ~44px apart.
+    var pxPerSec = state.timelineSeconds > 0 ? c.width / state.timelineSeconds : 0;
+    var step = 2;
+    var steps = [2, 4, 6, 10, 15, 30, 60];
+    for (var si = 0; si < steps.length; si++) {
+      if (steps[si] * pxPerSec >= 44 || si === steps.length - 1) { step = steps[si]; break; }
+    }
+    var html = '';
+    for (var t = 0; t <= end; t += step) {
+      var pct = state.timelineSeconds > 0 ? (t / state.timelineSeconds) * 100 : 0;
+      if (pct > 100) break;
+      html += '<div class="ruler-tick" style="left:' + pct.toFixed(2) + '%">' + fmtClock(t) + '</div>';
+    }
+    ticks.innerHTML = html;
+  }
+
   /* v29 (mockup 12): the overview strip — the whole song at a
    * glance, above the transport bar. The beat's wave fills it
    * (the longest vocal take's wave if there is no beat yet); a
@@ -4860,7 +4895,19 @@
       if (best) wave = state.waveCache[best.id] || null;
     }
     var color = wave ? '#e5e5e5' : null;
-    if (wave) drawWave(canvas, wave, color);
+    if (wave) {
+      drawWave(canvas, wave, color);
+      win.style.display = '';
+    } else {
+      // v31 (mockup 12 fix): no beat and no takes means no wave to
+      // overview — the strip is an empty dark bar, and the blue
+      // window on it read as a stray empty box on Denasse's phone.
+      // Hide the window until there is something to show.
+      var ctx = canvas.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+      win.style.display = 'none';
+      return;
+    }
     renderOverviewWindow();
   }
 
@@ -4959,7 +5006,11 @@
         if (!state.beat) {
           // v27 (QUEUE #87): the row tap is the Import button's other
           // door — shut it while an import is loading too.
-          if (!state.beatLoading) $('beat-file').click();
+          // v31: and while a take is live (v22 #45) — the row's own
+          // click handler already guards both; this pointerdown
+          // path is the first door a real tap hits, so it must
+          // guard both too, or the picker opens mid-take.
+          if (!state.beatLoading && !state.recording) $('beat-file').click();
           return;
         }
       } else {
@@ -5266,20 +5317,21 @@
     beatRow.appendChild(beatLabel);
     var beatLane = el('div', 'wave-lane');
     beatLane.appendChild(document.createElement('canvas'));
+    beatRow.appendChild(beatLane);
     if (!state.beat) {
-      var importBtn = el('button', 'btn-small lane-btn', 'Import a beat');
-      // v22 (QUEUE #45): the beat cannot change under a live take.
-      // v27 (QUEUE #87): nor while another import is still loading — a
-      // second tap starts a second chain that the first one's late
-      // landing would clobber (the generation guard is the backstop).
-      importBtn.disabled = !!state.recording || state.beatLoading;
-      importBtn.addEventListener('click', function (ev) {
+      // v31 (mockup 12 fix): no floating "Import a beat" pill over
+      // the lane — it covered the beat wave on Denasse's phone. The
+      // row's own "tap to import MP3" label is the affordance, and
+      // the WHOLE row is the button now: tap anywhere on it to pick
+      // a beat. Same guards as the old button (v22 #45: not under a
+      // live take; v27 #87: not while another import is loading).
+      beatRow.classList.add('no-beat');
+      beatRow.addEventListener('click', function (ev) {
         ev.stopPropagation();
+        if (state.recording || state.beatLoading) return;
         $('beat-file').click();
       });
-      beatLane.appendChild(importBtn);
     }
-    beatRow.appendChild(beatLane);
     if (state.beat) {
       var remove = el('button', 'row-more', '×');
       // v22 (QUEUE #45): the beat cannot change under a live take.
@@ -5298,6 +5350,7 @@
       drawBlockWaves();
       renderPlayhead();
       renderOverview();
+      renderRuler();
     });
     renderLoop(); // the band + ruler text for the loop region, if any
   }
@@ -6705,7 +6758,10 @@
     play.disabled = busy || !!state.recording || (!playing && !take && !state.beat);
     play.innerHTML = playing ? STOP_SVG : PLAY_SVG;
     play.setAttribute('aria-label', playing ? 'Stop' : 'Play');
-    share.disabled = !take;
+    // v31 (mockup 12 fix): the Send button left the transport bar
+    // (Send lives on the takes screen now) — the share element is
+    // gone, so guard the reference instead of throwing on null.
+    if (share) share.disabled = !take;
     rewind.disabled = !!state.recording;
     // v22 (QUEUE #48): the key sheet cannot open mid-take.
     $('topbar-key').disabled = !!state.recording;
@@ -6873,7 +6929,11 @@
       if (state.playingStop) stopPlayback();
       setPlayhead(0);
     });
-    $('transport-share').addEventListener('click', shareSelected);
+    // v31 (mockup 12 fix): the Send button left the transport bar —
+    // the element is gone, so only bind it if it exists. (The
+    // per-take Send on the takes screen is the Send flow now.)
+    var shareBtn = $('transport-share');
+    if (shareBtn) shareBtn.addEventListener('click', shareSelected);
     $('transport-headphones').addEventListener('click', toggleMonitor);
     // v29: tap the overview strip to jump the line there — the
     // whole song at a glance, one tap to anywhere in it.
@@ -7100,6 +7160,7 @@
         drawAllWaves();
         renderPlayhead();
         renderLoop();
+        renderRuler();
       }, 150);
     });
   }
