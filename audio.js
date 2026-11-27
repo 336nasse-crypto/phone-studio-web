@@ -58,6 +58,12 @@
   var PRECOMP_GUARD = ANCHOR_DELAY - 0.1;
   // How long to wait for the mic to start flowing before giving up.
   var FIRST_BLOCK_TIMEOUT_MS = 3000;
+  // v36 (QUEUE #34): how long stopCapture waits for the worklet's
+  // 'flushed' ack after posting 'stop' — the ack lands ~one render
+  // quantum later (~2.7 ms); 100 ms is ~37 quanta of headroom, and
+  // past it the save assembles from the blocks already in hand
+  // instead of hanging the take on a lost message.
+  var STOP_DRAIN_TIMEOUT_MS = 100;
   // Nominal round-trip latency used when no acoustic calibration
   // exists (wired/speaker, or uncalibrated Bluetooth). The native app
   // reads this from AVAudioSession; the web has no input-latency API,
@@ -85,7 +91,12 @@
   var sessionLog = []; // AudioSession type transitions (for take metadata)
 
   // Capture state (one capture at a time — calibration or take).
-  var capture = null; // { blocks, firstTime, totalFrames, onBlock, waiters, chunkBuf, chunkFill, chunkIndex, onChunk }
+  // v36 (QUEUE #34): stopping/stopPromise/stopResolve/stopTimer/
+  // stopDone are the stop drain — stopCapture keeps the capture
+  // alive in a 'stopping' state until the worklet's 'flushed' ack
+  // (or the drain timeout) instead of nulling it synchronously and
+  // dropping the final partial batch.
+  var capture = null; // { blocks, firstTime, totalFrames, onBlock, waiters, chunkBuf, chunkFill, chunkIndex, onChunk, stopping, stopPromise, stopResolve, stopTimer, stopDone }
 
   function sampleRate() {
     return ctx ? ctx.sampleRate : 0;
@@ -210,6 +221,41 @@
     return sessionLog.slice();
   }
 
+  /* v35 (QUEUE #32): who to tell when the mic track dies. The
+   * app registers one handler (app.js, next to the
+   * visibilitychange listener); audio.js owns the track, so it
+   * owns the firing. Null until registered.
+   */
+  var micEndedHandler = null;
+
+  function onMicEnded(fn) {
+    micEndedHandler = (typeof fn === 'function') ? fn : null;
+  }
+
+  /* v35 (QUEUE #32): is the mic track still live? The polled
+   * backstop in app.js updateRecordTimer reads this every 100 ms
+   * while a take runs. False when there is no mic, the stream is
+   * inactive, or no audio track is live.
+   */
+  function micAlive() {
+    if (!stream || !stream.active) return false;
+    var tracks = stream.getAudioTracks();
+    for (var i = 0; i < tracks.length; i++) {
+      if (tracks[i].readyState === 'live') return true;
+    }
+    return false;
+  }
+
+  /* v35 (QUEUE #32): the current mic track, or null. The CDP
+   * suite ends it to prove the guard; the app never stops a
+   * track through this (closeMic owns that).
+   */
+  function micTrack() {
+    if (!stream) return null;
+    var tracks = stream.getAudioTracks();
+    return tracks.length ? tracks[0] : null;
+  }
+
   /* Opens the mic with raw-audio constraints (no echo cancellation,
    * no noise suppression, no automatic gain). Verifies the settings
    * actually applied via track.getSettings() and logs them (Step 1B)
@@ -232,6 +278,24 @@
     }).then(function (s) {
       stream = s;
       var track = s.getAudioTracks()[0];
+      // v35 (QUEUE #32): the mic can die mid-take (Bluetooth
+      // disconnect, another app grabbing the mic, an iOS route
+      // change) and the worklet would keep emitting silence with
+      // nothing noticing. Attach the end handler at open — the
+      // only moment the track exists. Fires once per track:
+      // track.onended and stream.oninactive report the same death,
+      // and closeMic's own stop() fires onended too (the app
+      // handler no-ops then — nothing is recording).
+      var micEndedFired = false;
+      var fireMicEnded = function () {
+        if (micEndedFired) return;
+        micEndedFired = true;
+        if (micEndedHandler) {
+          try { micEndedHandler(); } catch (e) { console.warn('Mic-ended handler failed:', e); }
+        }
+      };
+      if (track) track.onended = fireMicEnded;
+      try { s.oninactive = fireMicEnded; } catch (e) { /* older browsers may not allow it */ }
       // v13.2 (item 4): the track label names the mic ("AirPods
       // Pro", "iPhone Microphone", "Microphone" when the browser
       // cannot name it). Cached here, at open — it is the only
@@ -350,7 +414,15 @@
 
   function onWorkletMessage(event) {
     var data = event.data;
-    if (!capture || !data || data.type !== 'block') return;
+    if (!data) return;
+    if (data.type === 'flushed') {
+      // v36 (QUEUE #34): the worklet's stop-flush landed — every
+      // block it posted is already ahead of this ack on the same
+      // port, so the drain is done and the stop can assemble.
+      if (capture && capture.stopping) finishStopCapture(capture);
+      return;
+    }
+    if (!capture || data.type !== 'block') return;
     if (capture.firstTime === null) {
       capture.firstTime = data.time;
       var waiters = capture.waiters;
@@ -397,12 +469,22 @@
    */
   function startCapture(onBlock, opts) {
     return ensureGraph().then(function () {
-      if (capture) return Promise.reject(new Error('A recording is already running.'));
+      if (capture) {
+        if (capture.stopping && capture.stopPromise) {
+          // v36 (QUEUE #34): a stop is draining — wait for it, then
+          // start fresh, instead of failing a record tap that lands
+          // in the ~10 ms window between stop and drain. The drain
+          // is ~one render quantum, so this is not a real wait.
+          return capture.stopPromise.then(function () { return startCapture(onBlock, opts); });
+        }
+        return Promise.reject(new Error('A recording is already running.'));
+      }
       if (!workletNode) return Promise.reject(new Error('The recorder could not start. Close the app and open it again.'));
       capture = {
         blocks: [], firstTime: null, totalFrames: 0, onBlock: onBlock || null, waiters: [],
         chunkBuf: new Float32Array(PS_CHUNK_SAMPLES), chunkFill: 0, chunkIndex: 0,
-        onChunk: (opts && opts.onChunk) || null
+        onChunk: (opts && opts.onChunk) || null,
+        stopping: false, stopPromise: null, stopResolve: null, stopTimer: null, stopDone: false
       };
       try {
         workletNode.port.postMessage({ type: 'start' });
@@ -430,22 +512,83 @@
     });
   }
 
-  /* Stops the capture and returns everything recorded:
+  /* Stops the capture and returns a promise of everything recorded:
    * { samples: Float32Array, firstSampleTime, totalFrames }.
    * firstSampleTime is the render-clock time of samples[0].
+   *
+   * v36 (QUEUE #34): the stop DRAINS. The old code posted 'stop'
+   * and synchronously nulled the capture, so the worklet's flush of
+   * its final partial 4096-frame batch arrived after capture was
+   * null and onWorkletMessage dropped it — every take lost its last
+   * 0–85 ms, by construction. Now the capture stays alive in a
+   * 'stopping' state until the worklet's 'flushed' ack (or the
+   * 100 ms drain timeout), the flush block lands in the capture,
+   * and only then does the stop assemble. No padding, no synthesis
+   * — the save waits for the real frames. A second stop while one
+   * is draining waits on the same promise instead of starting a
+   * second drain. The #32 liveness behavior is untouched: a dead
+   * mic still finishes the take through this same stop, and the
+   * drain timeout is the backstop when the worklet never acks.
    */
   function stopCapture() {
-    if (workletNode) workletNode.port.postMessage({ type: 'stop' });
     var c = capture;
-    capture = null;
-    if (!c) return { samples: new Float32Array(0), firstSampleTime: null, totalFrames: 0 };
+    if (!c) return Promise.resolve({ samples: new Float32Array(0), firstSampleTime: null, totalFrames: 0 });
+    if (c.stopping) return c.stopPromise;
+    c.stopping = true;
+    if (workletNode) workletNode.port.postMessage({ type: 'stop' });
+    c.stopPromise = new Promise(function (resolve) {
+      c.stopResolve = resolve;
+      c.stopTimer = setTimeout(function () { finishStopCapture(c); }, STOP_DRAIN_TIMEOUT_MS);
+    });
+    return c.stopPromise;
+  }
+
+  /* Assembles a stopping capture: flushes the final partial 1 s
+   * chunk to disk first (the recovery copy keeps the tail — the old
+   * code never flushed it, so a killed take recovered up to ~1 s
+   * short), then builds the samples from the blocks. Runs once —
+   * the 'flushed' ack and the drain timeout race, and whichever
+   * fires second no-ops on stopDone. The chunk put is awaited
+   * (500 ms cap) before resolving, so completeTakeSave's chunk
+   * delete can never run ahead of the put and leave a phantom
+   * recovery row behind on the next boot.
+   */
+  function finishStopCapture(c) {
+    if (!c || c.stopDone) return;
+    c.stopDone = true;
+    if (c.stopTimer) { clearTimeout(c.stopTimer); c.stopTimer = null; }
+    var chunkWritten = null;
+    if (c.onChunk && c.chunkFill > 0) {
+      var chunk = c.chunkBuf.slice(0, c.chunkFill);
+      var index = c.chunkIndex;
+      c.chunkIndex += 1;
+      c.chunkFill = 0;
+      try {
+        chunkWritten = c.onChunk(index, chunk);
+      } catch (err) {
+        console.warn('Chunk write callback failed:', err);
+      }
+    }
+    if (capture === c) capture = null;
     var samples = new Float32Array(c.totalFrames);
     var offset = 0;
     for (var i = 0; i < c.blocks.length; i++) {
       samples.set(c.blocks[i].samples, offset);
       offset += c.blocks[i].samples.length;
     }
-    return { samples: samples, firstSampleTime: c.firstTime, totalFrames: c.totalFrames };
+    var result = { samples: samples, firstSampleTime: c.firstTime, totalFrames: c.totalFrames };
+    if (chunkWritten && typeof chunkWritten.then === 'function') {
+      var settled = false;
+      var done = function () {
+        if (settled) return;
+        settled = true;
+        if (c.stopResolve) c.stopResolve(result);
+      };
+      chunkWritten.then(done, done);
+      setTimeout(done, 500); // the put is local IndexedDB — never hang the save on it
+    } else if (c.stopResolve) {
+      c.stopResolve(result);
+    }
   }
 
   function isCapturing() {
@@ -599,7 +742,10 @@
     }).then(function () {
       players.forEach(function (p) { try { p.stop(); } catch (e) { /* already stopped */ } });
       players.forEach(function (p) { try { p.disconnect(); } catch (e) { /* ignore */ } });
-      var recorded = stopCapture();
+      // v36 (QUEUE #34): the click test reads the drained capture —
+      // the last click's tail is in the final partial batch.
+      return stopCapture();
+    }).then(function (recorded) {
       progress('Measuring the delay…');
       if (recorded.firstSampleTime === null || recorded.samples.length === 0) {
         return {
@@ -801,7 +947,11 @@
   }
 
   /* Stops the take: stops the players, stops the capture, and returns
-   * the recording plus the take handle's timing numbers.
+   * a promise of the recording plus the take handle's timing numbers.
+   * v36 (QUEUE #34): async now — stopCapture drains the worklet's
+   * final partial batch before the take assembles. Callers (finishTake)
+   * await it; the players stop synchronously up front so the beat
+   * never plays past the tap.
    */
   function stopTake(handle) {
     if (handle && handle.players) {
@@ -820,15 +970,16 @@
       });
     }
     if (handle && handle.primer) stopPrimer(handle.primer);
-    var recorded = stopCapture();
-    return {
-      samples: recorded.samples,
-      firstSampleTime: recorded.firstSampleTime,
-      totalFrames: recorded.totalFrames,
-      anchorTime: handle ? handle.anchorTime : null,
-      preCompActive: handle ? handle.preCompActive : false,
-      delaySeconds: handle ? handle.delaySeconds : null
-    };
+    return stopCapture().then(function (recorded) {
+      return {
+        samples: recorded.samples,
+        firstSampleTime: recorded.firstSampleTime,
+        totalFrames: recorded.totalFrames,
+        anchorTime: handle ? handle.anchorTime : null,
+        preCompActive: handle ? handle.preCompActive : false,
+        delaySeconds: handle ? handle.delaySeconds : null
+      };
+    });
   }
 
   /* Plays one take against the beat, both from the same anchor, so
@@ -875,10 +1026,10 @@
 
   /* The 60 s Audio Logger (Step 1B): a bare mic capture whose
    * blocks feed the caller's ring buffer. startLogger returns the
-   * capture handle once the mic is flowing; stopLogger returns the
-   * recorded samples (the caller normally ignores them — the ring
-   * buffer already holds the last 60 s). The mic stays open only
-   * while the logger is armed.
+   * capture handle once the mic is flowing; stopLogger returns a
+   * promise of the recorded samples (v36, QUEUE #34: the drain —
+   * the caller normally ignores them, the ring buffer already holds
+   * the last 60 s). The mic stays open only while the logger is armed.
    */
   function startLogger(onBlock) {
     return startCapture(onBlock || null);
@@ -926,6 +1077,9 @@
     sampleRate: sampleRate,
     ensureContext: ensureContext,
     ensureMic: ensureMic,
+    onMicEnded: onMicEnded, // v35 (QUEUE #32): register the mic-died handler
+    micAlive: micAlive, // v35 (QUEUE #32): polled liveness backstop
+    micTrack: micTrack, // v35 (QUEUE #32): the current mic track, or null (CDP suite ends it)
     closeMic: closeMic,
     isMicOpen: isMicOpen,
     micSettings: micSettings,

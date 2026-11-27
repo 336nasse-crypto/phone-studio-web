@@ -352,6 +352,28 @@
     }
   });
 
+  // v35 (QUEUE #32): the mic can die mid-take (Bluetooth
+  // disconnect, another app grabbing the mic, an iOS route
+  // change) and the worklet keeps emitting silence with nothing
+  // noticing. audio.js fires this when the track ends. A take in
+  // progress finishes flagged interrupted (same shape as the
+  // visibilitychange path above — saved up to the disconnect,
+  // never a silent tail passed off as clean). An armed logger
+  // saves its ring buffer the same way. No auto-restart: a new
+  // track mid-take would splice two inputs. Registered once here
+  // (audio.js loads before app.js) and never per-take, so a
+  // re-opened mic keeps the same handler.
+  if (PS.audio && PS.audio.onMicEnded) {
+    PS.audio.onMicEnded(function () {
+      if (state.recording) {
+        finishTake(true, 'mic-disconnected');
+      } else if (state.logger) {
+        state.logger.micEnded = true;
+        saveLoggerTake();
+      }
+    });
+  }
+
   // ---------------------------------------------------------------- phase 0 helpers
 
   /* The mic is open ONLY while something needs it (a take, a
@@ -946,78 +968,17 @@
 
   // ---------------------------------------------------------------- calibration
 
-  /* No typing required to measure: one pair of headphones is the
-   * normal case, so an empty name becomes "My headphones" (a second
-   * pair gets a number). The name only matters if he ever measures
-   * a second pair.
+  /* v32 (QUEUE #110) — Setup's "Measure my headphones" is gone, so
+   * startCalibration + defaultCalLabel are gone with it. The
+   * measurement lives in the lab now: startLabRun's 8-click phase
+   * measures the same round-trip latency (runClickTest under the
+   * hood in both cases) and saveLabCalibration stores it as the
+   * active calibration — see the route-lab section below. The
+   * stored calibration shape is unchanged (label, delaySamples,
+   * delayMs, delaySeconds, sampleRate, nominal/output latency,
+   * mic sample rate + device id, audio session log, date), so the
+   * beat offset + the slow-route check read it exactly as before.
    */
-  function defaultCalLabel() {
-    if (!state.calibrations['My headphones']) return 'My headphones';
-    var n = 2;
-    while (state.calibrations['Headphones ' + n]) n += 1;
-    return 'Headphones ' + n;
-  }
-
-  function startCalibration() {
-    var label = $('cal-label').value.trim() || defaultCalLabel();
-    clearError();
-    state.calibrating = true;
-    renderCalibration();
-    updateTransport();
-    updateMonitor(); // the monitor would loop the clicks back into the measurement
-    acquireWakeLock();
-    $('cal-status').textContent = 'Getting the mic ready…';
-    PS.audio.runCalibration(function (text) {
-      $('cal-status').textContent = text;
-    }).then(function (result) {
-      state.calibrating = false;
-      releaseWakeLock();
-      updateTransport();
-      updateMonitor();
-      maybeCloseMic(); // the mic was open for the measurement only
-      if (!result.ok) {
-        $('cal-status').textContent = result.error;
-        renderCalibration();
-        return;
-      }
-      // Step 0C — calibrate IN THE RECORD STATE, on the route
-      // actually used: the mic was open with the session locked to
-      // play-and-record, so the delay measured is the record-state
-      // delay. Log outputLatency next to the acoustic calibration;
-      // a take whose outputLatency has moved > 20 ms from this
-      // value is flagged to re-measure.
-      var micSettings = PS.audio.micSettings();
-      var calibration = {
-        label: label,
-        delaySamples: result.medianSamples,
-        delayMs: result.medianMs,
-        delaySeconds: result.delaySeconds,
-        sampleRate: PS.audio.sampleRate(),
-        nominalLatencySeconds: PS.audio.nominalLatency(),
-        outputLatencySeconds: PS.audio.outputLatency(),
-        micSampleRate: micSettings && typeof micSettings.sampleRate === 'number' ? micSettings.sampleRate : null,
-        micDeviceId: micSettings && micSettings.deviceId ? micSettings.deviceId : null,
-        audioSessionLog: PS.audio.audioSessionLog(),
-        date: new Date().toISOString()
-      };
-      PS.store.saveCalibration(label, calibration);
-      PS.store.setActiveCalibrationLabel(label);
-      if (micSettings && micSettings.deviceId) PS.store.markDeviceSeen(micSettings.deviceId);
-      state.calibrations = PS.store.loadCalibrations();
-      $('cal-status').textContent = 'Done — ' + label + ': ' + Math.round(result.medianMs) +
-        ' ms. Your voice will land in time.';
-      renderCalibration();
-    }).catch(function (err) {
-      state.calibrating = false;
-      releaseWakeLock();
-      updateTransport();
-      updateMonitor();
-      maybeCloseMic();
-      $('cal-status').textContent = '';
-      renderCalibration();
-      showError(err && err.message ? err.message : 'The measurement failed. Try again.');
-    });
-  }
 
   /* Step 0C — a new audio input appeared (devicechange). Safari
    * exposes no Bluetooth identity, but after the mic is granted,
@@ -1069,6 +1030,7 @@
     $('studio-view').style.display = 'none';
     $('setup-view').style.display = 'none';
   }
+  PS.openLab = openLab; // v33: exposed for the CDP tests (the Setup #lab-open button is gone; the lab view itself stays, opened programmatically)
 
   function closeLab() {
     $('lab-view').style.display = 'none';
@@ -1162,10 +1124,66 @@
     return PS.audio.startCapture(null).then(function () {
       return sleep(seconds * 1000);
     }).then(function () {
-      var recorded = PS.audio.stopCapture();
+      // v36 (QUEUE #34): stopCapture drains the worklet's final
+      // partial batch — async now; the lab's room tone / "sss"
+      // keeps its tail too.
+      return PS.audio.stopCapture();
+    }).then(function (recorded) {
       return recorded.samples || new Float32Array(0);
     });
   }
+
+  /* v32 (QUEUE #110) — the lab test IS the headphone measurement
+   * now. The lab's 8-click phase measures the same round-trip
+   * latency the old 5-click calibration did — runClickTest under
+   * the hood in both cases — so the run saves it as the active
+   * calibration: the beat offset + the slow-route check read it,
+   * and the next take lands in time. Returns the saved
+   * calibration, or null when the clicks were not heard (nothing
+   * to save). Exposed as PS.saveLabCalibration for the CDP tests.
+   * The stored shape is the old calibration's shape (label,
+   * delaySamples, delayMs, delaySeconds, sampleRate, nominal /
+   * output latency, mic sample rate + device id, audio session
+   * log, date), so nothing downstream changes. delaySamples is
+   * informational — beginTake recomputes it from delaySeconds at
+   * record time — so a missing AudioContext here (sampleRate 0)
+   * falls back to 48000 rather than blocking the save.
+   */
+  function saveLabCalibration(label, report, contextInfo) {
+    var medianMs = report && report.clapMedianMs;
+    if (typeof medianMs !== 'number' || !(medianMs > 0)) return null;
+    var sr = PS.audio.sampleRate() || 48000;
+    var settings = PS.audio.micSettings ? PS.audio.micSettings() : null;
+    var calibration = {
+      label: label,
+      delaySamples: Math.round(medianMs / 1000 * sr),
+      delayMs: medianMs,
+      delaySeconds: medianMs / 1000,
+      sampleRate: sr,
+      nominalLatencySeconds: contextInfo && typeof contextInfo.baseLatency === 'number' ? contextInfo.baseLatency : null,
+      outputLatencySeconds: contextInfo && typeof contextInfo.outputLatency === 'number' ? contextInfo.outputLatency : (PS.audio.outputLatency ? PS.audio.outputLatency() : null),
+      micSampleRate: (report && typeof report.inputSampleRate === 'number') ? report.inputSampleRate : null,
+      micDeviceId: (settings && settings.deviceId) ? settings.deviceId : null,
+      audioSessionLog: (PS.audio.audioSessionLog ? PS.audio.audioSessionLog() : []),
+      date: new Date().toISOString()
+    };
+    PS.store.saveCalibration(label, calibration);
+    PS.store.setActiveCalibrationLabel(label);
+    if (settings && settings.deviceId) PS.store.markDeviceSeen(settings.deviceId);
+    state.calibrations = PS.store.loadCalibrations();
+    state.newDeviceDetected = false;
+    return calibration;
+  }
+  PS.saveLabCalibration = saveLabCalibration;
+  // v36 (QUEUE #34): exposed for the CDP tests (cdp-v159 asserts the
+  // lab path drains its tail) — the lab itself calls recordSegment
+  // directly; nothing else reads this handle.
+  PS.recordSegment = recordSegment;
+  // v37 (QUEUE #23): exposed for the CDP tests only (cdp-v160 drives
+  // the live clip latch + reads the latch state) — the record path
+  // calls noteLivePeak itself from onBlock; nothing else reads these.
+  PS._noteLivePeak = noteLivePeak;
+  PS._clipState = function () { return { blocks: liveClipBlocks, clipped: liveClipped }; };
 
   function startLabRun() {
     if (labRunning || state.recording || state.calibrating) return;
@@ -1218,13 +1236,20 @@
       report.clapPass = offsets.pass;
       report.clapOk = !!clap.ok;
       report.recommendation = labRecommendation(report, state.labReports);
+      // v32 (QUEUE #110) — the lab test is the measurement now
+      // (Setup's "Measure my headphones" is gone): the 8 clicks
+      // just measured the round-trip latency, so save it as the
+      // active calibration. A run where the clicks were not heard
+      // saves nothing (medianMs null) and the old timing stands.
+      var savedCal = saveLabCalibration(label, report, before);
       PS.store.saveLabReport(label, report);
       state.labReports = PS.store.loadLabReports();
       state.newDeviceDetected = false;
       $('lab-status').textContent = 'Done — ' + label + ': hears up to ' +
         (report.bandwidthHz / 1000).toFixed(1) + ' kHz' +
         (report.studioGrade ? ' (studio grade)' : '') +
-        '. ' + report.recommendation;
+        '. ' + report.recommendation +
+        (savedCal ? ' Timing saved — your voice will land in time.' : '');
       renderLabReports();
       renderCalibration();
     }).catch(function (err) {
@@ -1345,11 +1370,15 @@
   function disarmLogger(saveFirst) {
     if (!state.logger) return;
     if (loggerTimer) { clearInterval(loggerTimer); loggerTimer = null; }
-    try { PS.audio.stopLogger(); } catch (e) { /* ignore */ }
+    // v36 (QUEUE #34): stopLogger drains (~one render quantum) and
+    // closeMic refuses while a capture is stopping — close the mic
+    // when the drain lands, or it stays open and review plays dull.
+    try {
+      PS.audio.stopLogger().then(function () { maybeCloseMic(); }).catch(function () { /* ignore */ });
+    } catch (e) { maybeCloseMic(); }
     state.logger = null;
     releaseWakeLock();
     updateIdeasUI();
-    maybeCloseMic();
   }
 
   /* Saves the last 60 s (or less) in the ring buffer as a take on
@@ -1365,8 +1394,11 @@
     state.logger = null;
     releaseWakeLock();
     updateIdeasUI();
-    try { PS.audio.stopLogger(); } catch (e) { /* ignore */ }
-    maybeCloseMic();
+    // v36 (QUEUE #34): stopLogger drains — close the mic when it
+    // lands (closeMic refuses while a capture is stopping).
+    try {
+      PS.audio.stopLogger().then(function () { maybeCloseMic(); }).catch(function () { /* ignore */ });
+    } catch (e) { maybeCloseMic(); }
     if (snapshot.length < Math.round(0.5 * sr)) {
       showError('Nothing to save yet — the logger had just started listening.');
       return;
@@ -1376,6 +1408,11 @@
     var takeNumber = vocal.takes.length + 1;
     var takeId = PS.store.newId();
     var durationSeconds = snapshot.length / sr;
+    // v37 (QUEUE #23): the logger take never runs analyzeTake (no
+    // narrowband check on the ring buffer) — scan the snapshot for
+    // the peak + full-scale count directly, same threshold, same
+    // shape as analyzeTake's clip fields.
+    var loggerClip = PS.routelab.clipStats(snapshot);
     var baseName = takeFileBase(state.session.name, track, takeNumber, takeId);
     var metadata = {
       trackKind: track,
@@ -1415,7 +1452,10 @@
       calibrationDate: null,
       calibrated: false,
       compensationSource: 'logger',
-      interrupted: false,
+      // v35 (QUEUE #32): the mic died while the logger was
+      // armed — this take is the ring buffer up to the
+      // disconnect, flagged interrupted, never a clean minute.
+      interrupted: !!logger.micEnded,
       loggerRecovery: true,
       chunkCount: 0,
       savedUpToSeconds: durationSeconds,
@@ -1428,6 +1468,10 @@
       narrowbandFractionAbove7k5: null,
       takeBandwidthHz: null,
       takeRmsDb: PS.routelab.rmsDb(snapshot),
+      // v37 (QUEUE #23): clipping, from the snapshot scan above.
+      takePeakDbfs: loggerClip.peakDbfs,
+      takeClippedSamples: loggerClip.clippedSamples,
+      clipped: loggerClip.clipped,
       outputLatencySeconds: PS.audio.outputLatency(),
       outputLatencyAtStartSeconds: null,
       calibrationOutputLatencySeconds: null,
@@ -1506,9 +1550,15 @@
         delayMilliseconds: 0,
         durationSeconds: durationSeconds,
         residualVerdict: 'no-beat',
-        partial: false,
+        // v35 (QUEUE #32): a logger take saved because the mic
+        // died is partial — the ring buffer stops at the disconnect.
+        partial: !!logger.micEnded,
         savedUpToSeconds: durationSeconds,
         narrowbandWarn: false,
+        // v37 (QUEUE #23): clipping, from the snapshot scan — the row reads it from here.
+        clipped: loggerClip.clipped,
+        takePeakDbfs: loggerClip.peakDbfs,
+        takeClippedSamples: loggerClip.clippedSamples,
         outputLatencyDrift: false,
         loggerRecovery: true,
         // v28 (QUEUE #66): the logger take's own frozen beat
@@ -1537,6 +1587,15 @@
       renderTracks();
       renderSheet();
       updateTransport();
+      // v35 (QUEUE #32): the logger take exists because the mic
+      // died — say so, so the last minute is never read as a
+      // clean minute.
+      if (logger.micEnded) {
+        showError('The mic disconnected — the last minute was saved up to the disconnect.');
+      } else if (loggerClip.clipped) {
+        // v37 (QUEUE #23): the last minute clipped — said plainly, never gated.
+        showError('That take clipped — the loudest peaks hit the limit. Back off the mic a little and record it again.');
+      }
     }
     attemptLoggerSave();
   }
@@ -1624,6 +1683,7 @@
     $('live-strip').style.display = 'flex';
     $('record-hint').textContent = 'Getting ready…';
     setMeter(0);
+    resetClipState(); // v37 (QUEUE #23): a new take starts clean — the latch from the last take never carries over
     // Overdubs: the active takes of the OTHER vocal tracks, so ad-libs
     // and harmonies record over the lead. Same anchor as the beat —
     // they travel the same Bluetooth path, so they need the same
@@ -1656,7 +1716,7 @@
         loop: loopOn() ? { start: state.session.loop.start, end: state.session.loop.end } : null,
         onBlock: function (batch) {
           if (window.PSPerf) PSPerf.noteBlock(batch.time);
-          setMeter(batch.peak); accumulateLivePeak(batch.peak);
+          setMeter(batch.peak); accumulateLivePeak(batch.peak); noteLivePeak(batch.peak);
         },
         // Chunked writes (Step 1B): one 48,000-sample chunk per
         // second, straight to storage while recording. A write
@@ -1664,6 +1724,13 @@
         // is still the primary copy.
         onChunk: function (index, samples) {
           chunkState.count = index + 1;
+          // v36 (QUEUE #34): return the writes — the stop drain
+          // waits for the final partial chunk's put to land before
+          // the take saves, so completeTakeSave's chunk delete can
+          // never run ahead of it and leave a phantom recovery row
+          // behind on the next boot. The mid-take path ignores the
+          // return value, as before.
+          var writes = [];
           // v25 (QUEUE #59): the first chunk landing is the moment
           // the take becomes recoverable — write the at-record
           // sound identity with it, keyed by takeId. A write
@@ -1671,7 +1738,7 @@
           // stamp, not the audio); a missing record at recovery
           // time falls back to the session + flags the take.
           if (index === 0) {
-            PS.db.saveTakeRecovery({
+            writes.push(PS.db.saveTakeRecovery({
               takeId: takeId,
               sessionId: state.session.id,
               track: track,
@@ -1692,9 +1759,9 @@
               recordedAt: new Date().toISOString()
             }).catch(function (err) {
               console.warn('Recovery record write failed (take continues in memory):', err);
-            });
+            }));
           }
-          PS.db.saveTakeChunk({
+          writes.push(PS.db.saveTakeChunk({
             key: PS.safety.chunkKey(state.session.id, track, takeId, index),
             sessionId: state.session.id,
             track: track,
@@ -1728,7 +1795,8 @@
                 }).catch(function () { /* the warning stands without a number */ });
               }
             }
-          });
+          }));
+          return Promise.all(writes);
         }
       });
     }).then(function (handle) {
@@ -1838,6 +1906,16 @@
 
   function updateRecordTimer() {
     if (!state.recording) return;
+    // v35 (QUEUE #32): backstop for a mic that died without
+    // firing onended — poll liveness on the 100 ms record tick
+    // and finish flagged interrupted instead of recording
+    // silence. Safe here: the mic is open by construction while
+    // a take runs (startCapture resolved on the first block), so
+    // a dead track is a real death, not a not-yet-open mic.
+    if (PS.audio && typeof PS.audio.micAlive === 'function' && !PS.audio.micAlive()) {
+      finishTake(true, 'mic-disconnected');
+      return;
+    }
     var elapsed = (Date.now() - state.recording.startWall) / 1000;
     var label = $('record-timer');
     if (label) label.textContent = elapsed.toFixed(1) + 's';
@@ -1869,6 +1947,45 @@
     if (!bar) return;
     var pct = Math.min(100, Math.max(0, peak * 100));
     bar.style.width = pct + '%';
+  }
+
+  // v37 (QUEUE #23): clipping — detection + warning, NOT auto-gain.
+  // The worklet already reports the true peak per block; count the
+  // blocks at the rail (>= 0.999, the one threshold in
+  // routelab.CLIP_PEAK_THRESHOLD) and latch a red "too loud" state
+  // on the meter. It latches: one clipped block is enough to warn,
+  // and the warning stays until the next take starts — a loud
+  // moment he missed while singing is still there when he looks.
+  // The capture sound never changes (no gain node, no limiter).
+  var liveClipBlocks = 0;
+  var liveClipped = false;
+
+  function clipThreshold() {
+    return (PS.routelab && typeof PS.routelab.CLIP_PEAK_THRESHOLD === 'number')
+      ? PS.routelab.CLIP_PEAK_THRESHOLD : 0.999;
+  }
+
+  function setClipState(on) {
+    var bar = $('level-bar');
+    if (bar) bar.classList.toggle('clipping', !!on);
+    var warn = $('clip-warn');
+    if (warn) warn.style.display = on ? 'block' : 'none';
+  }
+
+  function noteLivePeak(peak) {
+    if (peak >= clipThreshold()) {
+      liveClipBlocks++;
+      if (!liveClipped) {
+        liveClipped = true;
+        setClipState(true);
+      }
+    }
+  }
+
+  function resetClipState() {
+    liveClipBlocks = 0;
+    liveClipped = false;
+    setClipState(false);
   }
 
   // v13 — rolling peaks for the live waveform (last ~9 s). The
@@ -1946,9 +2063,13 @@
   /* Finishes the take: trim, residual check, save. (Port of
    * AudioEngineManager.finishTake + TrackRecorder.)
    */
-  function finishTake(interrupted) {
+  function finishTake(interrupted, reason) {
     var rec = state.recording;
     if (!rec) return;
+    // v35 (QUEUE #32): why the take ended early, in plain words
+    // for the finish message ('mic-disconnected' — the track
+    // died; the visibilitychange path passes no reason).
+    if (reason) rec.interruptedReason = reason;
     state.recording = null;
     clearInterval(rec.timer);
     releaseWakeLock();
@@ -1966,7 +2087,6 @@
     clearPlayheadTimer();
     setPlayhead(0); // the take is done — back to the top, so Play hears it from the beginning
 
-    var result = PS.audio.stopTake(rec.handle);
     var track = rec.track;
     var sr = PS.audio.sampleRate();
     var chunkCount = rec.chunkState ? rec.chunkState.count : 0;
@@ -1974,387 +2094,424 @@
     // — the saved take is whole (it comes from memory) but the
     // safety copy is partial; the finish messages say so below.
     var chunkWriteFailed = !!(rec.chunkState && rec.chunkState.writeFailed);
-    if (!result.samples || result.samples.length === 0 || result.firstSampleTime === null) {
-      // Nothing recorded — drop any chunks so they never surface as
-      // a phantom recovery on the next boot.
-      if (rec.takeId) PS.db.deleteTakeChunks(rec.takeId).catch(function () { /* ignore */ });
-      if (rec.takeId) PS.db.deleteTakeRecovery(rec.takeId).catch(function () { /* ignore */ });
-      showError('Nothing was recorded — the mic did not pick up any sound.');
-      renderTracks();
-      updateTransport();
-      return;
-    }
-
-    // Step 6C (v13.3): a loop take is one capture of many passes —
-    // it splits into one take per pass instead of one take.
-    if (rec.loop) {
-      finishLoopTake(rec, result, sr, chunkCount);
-      return;
-    }
-
-    // --- Narrowband check (Step 1B). ---
-    // If the recorded input has virtually no energy above 7.5 kHz,
-    // the Bluetooth mic is in phone-call mode and the vocal is
-    // crushed — no software recovers those frequencies. Warn him
-    // plainly (and record it in the metadata) instead of silently
-    // keeping a muffled take.
-    // v21 (QUEUE #19): the finish path used to run with zero
-    // try/catch — a throw here (FFT edge case, heap pressure)
-    // died in the console and the take vanished with no error
-    // and no retry. A failed analysis now falls back to saving
-    // the RAW take untrimmed (analysis fields null, flagged
-    // unfinished) — a raw take he can re-trim beats a lost take.
-    var finishError = null;
-    var takeAnalysis;
-    try {
-      takeAnalysis = PS.routelab.analyzeTake(result.samples, sr);
-    } catch (e) {
-      finishError = e;
-      takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null };
-    }
-    // v25 (QUEUE #70): no sound in the take — the warning chain
-    // in completeTakeSave reads this after the unfinished branch
-    // (a failed analysis is unfinished, never silent).
-    var silentTake = takeIsSilent(takeAnalysis);
-
-    // --- Compensation. ---
-    // Pre-comp ON: the beat was played early by D, so the vocal
-    // already lands on time — trim the lead-in ONLY. Pre-comp OFF:
-    // trim lead-in + delay (the post-shift path). The calibration and
-    // the mode are the ones captured at take start.
-    var leadInSamples = Math.max(0, Math.round((result.anchorTime - result.firstSampleTime) * sr));
-    var active = activeCalibration();
-    var mode = PS.store.outputMode();
-    var delaySamples;
-    var compensationSource;
-    var calibrated;
-    if (mode === 'headphones' && active) {
-      delaySamples = Math.round(active.calibration.delaySeconds * sr);
-      compensationSource = 'acoustic';
-      calibrated = true;
-    } else if (mode === 'headphones') {
-      // No calibration ("Record anyway"): the nominal latency
-      // UNDERSTATES the real Bluetooth delay — the take is flagged
-      // uncalibrated, and the residual check may still catch part
-      // of the unmeasured delay from the take itself.
-      delaySamples = Math.round(PS.audio.nominalLatency() * sr);
-      compensationSource = 'session-nominal-fallback';
-      calibrated = false;
-    } else {
-      // Speaker: no Bluetooth codec in the path, so the nominal
-      // latency IS the full delay. No calibration needed.
-      delaySamples = Math.round(PS.audio.nominalLatency() * sr);
-      compensationSource = 'session-nominal';
-      calibrated = true;
-    }
-    var baseTrimSamples = result.preCompActive ? leadInSamples : leadInSamples + delaySamples;
-
-    // Residual check: measure what is left after the base trim.
-    // v21 (QUEUE #19): guarded like the analysis above — a throw
-    // falls back to the raw take, it never drops the take.
-    var residual;
-    if (state.beat && state.beat.mono) {
-      // v24 (QUEUE #53): the residual check reads both arrays at ONE
-      // rate (sr). decodeBeat resamples the beat to the context rate,
-      // but if the beat ever arrives at another rate (a browser that
-      // hands back the native rate and no offline render to fix it),
-      // verify() would read the beat's onsets ~8% early and mis-trim
-      // the take — or flag an on-time take off-beat. Refuse loudly
-      // instead of verifying on mismatched arrays.
-      if (state.beat.sampleRate !== sr) {
-        residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'unverified-rate-mismatch' };
-      } else {
-        try {
-          residual = PS.residual.verify(result.samples, state.beat.mono, baseTrimSamples, sr);
-        } catch (e) {
-          if (!finishError) finishError = e;
-          residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'no-beat' };
-        }
-      }
-    } else {
-      residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'no-beat' };
-    }
-    var trimSamples = Math.max(0, Math.min(baseTrimSamples + residual.trimSamples, result.samples.length));
-    var alignedSamples = result.samples.subarray(trimSamples);
-    if (finishError) {
-      // The analysis failed — save the raw take untrimmed. The
-      // too-short check below then reads the full capture, so a
-      // take is never dropped for a trim it never got.
-      trimSamples = 0;
-      alignedSamples = result.samples;
-    }
-    if (alignedSamples.length < Math.round(0.3 * sr)) {
-      // A tap-and-release (or a take sung entirely inside the
-      // lead-in) leaves nothing after the trim — do not save an
-      // empty take. Drop any chunks for the same reason as above.
-      if (rec.takeId) PS.db.deleteTakeChunks(rec.takeId).catch(function () { /* ignore */ });
-      if (rec.takeId) PS.db.deleteTakeRecovery(rec.takeId).catch(function () { /* ignore */ });
-      showError('Too short to save — tap record and sing a little longer.');
-      renderTracks();
-      updateTransport();
-      return;
-    }
-
-    var vocal = state.session.tracks[track];
-    var takeNumber = rec.takeNumber;
-    var baseName = takeFileBase(state.session.name, track, takeNumber, rec.takeId);
-    var durationSeconds = alignedSamples.length / sr;
-    // outputLatency drift (Step 0C): recalibrate when it has moved
-    // more than 20 ms from the calibration's value.
-    var outputLatencyNow = PS.audio.outputLatency();
-    var calibrationOutputLatency = active && typeof active.calibration.outputLatencySeconds === 'number'
-      ? active.calibration.outputLatencySeconds : null;
-    var drifted = PS.safety.outputLatencyDrifted(calibrationOutputLatency, outputLatencyNow);
-    var micSettings = PS.audio.micSettings();
-    var metadata = {
-      trackKind: track,
-      rawFileName: baseName + '-raw.wav',
-      alignedFileName: baseName + '.wav',
-      sampleRate: sr,
-      // v13.8-light: which beat this take was sung over — the
-      // server render matches on this, never guesses. Nulls when
-      // there was no beat (or no fingerprint yet).
-      // v22 (QUEUE #45/#46): stamped from the freeze at record
-      // start (rec.*), never from live session state — a beat
-      // swapped or removed mid-take cannot rewrite the stamp.
-      beatFileName: rec.beatFileName,
-      beatSha256: rec.beatSha256,
-      beatOriginalName: rec.beatOriginalName,
-      beatless: !!rec.beatless,
-      // v20 (QUEUE #41): the beat's tempo travels with the take —
-      // the server renders the echo on this grid, never the
-      // hardcoded 135. Nulls when there was no beat (or no tempo
-      // detected yet); beatBpmAlt is the half/double partner.
-      beatBpm: rec.beatBpm,
-      beatBpmAlt: rec.beatBpmAlt,
-      // v24 (QUEUE #53): the beat's rate at record start — the
-      // residual check ran the beat's mono at this rate. Nulls when
-      // there was no beat.
-      beatSampleRate: rec.beatSampleRate,
-      durationSeconds: durationSeconds,
-      leadInSamples: leadInSamples,
-      delaySamples: delaySamples,
-      delayMilliseconds: delaySamples / sr * 1000,
-      trimSamples: trimSamples,
-      preCompensationActive: result.preCompActive,
-      preCompensationDelayMilliseconds: result.preCompActive && result.delaySeconds !== null
-        ? result.delaySeconds * 1000 : null,
-      residualTrimSamples: finishError ? 0 : residual.trimSamples,
-      residualMilliseconds: finishError ? null : (residual.residualSeconds !== null ? residual.residualSeconds * 1000 : null),
-      residualOnsets: finishError ? 0 : residual.onsetCount,
-      residualVerdict: finishError ? 'unfinished' : residual.verdict,
-      // v21 (QUEUE #19): a take saved raw because the finish
-      // checks threw — the sheet says so in plain words.
-      unfinished: !!finishError,
-      finishError: finishError ? String(finishError && finishError.message || finishError) : null,
-      calibrationDeviceUID: null, // the web has no device identity
-      calibrationLabel: active ? active.label : null,
-      calibrationDeviceName: active ? active.label : null,
-      calibrationDate: active ? active.calibration.date : null,
-      calibrated: calibrated,
-      compensationSource: compensationSource,
-      interrupted: !!interrupted,
-      // Step 1B — the take is durable from its chunks up to the last
-      // full second; the rest was saved best-effort in memory.
-      chunkCount: chunkCount,
-      savedUpToSeconds: interrupted ? PS.safety.chunkedSeconds(chunkCount, sr) : durationSeconds,
-      // Step 1B — the mic settings actually applied (verified via
-      // track.getSettings() when the mic opened).
-      micSettings: micSettings,
-      echoCancellationOff: micSettings ? micSettings.echoCancellation === false : null,
-      // B9 (v13.1) — the phone processed the mic despite the raw
-      // constraints (echo cancellation, noise suppression, or auto
-      // gain actually on). The take sheet says so in plain words,
-      // and the backup carries it in this metadata.
-      micProcessed: PS.audio.micProcessed(),
-      // v13.2 (item 4) — what mic recorded the take, in plain
-      // words ("built-in mic", a product name, or "input unknown"
-      // when the app cannot tell). The take sheet shows it.
-      micLabel: PS.audio.micLabel(),
-      // Step 1B — narrowband warning (Bluetooth HFP mic).
-      narrowbandWarn: takeAnalysis.narrowbandWarn,
-      narrowbandFractionAbove7k5: takeAnalysis.fractionAbove7k5,
-      takeBandwidthHz: takeAnalysis.bandwidthHz,
-      takeRmsDb: takeAnalysis.rmsDb,
-      // v25 (QUEUE #70): no sound in the take. (QUEUE #82): a
-      // chunk write failed mid-take — the saved take is whole
-      // (from memory) but the safety copy is partial.
-      silentTake: silentTake,
-      chunkWriteFailed: chunkWriteFailed,
-      // Step 0C — outputLatency next to the acoustic calibration.
-      outputLatencySeconds: outputLatencyNow,
-      outputLatencyAtStartSeconds: rec.outputLatencyAtStart,
-      calibrationOutputLatencySeconds: calibrationOutputLatency,
-      outputLatencyDrift: drifted,
-      recordedAt: new Date().toISOString(),
-      appVersion: 'pwa-1.1',
-      // Step 3 — the sound this take was sung with. Playback uses
-      // the TAKE's sound, not the song's current one, so changing
-      // the preset later never rewrites what this take sounds like.
-      // v22 (QUEUE #48): stamped from the record-start freeze.
-      preset: rec.preset,
-      strength: rec.strength,
-      speed: state.session.speed,
-      key: rec.key,
-      macros: copySessionMacros(),
-      chainOn: state.session.chainOn,
-      bypass: copySessionBypass(),
-      tone: copySessionTone(),
-      analysis: null, // filled in after the take saves (Step 3)
-      // v13.2 (item 5) — timestamped notes on the take: each is a
-      // time in seconds + words the singer typed. Saved here so the
-      // backup carries them.
-      notes: [],
-      // Step 6C (v13.3): where the take sits in the song. A plain
-      // take starts at 0; a loop pass or a best-of take starts at
-      // the part it covers. The reconcile step reads these back
-      // when it rebuilds a take list from storage.
-      songOffsetSeconds: 0,
-      loopPass: false,
-      comp: false
-    };
-
-    // v21 (QUEUE #19): the blobs are built inside attemptTakeSave
-    // below, so a throw in the encode can offer the #10 retry
-    // instead of dropping the take. Declared here so the success
-    // path (completeTakeSave) still sees the saved blobs.
-    var rawWav;
-    var alignedWav;
-    var takeId = rec.takeId;
-    var takeMeta = {
-      id: takeId,
-      takeNumber: takeNumber,
-      rawFileName: metadata.rawFileName,
-      alignedFileName: metadata.alignedFileName,
-      recordedAt: metadata.recordedAt,
-      calibrated: calibrated,
-      delayMilliseconds: metadata.delayMilliseconds,
-      durationSeconds: durationSeconds,
-      residualVerdict: finishError ? 'unfinished' : residual.verdict,
-      unfinished: !!finishError,
-      partial: !!interrupted,
-      savedUpToSeconds: metadata.savedUpToSeconds,
-      narrowbandWarn: takeAnalysis.narrowbandWarn,
-      // v25 (QUEUE #70): no sound in the take. (QUEUE #82): a
-      // chunk write failed mid-take — the safety copy is partial.
-      silentTake: silentTake,
-      chunkWriteFailed: chunkWriteFailed,
-      // B9 (v13.1) — the phone processed this take's mic.
-      micProcessed: metadata.micProcessed,
-      // v13.2 (item 4) — what mic recorded the take.
-      micLabel: metadata.micLabel,
-      outputLatencyDrift: drifted,
-      // Step 3 — the take's own sound + its one-line summary.
-      // v22 (QUEUE #48): stamped from the record-start freeze.
-      // v28 (QUEUE #66): the frozen beat identity rides on the
-      // list entry too — the take row reads it from here, never
-      // from live session state.
-      preset: rec.preset,
-      strength: rec.strength,
-      speed: state.session.speed,
-      key: rec.key,
-      beatFileName: rec.beatFileName,
-      beatOriginalName: rec.beatOriginalName,
-      beatless: !!rec.beatless,
-      macros: copySessionMacros(),
-      chainOn: state.session.chainOn,
-      bypass: copySessionBypass(),
-      tone: copySessionTone(),
-      analysis: null,
-      // v13.2 (item 5) — timestamped notes on the take.
-      notes: [],
-      // Step 6C (v13.3): a plain take lives at 0 in the song.
-      songOffsetSeconds: 0,
-      loopPass: false,
-      comp: false
-    };
-
-    // v17 (QUEUE #10): the save record is built once, so a failed
-    // save can be retried with the exact same bytes + metadata —
-    // and the success path is one function, run by the first save
-    // or by the retry, never duplicated.
-    // v21 (QUEUE #19): the encode is the last pre-save step and
-    // the only one that allocates ~38 MiB in two fresh ArrayBuffers
-    // at the fattest moment of the tab — the likeliest throw in the
-    // whole finish path. If it throws, the take is still whole in
-    // memory: hold it and offer the #10 retry, whose resume re-runs
-    // this encode + save from the same samples. Chunks are NOT
-    // deleted here — the boot recovery the message names is still
-    // true. The save path itself is unchanged (#10 owns it).
-    function attemptTakeSave() {
-      try {
-        rawWav = new Blob([PS.wav.encodeWavFloat32(result.samples, sr)], { type: 'audio/wav' });
-        alignedWav = new Blob([PS.wav.encodeWavFloat32(alignedSamples, sr)], { type: 'audio/wav' });
-      } catch (encodeErr) {
-        showSaveFailedError('Something went wrong finishing the take — your audio is still here. Tap "Try saving again" to save it now, or close the app and reopen it — your take is kept as a recovery' + (chunkWriteFailed ? ' — only the part recorded before the storage filled up' : '') + '.',
-          { kind: 'take-finish', resume: function () { attemptTakeSave(); } });
+    // v36 (QUEUE #34): stopTake drains the worklet's final partial
+    // batch — async now. The rest of the finish runs when the
+    // drained samples land (~one render quantum later). Everything
+    // above was already synchronous up to the stop call (state
+    // cleared, timer stopped, wake lock released), so the async
+    // half only moves the save — a second finishTake still no-ops
+    // on state.recording === null, and a record tap in the drain
+    // window waits on the drain inside startCapture.
+    PS.audio.stopTake(rec.handle).then(function (result) {
+      if (!result.samples || result.samples.length === 0 || result.firstSampleTime === null) {
+        // Nothing recorded — drop any chunks so they never surface as
+        // a phantom recovery on the next boot.
+        if (rec.takeId) PS.db.deleteTakeChunks(rec.takeId).catch(function () { /* ignore */ });
+        if (rec.takeId) PS.db.deleteTakeRecovery(rec.takeId).catch(function () { /* ignore */ });
+        showError('Nothing was recorded — the mic did not pick up any sound.');
         renderTracks();
         updateTransport();
         return;
       }
-      var takeRecord = {
-        id: takeId,
-        sessionId: state.session.id,
-        track: track,
-        takeNumber: takeNumber,
-        rawWav: rawWav,
-        alignedWav: alignedWav,
-        metadata: metadata,
-        recordedAt: metadata.recordedAt
-      };
-      PS.db.saveTake(takeRecord).then(completeTakeSave).catch(function (err) {
-        console.warn('Take save failed:', err);
-        // v17 (QUEUE #10): hold the take in memory and offer the
-        // retry — the blobs are the only full copy (the chunks hold
-        // it up to the last full second). Do NOT delete the orphan
-        // chunks here: they are the boot recovery the message names.
-        showSaveFailedError('The take recorded but could not be saved — the phone may be out of space for this site. Tap "Try saving again" to save it now, or close the app and reopen it — your take is kept as a recovery' + (chunkWriteFailed ? ' — only the part recorded before the storage filled up' : '') + '.',
-          { kind: 'take', record: takeRecord, onSaved: completeTakeSave });
+
+      // Step 6C (v13.3): a loop take is one capture of many passes —
+      // it splits into one take per pass instead of one take.
+      if (rec.loop) {
+        finishLoopTake(rec, result, sr, chunkCount);
+        return;
+      }
+
+      // --- Narrowband check (Step 1B). ---
+      // If the recorded input has virtually no energy above 7.5 kHz,
+      // the Bluetooth mic is in phone-call mode and the vocal is
+      // crushed — no software recovers those frequencies. Warn him
+      // plainly (and record it in the metadata) instead of silently
+      // keeping a muffled take.
+      // v21 (QUEUE #19): the finish path used to run with zero
+      // try/catch — a throw here (FFT edge case, heap pressure)
+      // died in the console and the take vanished with no error
+      // and no retry. A failed analysis now falls back to saving
+      // the RAW take untrimmed (analysis fields null, flagged
+      // unfinished) — a raw take he can re-trim beats a lost take.
+      var finishError = null;
+      var takeAnalysis;
+      try {
+        takeAnalysis = PS.routelab.analyzeTake(result.samples, sr);
+      } catch (e) {
+        finishError = e;
+        takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null, peakDbfs: null, clippedSamples: null, clipped: false };
+      }
+      // v25 (QUEUE #70): no sound in the take — the warning chain
+      // in completeTakeSave reads this after the unfinished branch
+      // (a failed analysis is unfinished, never silent).
+      var silentTake = takeIsSilent(takeAnalysis);
+
+      // --- Compensation. ---
+      // Pre-comp ON: the beat was played early by D, so the vocal
+      // already lands on time — trim the lead-in ONLY. Pre-comp OFF:
+      // trim lead-in + delay (the post-shift path). The calibration and
+      // the mode are the ones captured at take start.
+      var leadInSamples = Math.max(0, Math.round((result.anchorTime - result.firstSampleTime) * sr));
+      var active = activeCalibration();
+      var mode = PS.store.outputMode();
+      var delaySamples;
+      var compensationSource;
+      var calibrated;
+      if (mode === 'headphones' && active) {
+        delaySamples = Math.round(active.calibration.delaySeconds * sr);
+        compensationSource = 'acoustic';
+        calibrated = true;
+      } else if (mode === 'headphones') {
+        // No calibration ("Record anyway"): the nominal latency
+        // UNDERSTATES the real Bluetooth delay — the take is flagged
+        // uncalibrated, and the residual check may still catch part
+        // of the unmeasured delay from the take itself.
+        delaySamples = Math.round(PS.audio.nominalLatency() * sr);
+        compensationSource = 'session-nominal-fallback';
+        calibrated = false;
+      } else {
+        // Speaker: no Bluetooth codec in the path, so the nominal
+        // latency IS the full delay. No calibration needed.
+        delaySamples = Math.round(PS.audio.nominalLatency() * sr);
+        compensationSource = 'session-nominal';
+        calibrated = true;
+      }
+      var baseTrimSamples = result.preCompActive ? leadInSamples : leadInSamples + delaySamples;
+
+      // Residual check: measure what is left after the base trim.
+      // v21 (QUEUE #19): guarded like the analysis above — a throw
+      // falls back to the raw take, it never drops the take.
+      var residual;
+      if (state.beat && state.beat.mono) {
+        // v24 (QUEUE #53): the residual check reads both arrays at ONE
+        // rate (sr). decodeBeat resamples the beat to the context rate,
+        // but if the beat ever arrives at another rate (a browser that
+        // hands back the native rate and no offline render to fix it),
+        // verify() would read the beat's onsets ~8% early and mis-trim
+        // the take — or flag an on-time take off-beat. Refuse loudly
+        // instead of verifying on mismatched arrays.
+        if (state.beat.sampleRate !== sr) {
+          residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'unverified-rate-mismatch' };
+        } else {
+          try {
+            residual = PS.residual.verify(result.samples, state.beat.mono, baseTrimSamples, sr);
+          } catch (e) {
+            if (!finishError) finishError = e;
+            residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'no-beat' };
+          }
+        }
+      } else {
+        residual = { trimSamples: 0, residualSeconds: null, onsetCount: 0, verdict: 'no-beat' };
+      }
+      var trimSamples = Math.max(0, Math.min(baseTrimSamples + residual.trimSamples, result.samples.length));
+      var alignedSamples = result.samples.subarray(trimSamples);
+      if (finishError) {
+        // The analysis failed — save the raw take untrimmed. The
+        // too-short check below then reads the full capture, so a
+        // take is never dropped for a trim it never got.
+        trimSamples = 0;
+        alignedSamples = result.samples;
+      }
+      if (alignedSamples.length < Math.round(0.3 * sr)) {
+        // A tap-and-release (or a take sung entirely inside the
+        // lead-in) leaves nothing after the trim — do not save an
+        // empty take. Drop any chunks for the same reason as above.
+        if (rec.takeId) PS.db.deleteTakeChunks(rec.takeId).catch(function () { /* ignore */ });
+        if (rec.takeId) PS.db.deleteTakeRecovery(rec.takeId).catch(function () { /* ignore */ });
+        showError('Too short to save — tap record and sing a little longer.');
         renderTracks();
         updateTransport();
-      });
-    }
-    function completeTakeSave() {
-      vocal.takes.push(takeMeta);
-      vocal.activeTakeId = takeId;
-      saveSessions();
-      // The take is saved — its chunks + recovery record have done their job.
-      PS.db.deleteTakeChunks(takeId).catch(function () { /* ignore */ });
-      PS.db.deleteTakeRecovery(takeId).catch(function () { /* ignore */ });
-      maybeCloseMic(); // review plays at full quality once the mic is closed
-      renderTracks();
-      renderSheet();
-      updateTransport();
-      // Step 3B — the take is saved: play it back tuned at once,
-      // so he hears the finished sound without tapping Play. Only
-      // takes worth hearing (2 s or more) play themselves.
-      if (durationSeconds >= 2) {
-        playTake(takeId);
+        return;
       }
-      // Step 3 — listen to the finished take once, in slices, and
-      // write one plain-words line about it. Playback already
-      // started, so this runs after it and never blocks the screen.
-      runTakeAnalysis(takeMeta, metadata, alignedSamples, sr, track, takeId, rawWav, alignedWav);
-      if (metadata.unfinished) {
-        showError('Saved raw — something went wrong finishing the take, so it was saved untrimmed and unchecked. It is in the list below; re-trim it or record it again if it sounds off.');
-      } else if (silentTake) {
-        // v25 (QUEUE #70): saved, flagged, never dropped — the
-        // v21 rule. The take stays in the list with its "No sound"
-        // row bit; the message says what to do next.
-        showError('That take has no sound in it — the mic heard nothing. Check the mic and record it again.');
-      } else if (takeAnalysis.narrowbandWarn) {
-        showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.');
-      } else if (drifted) {
-        showError('The timing may have drifted since you measured these headphones — measure them again before the next take.');
-      } else if (chunkWriteFailed) {
-        // v25 (QUEUE #82): the take itself saved whole from
-        // memory — only the safety copy is partial. Said once,
-        // here, so a later storage failure at save time is not
-        // blamed on a take that already landed.
-        showError('Saved — but the phone ran out of space while recording, so the safety copy of this take is incomplete. The take itself saved from memory; free some space before the next take.');
+
+      var vocal = state.session.tracks[track];
+      var takeNumber = rec.takeNumber;
+      var baseName = takeFileBase(state.session.name, track, takeNumber, rec.takeId);
+      var durationSeconds = alignedSamples.length / sr;
+      // outputLatency drift (Step 0C): recalibrate when it has moved
+      // more than 20 ms from the calibration's value.
+      var outputLatencyNow = PS.audio.outputLatency();
+      var calibrationOutputLatency = active && typeof active.calibration.outputLatencySeconds === 'number'
+        ? active.calibration.outputLatencySeconds : null;
+      var drifted = PS.safety.outputLatencyDrifted(calibrationOutputLatency, outputLatencyNow);
+      var micSettings = PS.audio.micSettings();
+      var metadata = {
+        trackKind: track,
+        rawFileName: baseName + '-raw.wav',
+        alignedFileName: baseName + '.wav',
+        sampleRate: sr,
+        // v13.8-light: which beat this take was sung over — the
+        // server render matches on this, never guesses. Nulls when
+        // there was no beat (or no fingerprint yet).
+        // v22 (QUEUE #45/#46): stamped from the freeze at record
+        // start (rec.*), never from live session state — a beat
+        // swapped or removed mid-take cannot rewrite the stamp.
+        beatFileName: rec.beatFileName,
+        beatSha256: rec.beatSha256,
+        beatOriginalName: rec.beatOriginalName,
+        beatless: !!rec.beatless,
+        // v20 (QUEUE #41): the beat's tempo travels with the take —
+        // the server renders the echo on this grid, never the
+        // hardcoded 135. Nulls when there was no beat (or no tempo
+        // detected yet); beatBpmAlt is the half/double partner.
+        beatBpm: rec.beatBpm,
+        beatBpmAlt: rec.beatBpmAlt,
+        // v24 (QUEUE #53): the beat's rate at record start — the
+        // residual check ran the beat's mono at this rate. Nulls when
+        // there was no beat.
+        beatSampleRate: rec.beatSampleRate,
+        durationSeconds: durationSeconds,
+        leadInSamples: leadInSamples,
+        delaySamples: delaySamples,
+        delayMilliseconds: delaySamples / sr * 1000,
+        trimSamples: trimSamples,
+        preCompensationActive: result.preCompActive,
+        preCompensationDelayMilliseconds: result.preCompActive && result.delaySeconds !== null
+          ? result.delaySeconds * 1000 : null,
+        residualTrimSamples: finishError ? 0 : residual.trimSamples,
+        residualMilliseconds: finishError ? null : (residual.residualSeconds !== null ? residual.residualSeconds * 1000 : null),
+        residualOnsets: finishError ? 0 : residual.onsetCount,
+        residualVerdict: finishError ? 'unfinished' : residual.verdict,
+        // v21 (QUEUE #19): a take saved raw because the finish
+        // checks threw — the sheet says so in plain words.
+        unfinished: !!finishError,
+        finishError: finishError ? String(finishError && finishError.message || finishError) : null,
+        calibrationDeviceUID: null, // the web has no device identity
+        calibrationLabel: active ? active.label : null,
+        calibrationDeviceName: active ? active.label : null,
+        calibrationDate: active ? active.calibration.date : null,
+        calibrated: calibrated,
+        compensationSource: compensationSource,
+        interrupted: !!interrupted,
+        // Step 1B — the take is durable from its chunks up to the last
+        // chunk (v36, QUEUE #34: the stop flushes the final partial
+        // chunk too, so the durable span runs to the end of the take —
+        // chunkedSeconds counts that partial chunk as a full second,
+        // so this figure rounds the tail up by < 1 s on interrupted
+        // takes; the recovered audio itself is exact). The rest was
+        // saved best-effort in memory.
+        chunkCount: chunkCount,
+        savedUpToSeconds: interrupted ? PS.safety.chunkedSeconds(chunkCount, sr) : durationSeconds,
+        // Step 1B — the mic settings actually applied (verified via
+        // track.getSettings() when the mic opened).
+        micSettings: micSettings,
+        echoCancellationOff: micSettings ? micSettings.echoCancellation === false : null,
+        // B9 (v13.1) — the phone processed the mic despite the raw
+        // constraints (echo cancellation, noise suppression, or auto
+        // gain actually on). The take sheet says so in plain words,
+        // and the backup carries it in this metadata.
+        micProcessed: PS.audio.micProcessed(),
+        // v13.2 (item 4) — what mic recorded the take, in plain
+        // words ("built-in mic", a product name, or "input unknown"
+        // when the app cannot tell). The take sheet shows it.
+        micLabel: PS.audio.micLabel(),
+        // Step 1B — narrowband warning (Bluetooth HFP mic).
+        narrowbandWarn: takeAnalysis.narrowbandWarn,
+        narrowbandFractionAbove7k5: takeAnalysis.fractionAbove7k5,
+        takeBandwidthHz: takeAnalysis.bandwidthHz,
+        takeRmsDb: takeAnalysis.rmsDb,
+        // v37 (QUEUE #23): clipping at capture — peak + full-scale count.
+        takePeakDbfs: takeAnalysis.peakDbfs,
+        takeClippedSamples: takeAnalysis.clippedSamples,
+        clipped: takeAnalysis.clipped,
+        // v25 (QUEUE #70): no sound in the take. (QUEUE #82): a
+        // chunk write failed mid-take — the saved take is whole
+        // (from memory) but the safety copy is partial.
+        silentTake: silentTake,
+        chunkWriteFailed: chunkWriteFailed,
+        // Step 0C — outputLatency next to the acoustic calibration.
+        outputLatencySeconds: outputLatencyNow,
+        outputLatencyAtStartSeconds: rec.outputLatencyAtStart,
+        calibrationOutputLatencySeconds: calibrationOutputLatency,
+        outputLatencyDrift: drifted,
+        recordedAt: new Date().toISOString(),
+        appVersion: 'pwa-1.1',
+        // Step 3 — the sound this take was sung with. Playback uses
+        // the TAKE's sound, not the song's current one, so changing
+        // the preset later never rewrites what this take sounds like.
+        // v22 (QUEUE #48): stamped from the record-start freeze.
+        preset: rec.preset,
+        strength: rec.strength,
+        speed: state.session.speed,
+        key: rec.key,
+        macros: copySessionMacros(),
+        chainOn: state.session.chainOn,
+        bypass: copySessionBypass(),
+        tone: copySessionTone(),
+        analysis: null, // filled in after the take saves (Step 3)
+        // v13.2 (item 5) — timestamped notes on the take: each is a
+        // time in seconds + words the singer typed. Saved here so the
+        // backup carries them.
+        notes: [],
+        // Step 6C (v13.3): where the take sits in the song. A plain
+        // take starts at 0; a loop pass or a best-of take starts at
+        // the part it covers. The reconcile step reads these back
+        // when it rebuilds a take list from storage.
+        songOffsetSeconds: 0,
+        loopPass: false,
+        comp: false
+      };
+
+      // v21 (QUEUE #19): the blobs are built inside attemptTakeSave
+      // below, so a throw in the encode can offer the #10 retry
+      // instead of dropping the take. Declared here so the success
+      // path (completeTakeSave) still sees the saved blobs.
+      var rawWav;
+      var alignedWav;
+      var takeId = rec.takeId;
+      var takeMeta = {
+        id: takeId,
+        takeNumber: takeNumber,
+        rawFileName: metadata.rawFileName,
+        alignedFileName: metadata.alignedFileName,
+        recordedAt: metadata.recordedAt,
+        calibrated: calibrated,
+        delayMilliseconds: metadata.delayMilliseconds,
+        durationSeconds: durationSeconds,
+        residualVerdict: finishError ? 'unfinished' : residual.verdict,
+        unfinished: !!finishError,
+        partial: !!interrupted,
+        savedUpToSeconds: metadata.savedUpToSeconds,
+        narrowbandWarn: takeAnalysis.narrowbandWarn,
+        // v37 (QUEUE #23): clipping — the row reads it from here.
+        clipped: takeAnalysis.clipped,
+        takePeakDbfs: takeAnalysis.peakDbfs,
+        takeClippedSamples: takeAnalysis.clippedSamples,
+        // v25 (QUEUE #70): no sound in the take. (QUEUE #82): a
+        // chunk write failed mid-take — the safety copy is partial.
+        silentTake: silentTake,
+        chunkWriteFailed: chunkWriteFailed,
+        // B9 (v13.1) — the phone processed this take's mic.
+        micProcessed: metadata.micProcessed,
+        // v13.2 (item 4) — what mic recorded the take.
+        micLabel: metadata.micLabel,
+        outputLatencyDrift: drifted,
+        // Step 3 — the take's own sound + its one-line summary.
+        // v22 (QUEUE #48): stamped from the record-start freeze.
+        // v28 (QUEUE #66): the frozen beat identity rides on the
+        // list entry too — the take row reads it from here, never
+        // from live session state.
+        preset: rec.preset,
+        strength: rec.strength,
+        speed: state.session.speed,
+        key: rec.key,
+        beatFileName: rec.beatFileName,
+        beatOriginalName: rec.beatOriginalName,
+        beatless: !!rec.beatless,
+        macros: copySessionMacros(),
+        chainOn: state.session.chainOn,
+        bypass: copySessionBypass(),
+        tone: copySessionTone(),
+        analysis: null,
+        // v13.2 (item 5) — timestamped notes on the take.
+        notes: [],
+        // Step 6C (v13.3): a plain take lives at 0 in the song.
+        songOffsetSeconds: 0,
+        loopPass: false,
+        comp: false
+      };
+
+      // v17 (QUEUE #10): the save record is built once, so a failed
+      // save can be retried with the exact same bytes + metadata —
+      // and the success path is one function, run by the first save
+      // or by the retry, never duplicated.
+      // v21 (QUEUE #19): the encode is the last pre-save step and
+      // the only one that allocates ~38 MiB in two fresh ArrayBuffers
+      // at the fattest moment of the tab — the likeliest throw in the
+      // whole finish path. If it throws, the take is still whole in
+      // memory: hold it and offer the #10 retry, whose resume re-runs
+      // this encode + save from the same samples. Chunks are NOT
+      // deleted here — the boot recovery the message names is still
+      // true. The save path itself is unchanged (#10 owns it).
+      function attemptTakeSave() {
+        try {
+          rawWav = new Blob([PS.wav.encodeWavFloat32(result.samples, sr)], { type: 'audio/wav' });
+          alignedWav = new Blob([PS.wav.encodeWavFloat32(alignedSamples, sr)], { type: 'audio/wav' });
+        } catch (encodeErr) {
+          showSaveFailedError('Something went wrong finishing the take — your audio is still here. Tap "Try saving again" to save it now, or close the app and reopen it — your take is kept as a recovery' + (chunkWriteFailed ? ' — only the part recorded before the storage filled up' : '') + '.',
+            { kind: 'take-finish', resume: function () { attemptTakeSave(); } });
+          renderTracks();
+          updateTransport();
+          return;
+        }
+        var takeRecord = {
+          id: takeId,
+          sessionId: state.session.id,
+          track: track,
+          takeNumber: takeNumber,
+          rawWav: rawWav,
+          alignedWav: alignedWav,
+          metadata: metadata,
+          recordedAt: metadata.recordedAt
+        };
+        PS.db.saveTake(takeRecord).then(completeTakeSave).catch(function (err) {
+          console.warn('Take save failed:', err);
+          // v17 (QUEUE #10): hold the take in memory and offer the
+          // retry — the blobs are the only full copy (the chunks hold
+          // it up to the last full second). Do NOT delete the orphan
+          // chunks here: they are the boot recovery the message names.
+          showSaveFailedError('The take recorded but could not be saved — the phone may be out of space for this site. Tap "Try saving again" to save it now, or close the app and reopen it — your take is kept as a recovery' + (chunkWriteFailed ? ' — only the part recorded before the storage filled up' : '') + '.',
+            { kind: 'take', record: takeRecord, onSaved: completeTakeSave });
+          renderTracks();
+          updateTransport();
+        });
       }
-    }
-    attemptTakeSave();
+      function completeTakeSave() {
+        vocal.takes.push(takeMeta);
+        vocal.activeTakeId = takeId;
+        saveSessions();
+        // The take is saved — its chunks + recovery record have done their job.
+        PS.db.deleteTakeChunks(takeId).catch(function () { /* ignore */ });
+        PS.db.deleteTakeRecovery(takeId).catch(function () { /* ignore */ });
+        maybeCloseMic(); // review plays at full quality once the mic is closed
+        renderTracks();
+        renderSheet();
+        updateTransport();
+        // Step 3B — the take is saved: play it back tuned at once,
+        // so he hears the finished sound without tapping Play. Only
+        // takes worth hearing (2 s or more) play themselves.
+        if (durationSeconds >= 2) {
+          playTake(takeId);
+        }
+        // Step 3 — listen to the finished take once, in slices, and
+        // write one plain-words line about it. Playback already
+        // started, so this runs after it and never blocks the screen.
+        runTakeAnalysis(takeMeta, metadata, alignedSamples, sr, track, takeId, rawWav, alignedWav);
+        if (metadata.unfinished) {
+          showError('Saved raw — something went wrong finishing the take, so it was saved untrimmed and unchecked. It is in the list below; re-trim it or record it again if it sounds off.');
+        } else if (rec.interruptedReason === 'mic-disconnected') {
+          // v35 (QUEUE #32): the mic died mid-take — said first,
+          // before the silent-take branch, because a take cut by a
+          // dead mic has no sound at the end for exactly this reason.
+          showError('The mic disconnected — your take was saved up to the disconnect.');
+        } else if (silentTake) {
+          // v25 (QUEUE #70): saved, flagged, never dropped — the
+          // v21 rule. The take stays in the list with its "No sound"
+          // row bit; the message says what to do next.
+          showError('That take has no sound in it — the mic heard nothing. Check the mic and record it again.');
+        } else if (takeAnalysis.narrowbandWarn) {
+          showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
+        } else if (drifted) {
+          // v37 (QUEUE #23): the drift note stays first when the take also
+          // clipped — the clip rides along, it never replaces the message.
+          showError('The timing may have drifted since you measured these headphones — measure them again before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
+        } else if (chunkWriteFailed) {
+          // v25 (QUEUE #82): the take itself saved whole from
+          // memory — only the safety copy is partial. Said once,
+          // here, so a later storage failure at save time is not
+          // blamed on a take that already landed.
+          // v37 (QUEUE #23): same combined pattern as muffled — the
+          // clip note appends, it never shadows this warning (the
+          // v37 clip branch sat ahead of it and hid it — v148).
+          showError('Saved — but the phone ran out of space while recording, so the safety copy of this take is incomplete. The take itself saved from memory; free some space before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
+        } else if (takeAnalysis.clipped) {
+          // v37 (QUEUE #23): clipped, nothing else to say — said plainly, never gated.
+          // Moved after drifted/storage: those warnings must not be shadowed.
+          showError('That take clipped — the loudest peaks hit the limit. Back off the mic a little and record it again.');
+        }
+      }
+      attemptTakeSave();
+    });
   }
 
   /* Step 3 — listen to a finished take once, in slices, and write
@@ -2431,7 +2588,7 @@
       takeAnalysis = PS.routelab.analyzeTake(result.samples, sr);
     } catch (e) {
       finishError = e;
-      takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null };
+      takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null, peakDbfs: null, clippedSamples: null, clipped: false };
     }
     // v25 (QUEUE #70): no sound in the whole capture — every pass
     // shares the mic, so every pass carries the flag. (QUEUE #82):
@@ -2533,18 +2690,30 @@
       if (last && last.durationSeconds >= 2) playTake(last.id);
       if (finishError) {
         showError('Saved without its finish check — something went wrong checking the loop take, so the passes were saved unchecked. They are in the list below; record them again if they sound off.');
+      } else if (rec.interruptedReason === 'mic-disconnected') {
+        // v35 (QUEUE #32): the mic died mid-loop — the passes
+        // saved are the ones sung before the disconnect.
+        showError('The mic disconnected — your take was saved up to the disconnect.');
       } else if (silentTake) {
         // v25 (QUEUE #70): the passes saved, flagged, never
         // dropped — same as a plain silent take.
         showError('That take has no sound in it — the mic heard nothing. Check the mic and record it again.');
       } else if (takeAnalysis.narrowbandWarn) {
-        showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.');
+        showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
       } else if (drifted) {
-        showError('The timing may have drifted since you measured these headphones — measure them again before the next take.');
+        // v37 (QUEUE #23): the drift note stays first when the take also
+        // clipped — the clip rides along, it never replaces the message.
+        showError('The timing may have drifted since you measured these headphones — measure them again before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
       } else if (chunkWriteFailed) {
         // v25 (QUEUE #82): the passes saved whole from memory —
         // only the safety copy is partial.
-        showError('Saved — but the phone ran out of space while recording, so the safety copy of this take is incomplete. The passes themselves saved from memory; free some space before the next take.');
+        // v37 (QUEUE #23): same combined pattern as muffled — the
+        // clip note appends, it never shadows this warning.
+        showError('Saved — but the phone ran out of space while recording, so the safety copy of this take is incomplete. The passes themselves saved from memory; free some space before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
+      } else if (takeAnalysis.clipped) {
+        // v37 (QUEUE #23): clipped, nothing else to say — said plainly, never gated.
+        // Moved after drifted/storage: those warnings must not be shadowed.
+        showError('That take clipped — the loudest peaks hit the limit. Back off the mic a little and record it again.');
       }
     }
     runLoopFrom(0);
@@ -2630,6 +2799,10 @@
         narrowbandFractionAbove7k5: takeAnalysis.fractionAbove7k5,
         takeBandwidthHz: takeAnalysis.bandwidthHz,
         takeRmsDb: takeAnalysis.rmsDb,
+        // v37 (QUEUE #23): clipping at capture — one analysis for the whole capture, every pass shares the mic.
+        takePeakDbfs: takeAnalysis.peakDbfs,
+        takeClippedSamples: takeAnalysis.clippedSamples,
+        clipped: takeAnalysis.clipped,
         // v25 (QUEUE #70): no sound in the capture. (QUEUE #82):
         // a chunk write failed mid-take — the safety copy is partial.
         silentTake: silentTake,
@@ -2676,6 +2849,10 @@
         partial: !!rec.interrupted,
         savedUpToSeconds: durationSeconds,
         narrowbandWarn: takeAnalysis.narrowbandWarn,
+        // v37 (QUEUE #23): clipping — the row reads it from here.
+        clipped: takeAnalysis.clipped,
+        takePeakDbfs: takeAnalysis.peakDbfs,
+        takeClippedSamples: takeAnalysis.clippedSamples,
         // v25 (QUEUE #70): no sound in the capture. (QUEUE #82):
         // a chunk write failed mid-take — the safety copy is partial.
         silentTake: silentTake,
@@ -3322,7 +3499,11 @@
         return { session: session, takes: takes || [] };
       }).catch(function () { return { session: session, takes: [] }; });
     });
-    Promise.all(jobs).then(function (groups) {
+    // v33 (QUEUE #115): returns the status text so the CDP tests
+    // can call it without the Setup button (the button is gone —
+    // Setup has no controls). The button handler ignores the
+    // return value; the promise resolves after share / download.
+    return Promise.all(jobs).then(function (groups) {
       var files = [];
       var audioFiles = []; // every audio File, to fingerprint before the manifest is written
       var takeCount = 0;
@@ -3361,7 +3542,7 @@
       });
       if (takeCount === 0) {
         if (status) status.textContent = 'No takes to back up yet.';
-        return;
+        return 'No takes to back up yet.';
       }
       var canHash = !!(window.crypto && window.crypto.subtle && window.crypto.subtle.digest);
       var hashJobs = audioFiles.map(function (f) {
@@ -3389,18 +3570,22 @@
           : ' The backup list has sizes only — this browser could not fingerprint the files.';
         if (navigator.canShare && navigator.canShare({ files: files })) {
           return navigator.share({ files: files, title: 'Phone Studio backup' }).then(function () {
-            if (status) status.textContent = 'Backed up ' + takeCount + ' take' + (takeCount === 1 ? '' : 's') + '.' + rawNote + hashNote;
+            var text = 'Backed up ' + takeCount + ' take' + (takeCount === 1 ? '' : 's') + '.' + rawNote + hashNote;
+            if (status) status.textContent = text;
+            return text;
           }).catch(function (err) {
             if (err && err.name === 'AbortError') {
               if (status) status.textContent = '';
-              return;
+              return '';
             }
             throw err;
           });
         }
         // No share sheet — download the files one by one.
         files.forEach(function (f) { downloadBlob(f, f.name); });
-        if (status) status.textContent = 'Downloaded ' + files.length + ' files.' + rawNote + hashNote;
+        var dlText = 'Downloaded ' + files.length + ' files.' + rawNote + hashNote;
+        if (status) status.textContent = dlText;
+        return dlText;
       });
     }).catch(function (err) {
       console.warn('Backup failed:', err);
@@ -3408,6 +3593,7 @@
       showError('The backup could not be made. Try again.');
     });
   }
+  PS.backupAllTakes = backupAllTakes; // v33: exposed for the CDP tests (the Setup backup button is gone; tests call it directly and await the status text)
 
   function toHex(buffer) {
     return Array.prototype.map.call(new Uint8Array(buffer), function (b) {
@@ -3495,8 +3681,14 @@
    * "All N files check out." or the missing / changed names.
    */
   function checkBackupFiles() {
+    // v32 (QUEUE #110) — the "Check these files" UI is gone from
+    // Setup, so this is dead from the UI; it stays (with the guard
+    // below) because the backup CHECK itself — verifyBackup + the
+    // status strings — is still proven by cdp-v132, which drives
+    // the same flow in-test.
     var status = $('backup-check-status');
     var input = $('backup-check-files');
+    if (!input) return;
     var picked = input.files ? Array.prototype.slice.call(input.files) : [];
     if (!picked.length) {
       if (status) status.textContent = 'Pick the backup file and the sound files first.';
@@ -5111,7 +5303,12 @@
   // ---------------------------------------------------------------- rendering
 
   function renderSession() {
-    $('song-name').value = state.session.name;
+    // v33 (QUEUE #115): #song-name (input) and #session-select
+    // (dropdown) are gone from Setup — the song name is plain text
+    // (#setup-song-name). Song-switching needs a home on the
+    // timeline screen (follow-up); Setup only shows the name.
+    var nameEl = $('setup-song-name');
+    if (nameEl) nameEl.textContent = state.session.name;
     $('topbar-song-name').textContent = state.session.name;
     // v13.2 (item 7): the top bar shows the word "Key", never the
     // key's name — Denasse never has to read "D minor" / "A minor"
@@ -5119,15 +5316,6 @@
     // session (and in the key sheet, which stays Jim-only); tapping
     // the button still opens it.
     $('topbar-song-key').textContent = 'Key';
-    var sessionSelect = $('session-select');
-    sessionSelect.innerHTML = '';
-    state.sessions.forEach(function (s) {
-      var opt = document.createElement('option');
-      opt.value = s.id;
-      opt.textContent = s.name;
-      if (s.id === state.session.id) opt.selected = true;
-      sessionSelect.appendChild(opt);
-    });
   }
 
   /* The song key — set from the key picker (top bar) or from the
@@ -5165,60 +5353,43 @@
     updateTransport(); // the beat arriving (or leaving) changes what Play can do
   }
 
+  /* v32 (QUEUE #110) — Setup simplify: the mode is two big buttons
+   * now (not radios), the cal list + measure box + new-device
+   * banner are gone, and the only calibration line left is one
+   * short status line (#cal-status-line). The lab test is the
+   * measurement — when it saves a calibration, this line says so;
+   * when a pair of headphones the app has never seen appears, it
+   * points at the test instead of a banner. Called on boot, on
+   * every Setup open (showSetup), after a lab run, on a mode
+   * change, and when a new device appears.
+   */
   function renderCalibration() {
     var mode = PS.store.outputMode();
-    $('mode-headphones').checked = mode === 'headphones';
-    $('mode-speaker').checked = mode === 'speaker';
-    $('headphones-box').style.display = mode === 'headphones' ? '' : 'none';
-    $('speaker-note').style.display = mode === 'speaker' ? '' : 'none';
+    var hpBtn = $('mode-headphones-btn');
+    var spBtn = $('mode-speaker-btn');
+    if (hpBtn) hpBtn.setAttribute('aria-pressed', mode === 'headphones' ? 'true' : 'false');
+    if (spBtn) spBtn.setAttribute('aria-pressed', mode === 'speaker' ? 'true' : 'false');
+    if (hpBtn) hpBtn.classList.toggle('active', mode === 'headphones');
+    if (spBtn) spBtn.classList.toggle('active', mode === 'speaker');
+    var note = $('speaker-note');
+    if (note) note.style.display = mode === 'speaker' ? '' : 'none';
 
-    var list = $('cal-list');
-    list.innerHTML = '';
-    var labels = Object.keys(state.calibrations);
-    var activeLabel = PS.store.activeCalibrationLabel();
-    if (labels.length === 0) {
-      list.appendChild(el('p', 'muted', 'No headphones measured yet.'));
-    }
-    labels.forEach(function (label) {
-      var cal = state.calibrations[label];
-      var row = el('div', 'cal-row');
-      var radio = document.createElement('input');
-      radio.type = 'radio';
-      radio.name = 'headphones';
-      radio.value = label;
-      radio.checked = label === activeLabel;
-      radio.addEventListener('change', function () {
-        PS.store.setActiveCalibrationLabel(label);
-        renderCalibration();
-      });
-      var text = el('span', '', label + ' — ' + Math.round(cal.delayMs) + ' ms, measured ' + fmtTime(cal.date));
-      var del = el('button', 'btn-small danger', 'Remove');
-      del.addEventListener('click', function () {
-        if (!window.confirm('Remove the measurement for "' + label + '"?')) return;
-        PS.store.deleteCalibration(label);
-        state.calibrations = PS.store.loadCalibrations();
-        renderCalibration();
-      });
-      row.appendChild(radio);
-      row.appendChild(text);
-      row.appendChild(del);
-      list.appendChild(row);
-    });
-
-    $('cal-measure').disabled = state.calibrating;
-    $('cal-measure').textContent = state.calibrating ? 'Measuring…' : 'Measure my headphones';
-    if (!state.calibrating && !$('cal-status').textContent) {
-      var active = activeCalibration();
-      $('cal-status').textContent = active
-        ? 'Using ' + active.label + ' — your voice will land in time.'
-        : 'Not measured yet.';
+    var line = $('cal-status-line');
+    if (!line) return;
+    if (mode === 'speaker') {
+      line.textContent = '';
+      return;
     }
     // Step 0C — a pair of headphones the app has never seen appeared.
-    // One calibration per pair: prompt to measure the new one.
-    var newDeviceLine = $('cal-new-device');
-    if (newDeviceLine) {
-      newDeviceLine.style.display = state.newDeviceDetected ? '' : 'none';
+    // One calibration per pair: point at the test that measures it.
+    if (state.newDeviceDetected) {
+      line.textContent = 'New headphones — tap Test my headphones so your voice lands in time.';
+      return;
     }
+    var active = activeCalibration();
+    line.textContent = active
+      ? 'Using ' + active.label + ' — your voice will land in time.'
+      : 'Not measured yet — tap Test my headphones.';
   }
 
   function selectTrack(kind) {
@@ -5893,6 +6064,9 @@
       if (take.partial) subBits.push(PS.safety.fmtSavedUpTo(take.savedUpToSeconds || 0) + ' — interrupted');
       if (take.recovered) subBits.push('recovered after the app closed');
       if (take.narrowbandWarn) subBits.push('Sounds muffled — your headphones dropped to phone-call mode');
+      // v37 (QUEUE #23): a clipped take says so on its own row, next
+      // to the muffled line — with the count, so the damage is concrete.
+      if (take.clipped) subBits.push('Clipped' + (typeof take.takeClippedSamples === 'number' ? ' — ' + take.takeClippedSamples + ' samples hit the limit' : '') + ' — back off the mic a little');
       // v25 (QUEUE #70): a take with no sound in it says so on
       // its own row — it must never list as an ordinary take.
       if (take.silentTake) subBits.push('No sound in this take — the mic heard nothing');
@@ -6734,7 +6908,13 @@
     renderTracks();
     renderPresetStrip();
     updateIdeasUI();
-    $('wake-note').style.display = state.wakeLockSupported ? 'none' : '';
+    // v33 (QUEUE #115): #wake-note (the screen-lock warning) is
+    // gone from Setup — Setup shows only the song, the sound and
+    // the headphones. Guard it so a missing element can't break
+    // the whole render (renderAll runs on boot and every session
+    // change).
+    var wakeNote = $('wake-note');
+    if (wakeNote) wakeNote.style.display = state.wakeLockSupported ? 'none' : '';
     updateTransport();
   }
 
@@ -6779,69 +6959,39 @@
    * monitor stays off on those — the tune still works on
    * playback, and the card says so in plain words).
    */
-  function renderChainCard() {
-    var slow = routeIsSlow();
-    var bypass = copySessionBypass();
-    $('chain-slow-note').style.display = slow ? '' : 'none';
-    $('chain-on').checked = state.session.chainOn;
-    // Checked = the noise cut is ON (bypass off).
-    $('chain-nr').checked = !bypass.nr;
-    // v23 (QUEUE #58): checked = tune-only live (the escape hatch
-    // back to light; the v23 default is the full chain live).
-    $('light-live').checked = state.session.lightLive !== false;
-    MACRO_KEYS.forEach(function (key) {
-      var slider = $('macro-' + key);
-      var val = $('macro-' + key + '-value');
-      if (!slider) return;
-      slider.value = String(state.session.macros[key]);
-      if (val) val.textContent = state.session.macros[key] + '%';
-    });
-    // Step 4B (v13.5): the fine tone sliders + one switch per
-    // sound part. The switches show whether the part is ON
-    // (checked = on, unchecked = bypassed/off).
-    TONE_KEYS.forEach(function (key) {
-      var slider = $('tone-' + key);
-      var val = $('tone-' + key + '-value');
-      if (!slider) return;
-      slider.value = String(state.session.tone[key]);
-      if (val) val.textContent = state.session.tone[key] + '%';
-    });
-    BYPASS_KEYS.forEach(function (key) {
-      if (key === 'nr') return; // the Cut background noise switch above
-      var cb = $('bypass-' + key);
-      if (cb) cb.checked = !bypass[key];
-    });
-  }
+  /* v33 (QUEUE #115) — renderChainCard is gone with the Setup
+   * controls: it synced the three sound toggles (#chain-on /
+   * #chain-nr / #light-live) that Denasse rejected ("I don't want
+   * to see no buttons at all"). Its only caller was showSetup.
+   * The sound is always the champion recipe now (macros/tone all
+   * 50, all 8 parts on, noise cut off — the session defaults),
+   * and the pipeline reads the session, not the DOM. The per-part
+   * controls still exist on the studio screen's sound strip
+   * (renderFxPanel) and the take sheet.
+   */
 
   function showSetup() {
     $('studio-view').style.display = 'none';
     $('setup-view').style.display = 'flex';
-    // Step 4A (v13.4): the studio-sound card always shows the
-    // song's current knobs + switches (a reload re-reads them).
-    renderChainCard();
-    renderPerfReadout();
-    // v19 (QUEUE #25): the sent-takes list is rebuilt every time
-    // Setup opens, so a take sent since last time shows up.
-    renderSentTakesList();
+    // v33 (QUEUE #115): Setup is one read-only screen — no
+    // controls, no scroll. The song name, the sound and the
+    // headphones are plain text; the system handles them. Nothing
+    // here is tappable except Back. (Denasse, Nov 27: "I don't
+    // want to see no buttons at all... You go to Voloco on the
+    // studio there's no scrolling.")
+    var nameEl = $('setup-song-name');
+    if (nameEl) nameEl.textContent = state.session.name || 'New Song';
+    var soundEl = $('setup-sound-status');
+    if (soundEl) soundEl.textContent = state.session.chainOn ? 'Full studio sound' : 'Light live sound';
+    var hpEl = $('setup-headphones-status');
+    if (hpEl) hpEl.textContent = PS.store.outputMode() === 'speaker' ? 'Phone speaker' : 'Headphones';
   }
 
-  /* v13.8-light — the probe's numbers in plain words, in Setup.
-   * The same numbers PS.perfReport() returns for the CDP harness.
-   * On his phone this is the only way to see whether recording
-   * is actually smooth — no computer needed.
+  /* v32 (QUEUE #110) — renderPerfReadout is gone with the Setup
+   * simplify: the diagnostic "Speed check" line is not something
+   * he reads (he is not an engineer), and the perf probe itself
+   * (PS.perfReport, for the CDP harness) is untouched.
    */
-  function renderPerfReadout() {
-    var line = $('perf-readout');
-    if (!line || !window.PSPerf) return;
-    var r = PSPerf.report();
-    var bits = [];
-    if (r.paints['first-contentful-paint'] !== undefined) bits.push('First paint ' + Math.round(r.paints['first-contentful-paint']) + ' ms');
-    if (r.measures['record-start-ms'] !== undefined) bits.push('Last take started in ' + Math.round(r.measures['record-start-ms']) + ' ms');
-    if (r.blocks.blocks > 1) bits.push(r.blocks.blocks + ' mic blocks, longest gap ' + Math.round(r.blocks.gapMaxMs) + ' ms');
-    bits.push(r.longtasks.count + ' slow moments over ' + Math.round(r.longtasks.totalMs) + ' ms');
-    bits.push(r.frames.dropped50 + ' dropped frames');
-    line.textContent = 'Speed check: ' + bits.join(' — ') + '.';
-  }
 
   function showStudio() {
     $('setup-view').style.display = 'none';
@@ -6859,66 +7009,17 @@
     $('setup-open').addEventListener('click', showSetup);
     $('setup-song').addEventListener('click', showSetup);
     $('setup-back').addEventListener('click', showStudio);
-    // Step 4A (v13.4): the studio-sound card. A knob drag retunes
-    // every live chain at once when it settles (broadcastTune);
-    // the switches save + broadcast on the tap.
-    $('chain-on').addEventListener('change', function () {
-      state.session.chainOn = $('chain-on').checked;
-      saveSessions();
-      broadcastTune();
-    });
-    $('chain-nr').addEventListener('change', function () {
-      // Step 4B (v13.5): the noise cut is one entry in the bypass
-      // set now — checked means the cut is ON (bypass off).
-      state.session.bypass.nr = !$('chain-nr').checked;
-      saveSessions();
-      broadcastTune();
-    });
-    // v13.8-light: flipping the switch re-parks the live chains
-    // in place (applyChainSettings recomputes light on every
-    // setSound) — no rebuild, no click.
-    $('light-live').addEventListener('change', function () {
-      setLightLive($('light-live').checked);
-    });
-    // Step 4B (v13.5): the fine tone sliders + the sound-part
-    // switches. A slider drag retunes every live chain at once
-    // when it settles (broadcastTune); the switches save +
-    // broadcast on the tap — same as the five knobs.
-    TONE_KEYS.forEach(function (key) {
-      var slider = $('tone-' + key);
-      var val = $('tone-' + key + '-value');
-      slider.addEventListener('input', function () {
-        state.session.tone[key] = Number(slider.value);
-        if (val) val.textContent = slider.value + '%';
-      });
-      slider.addEventListener('change', function () {
-        state.session.tone[key] = Number(slider.value);
-        saveSessions();
-        broadcastTune();
-      });
-    });
-    BYPASS_KEYS.forEach(function (key) {
-      if (key === 'nr') return; // the Cut background noise switch above
-      var cb = $('bypass-' + key);
-      cb.addEventListener('change', function () {
-        state.session.bypass[key] = !cb.checked;
-        saveSessions();
-        broadcastTune();
-      });
-    });
-    MACRO_KEYS.forEach(function (key) {
-      var slider = $('macro-' + key);
-      var val = $('macro-' + key + '-value');
-      slider.addEventListener('input', function () {
-        state.session.macros[key] = Number(slider.value);
-        if (val) val.textContent = slider.value + '%';
-      });
-      slider.addEventListener('change', function () {
-        state.session.macros[key] = Number(slider.value);
-        saveSessions();
-        broadcastTune();
-      });
-    });
+    // v33 (QUEUE #115) — the Setup sound toggles (#chain-on /
+    // #chain-nr / #light-live) are gone: Denasse rejected every
+    // button and check on Setup. The sound is always the champion
+    // recipe (macros/tone all 50, all 8 parts on, noise cut off —
+    // the session defaults) and the pipeline reads the session.
+    // An unguarded .addEventListener on a null element throws and
+    // would kill the whole wire(), so these listeners go with the
+    // elements. The same controls still exist on the studio
+    // screen's sound strip and the take sheet, wired by their own
+    // builders. (The v32 fine-tone/macro wire loops were already
+    // removed the same way.)
     $('transport-record').addEventListener('click', function () {
       if (window.PSPerf) PSPerf.mark('record-tap');
       if (state.recording) stopTakeRequest();
@@ -7097,61 +7198,45 @@
       buildComp(state.compTrack);
     });
 
-    $('song-name').addEventListener('change', function () {
-      state.session.name = $('song-name').value.trim() || 'New Song';
-      saveSessions();
-      renderSession();
-    });
-    $('session-select').addEventListener('change', function () {
-      switchSession($('session-select').value);
-    });
-    $('new-song').addEventListener('click', function () {
-      var name = window.prompt('Name the new song:', 'New Song');
-      if (name === null) return;
-      var session = PS.store.makeSession(name.trim() || 'New Song');
-      state.sessions.push(session);
-      saveSessions();
-      switchSession(session.id);
-    });
+    // v33 (QUEUE #115) — the Setup song controls (#song-name
+    // input, #session-select dropdown, #new-song button) are gone:
+    // Setup shows the song name as plain text and nothing here is
+    // tappable. Song-switching needs a home on the timeline screen
+    // (follow-up). The session still switches via switchSession()
+    // (called from boot / the take sheet); renderSession() keeps
+    // the plain-text name in sync.
     $('beat-file').addEventListener('change', function () {
       onBeatFilePicked($('beat-file').files[0]);
       $('beat-file').value = '';
     });
-    $('mode-headphones').addEventListener('change', function () {
-      PS.store.setOutputMode('headphones');
-      renderCalibration();
-      updateTransport();
-      updateMonitor();
-    });
-    $('mode-speaker').addEventListener('change', function () {
-      PS.store.setOutputMode('speaker');
-      renderCalibration();
-      updateTransport();
-      updateMonitor();
-    });
-    $('cal-measure').addEventListener('click', startCalibration);
+    // v33 (QUEUE #115) — the Setup headphone buttons
+    // (#mode-headphones-btn / #mode-speaker-btn) are gone: Setup
+    // shows the mode as plain text ("Headphones" / "Phone
+    // speaker") and nothing here is tappable. The mode stays
+    // whatever is stored (PS.store.outputMode(), default
+    // 'headphones'); the audio routing reads it. (The v32
+    // two-big-buttons wiring is removed the same way.)
     $('error-dismiss').addEventListener('click', dismissError);
     $('error-retry').addEventListener('click', retryFailedTakeSave);
     // Phase 0 wiring.
-    $('lab-open').addEventListener('click', openLab);
     $('lab-back').addEventListener('click', closeLab);
     $('lab-run').addEventListener('click', startLabRun);
     $('ideas-btn').addEventListener('click', toggleIdeas);
-    $('backup-btn').addEventListener('click', backupAllTakes);
-    // v13.2 (item 3) — check a backup against its list.
-    $('backup-check-btn').addEventListener('click', checkBackupFiles);
-    // v19 (QUEUE #25): clear only the takes already marked sent.
-    $('clear-sent-btn').addEventListener('click', clearSentTakes);
+    // v33 (QUEUE #115) — #lab-open, #backup-btn and
+    // #clear-sent-btn are gone from Setup (no buttons on Setup).
+    // The lab view itself stays (openLab/closeLab/startLabRun
+    // still exist); backupAllTakes stays in app.js (the Drive
+    // auto-return still backs up rendered masters); clearSentTakes
+    // stays exposed as PS.clearSentTakes for the CDP tests.
     $('home-banner-dismiss').addEventListener('click', function () {
       PS.store.dismissBanner('home-screen');
       $('home-banner').style.display = 'none';
     });
     $('recover-keep').addEventListener('click', function () { recoverOrphan(true); });
     $('recover-delete').addEventListener('click', function () { recoverOrphan(false); });
-    $('cal-new-device-dismiss').addEventListener('click', function () {
-      state.newDeviceDetected = false;
-      renderCalibration();
-    });
+    // v32 (QUEUE #110) — the new-device banner is gone; the
+    // status line in the headphones card carries the prompt now
+    // (renderCalibration), so there is no dismiss button to wire.
 
     var resizeTimer = null;
     window.addEventListener('resize', function () {
@@ -7179,6 +7264,14 @@
       renderAll();
     });
   }
+  PS.switchSession = switchSession; // v33: exposed for the CDP tests (the Setup song dropdown is gone; tests switch songs programmatically)
+  PS.newSong = function (name) { // v33: what the Setup #new-song button did — create a song and switch to it live (the button is gone; tests call this)
+    var s = PS.store.makeSession(name || 'New Song');
+    state.sessions.push(s);
+    saveSessions();
+    switchSession(s.id);
+    return s.id;
+  };
 
   // ---------------------------------------------------------------- orphan recovery (Step 1B)
 
@@ -7214,6 +7307,12 @@
             partial: !!m.interrupted,
             savedUpToSeconds: m.savedUpToSeconds || null,
             narrowbandWarn: !!m.narrowbandWarn,
+            // v37 (QUEUE #23): clipping, backfilled from the stored
+            // record like the rest — a take whose list entry was
+            // lost in a forced close keeps its clip flag on the row.
+            clipped: !!m.clipped,
+            takePeakDbfs: typeof m.takePeakDbfs === 'number' ? m.takePeakDbfs : null,
+            takeClippedSamples: typeof m.takeClippedSamples === 'number' ? m.takeClippedSamples : null,
             outputLatencyDrift: !!m.outputLatencyDrift,
             recovered: !!m.recovered,
             // v28 (QUEUE #66): the frozen beat identity, backfilled
@@ -7481,7 +7580,7 @@
       takeAnalysis = PS.routelab.analyzeTake(samples, sr);
     } catch (e) {
       if (!recoverError) recoverError = e;
-      takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null };
+      takeAnalysis = { narrowbandWarn: false, fractionAbove7k5: null, bandwidthHz: null, rmsDb: null, peakDbfs: null, clippedSamples: null, clipped: false };
     }
     // v25 (QUEUE #70): a recovered take with no sound in it warns
     // the same way — the save .then below reads this after the
@@ -7566,6 +7665,10 @@
       narrowbandFractionAbove7k5: takeAnalysis.fractionAbove7k5,
       takeBandwidthHz: takeAnalysis.bandwidthHz,
       takeRmsDb: takeAnalysis.rmsDb,
+      // v37 (QUEUE #23): clipping at capture — the recovery runs the same analysis.
+      takePeakDbfs: takeAnalysis.peakDbfs,
+      takeClippedSamples: takeAnalysis.clippedSamples,
+      clipped: takeAnalysis.clipped,
       // v25 (QUEUE #70): no sound in the recovered take.
       silentTake: silentTake,
       outputLatencySeconds: null,
@@ -7640,6 +7743,10 @@
         partial: true,
         savedUpToSeconds: durationSeconds,
         narrowbandWarn: takeAnalysis.narrowbandWarn,
+        // v37 (QUEUE #23): clipping — the row reads it from here.
+        clipped: takeAnalysis.clipped,
+        takePeakDbfs: takeAnalysis.peakDbfs,
+        takeClippedSamples: takeAnalysis.clippedSamples,
         // v25 (QUEUE #70): no sound in the recovered take.
         // (QUEUE #59): recovered without an at-record stamp.
         silentTake: silentTake,
@@ -7681,6 +7788,10 @@
       // never dropped.
       if (silentTake) {
         showError('That take has no sound in it — the mic heard nothing. Check the mic and record it again.');
+      }
+      // v37 (QUEUE #23): a clipped recovered take warns the same way.
+      if (takeAnalysis.clipped) {
+        showError('That take clipped — the loudest peaks hit the limit. Back off the mic a little and record it again.');
       }
       showRecoverBar();
     }).catch(function (err) {

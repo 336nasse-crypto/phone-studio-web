@@ -13,6 +13,13 @@
  *     time: AudioWorkletGlobalScope.currentTime of the first sample
  *     samples: Float32Array of mono PCM (transferable)
  *     peak: max absolute value in the batch (level meter)
+ *   worklet -> main: { type: 'flushed' } — v36 (QUEUE #34): posted
+ *     after the 'stop' flush, so the main thread knows every block
+ *     the worklet will ever post has already been posted (port order
+ *     puts the flush block ahead of this ack) and the stop drain can
+ *     assemble. Posted even when the partial batch is empty, so a
+ *     stop with nothing pending still acks instead of hanging the
+ *     drain on its timeout.
  */
 class RecorderProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -32,6 +39,10 @@ class RecorderProcessor extends AudioWorkletProcessor {
       } else if (data.type === 'stop') {
         this.recording = false;
         this.flush();
+        // v36 (QUEUE #34): the stop drain waits on this ack — it
+        // lands after the flush block on the same port, so the main
+        // thread can assemble knowing nothing more is coming.
+        this.port.postMessage({ type: 'flushed' });
       } else if (data.type === 'reset') {
         this.batchLength = 0;
         this.batchPeak = 0;

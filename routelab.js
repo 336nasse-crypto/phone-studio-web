@@ -214,6 +214,31 @@
     };
   }
 
+  /* v37 (QUEUE #23): clipping — the rail threshold. A sample at
+   * |x| >= 0.999 is at the digital limit: the take distorted at
+   * capture, and no software recovers it (same class as the
+   * narrowband warning). One threshold for the live meter, the
+   * take analysis, and the logger scan — never a second copy.
+   */
+  var CLIP_PEAK_THRESHOLD = 0.999;
+
+  /* Peak + full-scale count for a finished take's samples. */
+  function clipStats(samples) {
+    var peak = 0;
+    var clippedSamples = 0;
+    for (var i = 0; i < samples.length; i++) {
+      var a = samples[i] < 0 ? -samples[i] : samples[i];
+      if (a > peak) peak = a;
+      if (a >= CLIP_PEAK_THRESHOLD) clippedSamples++;
+    }
+    return {
+      peak: peak,
+      peakDbfs: peak > 0 ? 20 * Math.log10(peak) : null,
+      clippedSamples: clippedSamples,
+      clipped: clippedSamples > 0
+    };
+  }
+
   /* One-call take analysis (used right after a take finishes):
    * bandwidth of the take, the 12 kHz energy share, and the
    * narrowband warning. The bandwidth of a sung take is a lower
@@ -224,12 +249,16 @@
   function analyzeTake(samples, sampleRate) {
     var bw = bandwidth(samples, sampleRate);
     var nb = narrowbandWarning(samples, sampleRate);
+    var clip = clipStats(samples);
     return {
       bandwidthHz: bw.bandwidthHz,
       energyAbove12kHz: bw.energyAbove12kHz,
       narrowbandWarn: nb.warn,
       fractionAbove7k5: nb.fractionAbove7k5,
-      rmsDb: nb.rmsDb
+      rmsDb: nb.rmsDb,
+      peakDbfs: clip.peakDbfs,
+      clippedSamples: clip.clippedSamples,
+      clipped: clip.clipped
     };
   }
 
@@ -243,6 +272,8 @@
     // narrowband check already uses for "the take must have real
     // content". Exported so app.js never hard-codes a second copy.
     NARROWBAND_MIN_RMS_DB: NARROWBAND_MIN_RMS_DB,
+    CLIP_PEAK_THRESHOLD: CLIP_PEAK_THRESHOLD,
+    clipStats: clipStats,
     fft: fft,
     magnitudeSpectrum: magnitudeSpectrum,
     bandwidth: bandwidth,
