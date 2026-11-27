@@ -674,12 +674,55 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
-#volume-value {
-  flex: 0 0 44px;
-  text-align: right;
+
+/* v40 (QUEUE #124): per-layer volume — a + / − step control on the
+ * layer row itself, tap-based, NOT a slider. A narrow column at the
+ * row's RIGHT edge (after the lane, like .row-more): + on top, the
+ * level, − below — stacked, ~52 px tall, so it fits the row height
+ * without touching the label. The value is the level in plain
+ * percent (100% is the level the layer recorded at). Do NOT move
+ * this into .row-label: the label runs ~60 px in a 64 px row
+ * already (v13.3), and the stacked control in the label clipped
+ * the row name by 11 px (cdp-v133 check 0 caught it in the v163
+ * batch). */
+.layer-vol {
+  flex: 0 0 36px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 2px 0;
+}
+.layer-vol-btn {
+  flex: 0 0 18px;
+  width: 28px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
   font-size: 14px;
   font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.layer-vol-btn:active {
+  background: var(--track-accent, var(--purple));
+  color: #fff;
+}
+.layer-vol-value {
+  flex: 0 0 auto;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
+  color: var(--text);
+  white-space: nowrap;
 }
 
 /* ------------------------------------------------------------ Phase 1 (v12) */

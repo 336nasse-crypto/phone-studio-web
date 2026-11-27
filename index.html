@@ -178,9 +178,12 @@
     <p id="fx-wave-hint" class="muted small">Sing to see your voice move here.</p>
     <!-- v29 (mockup 12): the sound strip lives here now, on the sound
          screen — not on the timeline. The ids stay the same
-         (#preset-pills, #strength-slider, #volume-slider) so the
-         sound still works the same way, and the boot checks still
-         count five pills. -->
+         (#preset-pills, #strength-slider) so the sound still works
+         the same way, and the boot checks still count five pills.
+         v40 (QUEUE #124): the master Volume slider is gone —
+         Denasse refuses sliders; per-layer volume is the + / −
+         on each layer row, and the overall volume is the phone's
+         hardware buttons. -->
     <div id="preset-strip" class="preset-strip">
       <div id="preset-pills" class="preset-pills" role="group" aria-label="How it sounds"></div>
       <div class="strength-row">
@@ -189,11 +192,6 @@
         <input id="strength-slider" type="range" min="0" max="100" value="100" aria-label="How much tune">
         <span class="range-end">a lot</span>
         <span id="strength-value">100%</span>
-      </div>
-      <div class="strength-row">
-        <label for="volume-slider">Volume</label>
-        <input id="volume-slider" type="range" min="0" max="100" value="100" aria-label="Playback volume">
-        <span id="volume-value">100%</span>
       </div>
     </div>
     <div class="fx-key-row">

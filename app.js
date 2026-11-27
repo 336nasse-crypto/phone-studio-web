@@ -92,6 +92,8 @@
     session: null,
     beat: null, // { buffer, mono, duration, sampleRate, fileName, originalName, peaks }
     beatLoading: false, // a beat file is being read + decoded (row shows "Loading…")
+    beatLoadPromise: null, // v39 (QUEUE #123): the in-flight beat load (boot / song switch / import) — Play waits on it
+    playWaiting: false, // v39 (QUEUE #123): a Play tap is waiting for the beat load to land
     beatImportSeq: 0, // v27 (QUEUE #87): generation counter — each beat import stamps its own number; a late landing from an older import drops instead of replacing the newer beat
     calibrations: {},
     recording: null, // { track, handle, anchorTime, startWall, timer, interrupted }
@@ -587,7 +589,18 @@
     // survived the same kill). The blob is the source of truth, so
     // the beat is re-attached before the load below; a removed beat
     // can never come back this way (removeBeat deletes the row).
-    return reattachOrphanBeat().then(function () {
+    // v39 (QUEUE #123): the boot / song-switch load is the load Play
+    // waits on — store it the moment it starts (before the reattach,
+    // so a Play tap in that window can wait on it), and give it the
+    // same 30 s timeout the fresh-import path has. A decode that
+    // hangs on iOS used to leave Play dead for the whole session
+    // with no message — now the timeout surfaces it in plain words,
+    // and the inner chain keeps running, so a late landing still
+    // sets state.beat and clears the error below. The stored
+    // promise always resolves (the timeout is caught here), so the
+    // boot / song-switch .then(renderBeat / renderAll) still runs
+    // on a failure.
+    var load = reattachOrphanBeat().then(function () {
     if (!state.session.beatFileName) return Promise.resolve();
     // v25 (QUEUE #85): the boot / song-switch load is a load too —
     // the row must show "loading…" and the record button must stay
@@ -624,6 +637,13 @@
           originalName: state.session.beatOriginalName,
           peaks: null
         };
+        // v39 (QUEUE #123): a late landing after the 30 s timeout
+        // fired clears the timeout error — but only the beat-load
+        // messages, never an unrelated error (e.g. a failed-save
+        // retry) that happens to be showing.
+        var shown = $('error-text').textContent || '';
+        if (shown === 'The beat took too long to load. Try tapping the Beat row again.' ||
+            shown === 'The beat could not be loaded. Import it again.') clearError();
         // A beat saved before Step 9A has no detection stored —
         // listen to it once now (the same pass as a fresh import).
         if (!state.session.beatKey && !state.session.beatBpm) {
@@ -641,6 +661,11 @@
       updateTransport();
     });
     }); // v26 (QUEUE #97): closes the reattachOrphanBeat wrapper
+    state.beatLoadPromise = withTimeout(load, 30000, 'The beat took too long to load. Try tapping the Beat row again.').catch(function (err) {
+      console.warn('Beat load timed out:', err);
+      showError(err && err.message ? err.message : 'The beat took too long to load. Try tapping the Beat row again.');
+    });
+    return state.beatLoadPromise;
   }
 
   /* v26 (QUEUE #97): re-attach an orphaned beat row. The beat
@@ -738,7 +763,11 @@
         setTimeout(function () { detectBeatKeyTempo(); }, 0);
       });
     });
-    withTimeout(importJob, 30000, 'The beat took too long to load. Try tapping the Beat row again.').then(function () {
+    // v39 (QUEUE #123): the import is a beat load too — store it so
+    // a Play tap during an import waits on the same promise. The
+    // chained .then/.catch below settle it resolved in both paths,
+    // so awaiting it never throws.
+    state.beatLoadPromise = withTimeout(importJob, 30000, 'The beat took too long to load. Try tapping the Beat row again.').then(function () {
       // v27 (QUEUE #87): a newer import owns the loading state now — a
       // stale chain must not clear it (or re-enable Play) mid-import.
       if (seq !== state.beatImportSeq) return;
@@ -1199,6 +1228,30 @@
       allowed: !routeIsSlow(),
       mode: PS.store.outputMode()
     };
+  };
+  // v39 (QUEUE #123): exposed for the CDP tests only (cdp-v162 reads
+  // the beat-load state + the Play-wait flag) — the play path reads
+  // state itself; nothing else reads this handle.
+  PS._beatState = function () {
+    return {
+      loading: state.beatLoading,
+      loaded: !!state.beat,
+      waiting: state.playWaiting,
+      playing: !!state.playingStop
+    };
+  };
+  // v40 (QUEUE #124): exposed for the CDP tests only (cdp-v163 reads
+  // the stored level + the live gain per layer) — the play path reads
+  // the engine gains itself; nothing else reads this handle.
+  PS._layerVolumes = function () {
+    var out = {};
+    trackKinds().concat(['beat']).forEach(function (k) {
+      out[k] = {
+        stored: PS.store.layerVolume(state.session, k),
+        live: PS.audio.layerGainValue(k)
+      };
+    });
+    return out;
   };
 
   function startLabRun() {
@@ -1724,7 +1777,7 @@
         // Step 4A (v13.4): it gets the full vocal chain, not just
         // the tune — a guide vocal should sound like the finished
         // take, room and all.
-        tuneNodeFor: function (ctx, sound) { return makeVocalChain(ctx, false, sound, PS.audio.outputNode() || ctx.destination); },
+        tuneNodeFor: function (ctx, sound, kind) { return makeVocalChain(ctx, false, sound, PS.audio.layerGainFor(kind || 'lead') || PS.audio.outputNode() || ctx.destination); },
         delaySeconds: delaySeconds,
         // Step 6C (v13.3): loop the beat (and any overdub that
         // reaches the part) while this take records — the app
@@ -1918,7 +1971,7 @@
             // in the song, so the engine can start it late — a
             // loop pass or a best-of take used as a guide vocal
             // lines up with the beat instead of playing from 0.
-            var item = { buffer: buffer, sound: sound, songOffsetSeconds: take ? (take.songOffsetSeconds || 0) : 0 };
+            var item = { kind: kind, buffer: buffer, sound: sound, songOffsetSeconds: take ? (take.songOffsetSeconds || 0) : 0 };
             state.overdubCache[takeId] = item;
             return item;
           });
@@ -1941,6 +1994,30 @@
     if (PS.audio && typeof PS.audio.micAlive === 'function' && !PS.audio.micAlive()) {
       finishTake(true, 'mic-disconnected');
       return;
+    }
+    // v41 (QUEUE #42): liveness watchdog — the mic track can stay
+    // live while the audio flow stalls (page-visible interruption:
+    // Siri, an alarm, an audio-route takeover; a suspended context
+    // or a stalled worklet posts no blocks). The micAlive poll
+    // above cannot see it, so watch the block flow itself: no block
+    // for > 2 s ends the take flagged interrupted, the same path as
+    // a dead mic — the pre-stall audio is saved, he re-sings instead
+    // of singing into a dead take. No auto-resume: a resume without
+    // the watchdog would leave the hole invisible.
+    var lastBlockAt = PS.audio && typeof PS.audio.captureLastBlockAt === 'function'
+      ? PS.audio.captureLastBlockAt() : null;
+    if (lastBlockAt !== null) {
+      var blockGapMs = Date.now() - lastBlockAt;
+      if (blockGapMs > 2000) {
+        finishTake(true, 'audio-interrupted');
+        return;
+      }
+      // v41 (QUEUE #42): meter decay — setMeter is only called from
+      // the onBlock path, so on a stall the bar freezes at its last
+      // width. Drop it to zero within one tick of a > 100 ms gap,
+      // so a stall is visible on the meter, not just the waveform.
+      // setMeter's signature is unchanged; the decay is a caller-side call.
+      if (blockGapMs > 100) setMeter(0);
     }
     var elapsed = (Date.now() - state.recording.startWall) / 1000;
     var label = $('record-timer');
@@ -2287,6 +2364,14 @@
         // there was no beat.
         beatSampleRate: rec.beatSampleRate,
         durationSeconds: durationSeconds,
+        // v41 (QUEUE #42): wall-clock length of the take, next to
+        // the sample-derived duration — a stall is detectable
+        // post-hoc even if the watchdog is bypassed (wall exceeds
+        // samples by ~ the stall). An addition, not a replacement:
+        // durationSeconds / savedUpToSeconds keep their meanings.
+        // rec.startWall, not state.recording: finishTake nulled it
+        // at the top, rec is the same object.
+        wallDurationSeconds: (Date.now() - rec.startWall) / 1000,
         leadInSamples: leadInSamples,
         delaySamples: delaySamples,
         delayMilliseconds: delaySamples / sr * 1000,
@@ -2309,6 +2394,10 @@
         calibrated: calibrated,
         compensationSource: compensationSource,
         interrupted: !!interrupted,
+        // v41 (QUEUE #42): why the take ended early, in plain code
+        // ('mic-disconnected' / 'audio-interrupted' / null) — the
+        // saved record names the cause, not just the flag.
+        interruptedReason: rec.interruptedReason || null,
         // Step 1B — the take is durable from its chunks up to the last
         // chunk (v36, QUEUE #34: the stop flushes the final partial
         // chunk too, so the durable span runs to the end of the take —
@@ -2510,17 +2599,18 @@
           // before the silent-take branch, because a take cut by a
           // dead mic has no sound at the end for exactly this reason.
           showError('The mic disconnected — your take was saved up to the disconnect.');
+        } else if (rec.interruptedReason === 'audio-interrupted') {
+          // v41 (QUEUE #42): the audio flow stalled mid-take — the
+          // phone took the audio (Siri, an alarm, a route change).
+          // Said before the silent-take branch for the same reason
+          // as the mic branch: a take cut by a stall ends in
+          // nothing, and that nothing is the stall's fault.
+          showError('The audio cut out — your take was saved up to where it stopped. Record it again to get the rest.');
         } else if (silentTake) {
           // v25 (QUEUE #70): saved, flagged, never dropped — the
           // v21 rule. The take stays in the list with its "No sound"
           // row bit; the message says what to do next.
           showError('That take has no sound in it — the mic heard nothing. Check the mic and record it again.');
-        } else if (takeAnalysis.narrowbandWarn) {
-          showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
-        } else if (drifted) {
-          // v37 (QUEUE #23): the drift note stays first when the take also
-          // clipped — the clip rides along, it never replaces the message.
-          showError('The timing may have drifted since you measured these headphones — measure them again before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
         } else if (chunkWriteFailed) {
           // v25 (QUEUE #82): the take itself saved whole from
           // memory — only the safety copy is partial. Said once,
@@ -2529,7 +2619,19 @@
           // v37 (QUEUE #23): same combined pattern as muffled — the
           // clip note appends, it never shadows this warning (the
           // v37 clip branch sat ahead of it and hid it — v148).
-          showError('Saved — but the phone ran out of space while recording, so the safety copy of this take is incomplete. The take itself saved from memory; free some space before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
+          // v42 (QUEUE #121): storage leads the soft warnings now —
+          // it is the harder failure (the safety copy is partial
+          // and the next take hits the same full disk), so it must
+          // never be shadowed. The muffled + drift + clip notes
+          // append instead of hiding: a take tripping both storage
+          // and muffled says both.
+          showError('Saved — but the phone ran out of space while recording, so the safety copy of this take is incomplete. The take itself saved from memory; free some space before the next take.' + (takeAnalysis.narrowbandWarn ? ' It also sounds muffled — your Bluetooth mic dropped to phone-call mode; switch to the phone mic or wired headphones for the lead vocal.' : '') + (drifted ? ' The timing may also have drifted since you measured these headphones — measure them again before the next take.' : '') + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
+        } else if (takeAnalysis.narrowbandWarn) {
+          showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
+        } else if (drifted) {
+          // v37 (QUEUE #23): the drift note stays first when the take also
+          // clipped — the clip rides along, it never replaces the message.
+          showError('The timing may have drifted since you measured these headphones — measure them again before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
         } else if (takeAnalysis.clipped) {
           // v37 (QUEUE #23): clipped, nothing else to say — said plainly, never gated.
           // Moved after drifted/storage: those warnings must not be shadowed.
@@ -2720,22 +2822,29 @@
         // v35 (QUEUE #32): the mic died mid-loop — the passes
         // saved are the ones sung before the disconnect.
         showError('The mic disconnected — your take was saved up to the disconnect.');
+      } else if (rec.interruptedReason === 'audio-interrupted') {
+        // v41 (QUEUE #42): the audio flow stalled mid-loop — the
+        // passes saved are the ones sung before the stall.
+        showError('The audio cut out — your take was saved up to where it stopped. Record it again to get the rest.');
       } else if (silentTake) {
         // v25 (QUEUE #70): the passes saved, flagged, never
         // dropped — same as a plain silent take.
         showError('That take has no sound in it — the mic heard nothing. Check the mic and record it again.');
+      } else if (chunkWriteFailed) {
+        // v25 (QUEUE #82): the passes saved whole from memory —
+        // only the safety copy is partial.
+        // v37 (QUEUE #23): same combined pattern as muffled — the
+        // clip note appends, it never shadows this warning.
+        // v42 (QUEUE #121): storage leads the soft warnings now —
+        // same reorder as finishTake: the harder failure first,
+        // muffled + drift + clip append instead of hiding.
+        showError('Saved — but the phone ran out of space while recording, so the safety copy of this take is incomplete. The passes themselves saved from memory; free some space before the next take.' + (takeAnalysis.narrowbandWarn ? ' It also sounds muffled — your Bluetooth mic dropped to phone-call mode; switch to the phone mic or wired headphones for the lead vocal.' : '') + (drifted ? ' The timing may also have drifted since you measured these headphones — measure them again before the next take.' : '') + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
       } else if (takeAnalysis.narrowbandWarn) {
         showError('That take sounds muffled — your Bluetooth mic dropped to phone-call mode and crushed the high end. Switch to the phone mic or wired headphones for the lead vocal, then record it again.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
       } else if (drifted) {
         // v37 (QUEUE #23): the drift note stays first when the take also
         // clipped — the clip rides along, it never replaces the message.
         showError('The timing may have drifted since you measured these headphones — measure them again before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
-      } else if (chunkWriteFailed) {
-        // v25 (QUEUE #82): the passes saved whole from memory —
-        // only the safety copy is partial.
-        // v37 (QUEUE #23): same combined pattern as muffled — the
-        // clip note appends, it never shadows this warning.
-        showError('Saved — but the phone ran out of space while recording, so the safety copy of this take is incomplete. The passes themselves saved from memory; free some space before the next take.' + (takeAnalysis.clipped ? ' It also clipped — the loudest peaks hit the limit, so back off the mic a little too.' : ''));
       } else if (takeAnalysis.clipped) {
         // v37 (QUEUE #23): clipped, nothing else to say — said plainly, never gated.
         // Moved after drifted/storage: those warnings must not be shadowed.
@@ -2812,6 +2921,12 @@
         calibrated: calibrated,
         compensationSource: compensationSource,
         interrupted: !!rec.interrupted,
+        // v41 (QUEUE #42): why the recording ended early — the
+        // reason is per-recording, so every pass carries it. (No
+        // wallDurationSeconds here: the wall belongs to the whole
+        // loop recording, not to one pass — a pass's wall would
+        // always exceed its samples by the other passes.)
+        interruptedReason: rec.interruptedReason || null,
         // The chunks belong to the whole loop recording, not to
         // one pass — the count is the recording's, and a pass is
         // complete in memory, so it is saved up to its full length.
@@ -3005,6 +3120,21 @@
     return found;
   }
 
+  /* v40 (QUEUE #124): which layer a take belongs to — the take
+   * plays through that layer's gain. Falls back to the selected
+   * layer (a take is always found in practice; the fallback only
+   * keeps a stale id from playing silent).
+   */
+  function takeKindOf(takeId) {
+    var found = null;
+    trackKinds().forEach(function (kind) {
+      var vocal = state.session.tracks[kind];
+      if (!vocal || found) return;
+      if (vocal.takes.some(function (x) { return x.id === takeId; })) found = kind;
+    });
+    return found || state.selectedTrack;
+  }
+
   function playTake(takeId) {
     if (state.playingStop) {
       var wasPlaying = state.playingTakeId;
@@ -3082,7 +3212,7 @@
           renderTracks();
           renderSheet();
           updateTransport();
-        }, sound, takeDelay).then(function (stopFn) {
+        }, sound, takeDelay, takeKindOf(takeId)).then(function (stopFn) {
           if (gen !== state.playGen) {
             // A newer play won — stop this one before it is heard.
             if (stopFn) stopFn();
@@ -3129,7 +3259,56 @@
     }
     // No take yet — play the beat alone, from the playhead, so the
     // singer can hear it and rehearse before recording.
-    if (state.beat) playBeatOnly();
+    if (state.beat) {
+      playBeatOnly();
+      return;
+    }
+    // v39 (QUEUE #123): on a cold first start the beat is still
+    // loading and there is no take yet — the old code did nothing
+    // here, silently, and updateTransport had the button disabled
+    // anyway, so the first Play tap of the day read as a broken app.
+    // If a beat load is in flight, Play waits for it and then plays
+    // the beat; if there is truly no beat, Play says so in plain
+    // words instead of a dead tap.
+    if (state.beatLoading || (state.beatLoadPromise && state.session && state.session.beatFileName)) {
+      waitForBeatThenPlay();
+      return;
+    }
+    showError('This song has no beat yet — import a beat, or record a take first.');
+  }
+
+  /* v39 (QUEUE #123): one Play tap waits for the in-flight beat load,
+   * then plays the beat from the playhead. The wait is capped (10 s)
+   * so a hung load becomes a plain-words message, never a stuck
+   * button; the song/beat guards swallow the wait if he switched
+   * songs or removed the beat mid-wait. One waiter only — a second
+   * tap while waiting is ignored (the button disables while waiting).
+   */
+  function waitForBeatThenPlay() {
+    if (state.playWaiting) return;
+    state.playWaiting = true;
+    updateTransport();
+    var sessionId = state.session ? state.session.id : null;
+    var beatFileName = state.session ? state.session.beatFileName : null;
+    var load = state.beatLoadPromise || Promise.resolve();
+    var cap = new Promise(function (resolve) { setTimeout(resolve, 10000); });
+    Promise.race([Promise.resolve(load).catch(function () { /* a failed load is a message, not a throw */ }), cap]).then(function () {
+      state.playWaiting = false;
+      updateTransport();
+      // Switched songs or removed the beat mid-wait — say nothing,
+      // the new song's own state is the truth now.
+      if (!state.session || state.session.id !== sessionId ||
+          state.session.beatFileName !== beatFileName) {
+        return;
+      }
+      if (state.beat) {
+        playBeatOnly();
+      } else if (state.beatLoading) {
+        showError('The beat is still loading — try Play again in a moment.');
+      } else {
+        showError('The beat could not be loaded. Import it again.');
+      }
+    });
   }
 
   /* Plays just the beat (no take to tune — the beat plays dry).
@@ -3165,7 +3344,9 @@
       var anchor = ctx.currentTime + 0.1;
       var player = ctx.createBufferSource();
       player.buffer = beatBuffer;
-      player.connect(PS.audio.outputNode() || ctx.destination);
+      // v40 (QUEUE #124): the beat alone plays through the beat's
+      // layer gain — the beat lane's + / − moves it.
+      player.connect(PS.audio.layerGainFor('beat') || PS.audio.outputNode() || ctx.destination);
       player.start(anchor);
       state.playingStartCtx = anchor;
       player.onended = function () {
@@ -4442,6 +4623,20 @@
       tone: clampTone(s.tone),
       chainOn: typeof s.chainOn === 'boolean' ? s.chainOn : true,
       setSound: function (sound2, resetChain) { applyChainSettings(chainObj, sound2, resetChain); },
+      /* v40 (QUEUE #124): re-point the chain's output at another
+       * layer's gain — the playback chain is shared across layers,
+       * so a take on another layer moves its output before it
+       * plays. The dry signal (highShelf) and the echo wet both
+       * move; the echo feedback loop (delayNode) is re-wired
+       * intact, so the tail is never cut. */
+      setOutput: function (node) {
+        var out = node || ctx.destination;
+        try { highShelf.disconnect(); } catch (e) { /* ignore */ }
+        highShelf.connect(delayNode);
+        highShelf.connect(out);
+        try { delayWet.disconnect(); } catch (e) { /* ignore */ }
+        delayWet.connect(out);
+      },
       disconnect: function () {
         [corrective, lowCut1, lowCut2, tune, chainNode, lowShelf, presence, highShelf,
          delayNode, delayLp, delayHp, delayWet, delayFb].forEach(function (n) {
@@ -4782,7 +4977,7 @@
    * beat is not delayed to match.) If the tune cannot start, the
    * take plays dry and he is told — never silently wrong.
    */
-  function playTakeTuned(takeBuffer, beatBuffer, onEnded, opts, takeDelaySeconds) {
+  function playTakeTuned(takeBuffer, beatBuffer, onEnded, opts, takeDelaySeconds, layerKind) {
     return ensureTuneModule().then(function (ctx) {
       // Step 3 — `opts` is the TAKE's sound; without it, the song's
       // current sound (the old behaviour). Step 4A (v13.4): the
@@ -4791,6 +4986,14 @@
       // chain is built once and re-sounded per take, with the tune
       // + chain state reset so the last take's tail never bleeds
       // into the next one.
+      // v40 (QUEUE #124): the chain's output runs through the
+      // take's layer gain (layerKind), the beat through the beat's
+      // — the chain is shared across layers, so a take on another
+      // layer re-points its output before it plays.
+      var layerGain = PS.audio.layerGainFor(layerKind || state.selectedTrack) ||
+        PS.audio.outputNode() || ctx.destination;
+      var beatGain = PS.audio.layerGainFor('beat') ||
+        PS.audio.outputNode() || ctx.destination;
       var sound = opts || {
         key: state.session.key,
         preset: state.session.preset,
@@ -4802,10 +5005,11 @@
         tone: copySessionTone()
       };
       if (!state.playbackChain) {
-        state.playbackChain = makeVocalChain(ctx, false, sound, PS.audio.outputNode() || ctx.destination);
+        state.playbackChain = makeVocalChain(ctx, false, sound, layerGain);
         state.playbackTune = state.playbackChain.tune; // full 7-voice chorus on playback
       } else {
         state.playbackChain.setSound(sound, true);
+        state.playbackChain.setOutput(layerGain);
       }
       var anchor = PS.audio.currentTime() + 0.1;
       var players = [];
@@ -4833,7 +5037,7 @@
       if (beatBuffer) {
         var beatPlayer = ctx.createBufferSource();
         beatPlayer.buffer = beatBuffer;
-        beatPlayer.connect(PS.audio.outputNode() || ctx.destination);
+        beatPlayer.connect(beatGain);
         beatPlayer.start(anchor);
         players.push(beatPlayer);
       }
@@ -4846,7 +5050,7 @@
     }).catch(function (err) {
       console.warn('Tuned playback failed, playing dry:', err);
       showError('The tune could not start — playing the take without the tune instead.');
-      return PS.audio.playTake(takeBuffer, beatBuffer, onEnded, takeDelaySeconds || 0);
+      return PS.audio.playTake(takeBuffer, beatBuffer, onEnded, takeDelaySeconds || 0, layerKind);
     });
   }
 
@@ -5434,6 +5638,71 @@
    * No three-dot menus on the rows — the takes live on their own
    * screen (the Takes button up top), and a block's Delete is on
    * the block itself. */
+  /* v40 (QUEUE #124): per-layer volume — a + / − step control ON
+   * the layer row itself, tap-based, NOT a slider (Denasse: "that's
+   * for you, that's not for me"). One tap moves the layer 25
+   * (0..150, default 100 — 100% is the level the layer recorded
+   * at). The level lives in the session (session.layerVolumes) so
+   * it survives a reload with the layer, and the engine applies it
+   * to the layer's own gain node live — a tap while a take plays
+   * rebalances what he hears right now. The buttons are real
+   * <button>s, so the lane's pointerdown handler (which returns
+   * early for buttons) never treats a volume tap as a select or a
+   * scrub, and the beat row's import-click never fires from one.
+   * PLACEMENT (v40 fix, after the v163 batch caught it): the
+   * control is a narrow column at the row's RIGHT edge, AFTER the
+   * lane — NOT in the label. The first build stacked it in the
+   * label and the label ran ~86 px in a 64 px row, clipping the
+   * row name by 11 px (cdp-v133 check 0, in-batch). The label
+   * stays at its v13.3 ~60 px (icon + name + sub), and the side
+   * column's stacked + / value / − (~52 px) fits the row height
+   * without touching the label.
+   */
+  function layerVolumeControl(kind) {
+    var wrap = el('div', 'layer-vol');
+    wrap.setAttribute('data-track', kind);
+    var name = kind === 'beat' ? 'Beat' : trackName(kind);
+    var minus = el('button', 'layer-vol-btn', '−');
+    minus.type = 'button';
+    minus.setAttribute('aria-label', name + ' quieter');
+    minus.setAttribute('data-track', kind);
+    minus.setAttribute('data-dir', '-1');
+    var value = el('span', 'layer-vol-value', String(PS.store.layerVolume(state.session, kind)) + '%');
+    value.setAttribute('data-track', kind);
+    var plus = el('button', 'layer-vol-btn', '+');
+    plus.type = 'button';
+    plus.setAttribute('aria-label', name + ' louder');
+    plus.setAttribute('data-track', kind);
+    plus.setAttribute('data-dir', '1');
+    [minus, plus].forEach(function (btn) {
+      btn.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        changeLayerVolume(kind, Number(btn.getAttribute('data-dir')));
+      });
+    });
+    wrap.appendChild(minus);
+    wrap.appendChild(value);
+    wrap.appendChild(plus);
+    return wrap;
+  }
+
+  function changeLayerVolume(kind, dir) {
+    var cur = PS.store.layerVolume(state.session, kind);
+    var next = PS.store.setLayerVolume(state.session, kind, cur + dir * 25);
+    saveSessions();
+    PS.audio.setLayerLevel(kind, next);
+    renderTracks();
+  }
+
+  /* v40 (QUEUE #124): hand the session's stored per-layer levels
+   * to the engine — at boot and on every song switch (renderAll
+   * runs both). Levels are remembered before any audio exists, so
+   * a layer gain built later starts at its stored level.
+   */
+  function applyLayerVolumes() {
+    PS.audio.setLayerLevels(PS.store.layerVolumes(state.session));
+  }
+
   function renderTracks() {
     var container = $('tracks');
     container.innerHTML = '';
@@ -5463,6 +5732,9 @@
       lane.appendChild(document.createElement('canvas'));
       renderTakeBlocks(lane, kind);
       row.appendChild(lane);
+      // v40 (QUEUE #124): the layer's own volume, on the layer row
+      // (right edge — NOT in the label; see layerVolumeControl).
+      row.appendChild(layerVolumeControl(kind));
       container.appendChild(row);
     });
 
@@ -5515,6 +5787,10 @@
     var beatLane = el('div', 'wave-lane');
     beatLane.appendChild(document.createElement('canvas'));
     beatRow.appendChild(beatLane);
+    // v40 (QUEUE #124): the beat's own volume, on the beat row —
+    // the beat is a layer like the vocals (right edge, not the
+    // label — see layerVolumeControl).
+    beatRow.appendChild(layerVolumeControl('beat'));
     if (!state.beat) {
       // v31 (mockup 12 fix): no floating "Import a beat" pill over
       // the lane — it covered the beat wave on Denasse's phone. The
@@ -6738,12 +7014,10 @@
     slider.value = String(state.session.strength);
     slider.disabled = state.session.preset === 'clean';
     $('strength-value').textContent = state.session.strength + '%';
-    // v13 — Volume: one slider for how loud the beat + takes play.
-    // (Speed is gone — the tune always runs at the preset's own
-    // retune time now.)
-    var volSlider = $('volume-slider');
-    volSlider.value = String(PS.store.volume());
-    $('volume-value').textContent = PS.store.volume() + '%';
+    // v40 (QUEUE #124): the master Volume slider is gone — Denasse
+    // refuses sliders, and the phone's hardware buttons are the
+    // overall volume now. (Speed is gone — the tune always runs at
+    // the preset's own retune time now.)
   }
 
   /* v13.2 (item 7) — one tap sets the whole sound: the preset AND
@@ -6784,18 +7058,8 @@
     broadcastTune();
   }
 
-  /* v13 — Volume: how loud the beat + takes play (0-100). Live
-   * while dragging; saved when released, and it stays where he
-   * left it across sessions. The engine holds the level even
-   * before any audio has started (PS.audio.setVolume remembers
-   * it until the master gain is built).
-   */
-  function setVolume(value) {
-    var v = Math.max(0, Math.min(100, Math.round(value)));
-    $('volume-value').textContent = v + '%';
-    PS.audio.setVolume(v / 100);
-  }
-
+  // v40 (QUEUE #124): setVolume is gone with the master slider —
+  // per-layer volume lives in changeLayerVolume / the layer gains.
   // ---------------------------------------------------------------- effects screen (Step 5, v13.6)
   //
   // One screen where the whole sound lives — the preset row, the
@@ -6933,6 +7197,7 @@
     renderCalibration();
     renderTracks();
     renderPresetStrip();
+    applyLayerVolumes(); // v40 (QUEUE #124): the song's per-layer levels to the engine — boot + song switch
     updateIdeasUI();
     // v33 (QUEUE #115): #wake-note (the screen-lock warning) is
     // gone from Setup — Setup shows only the song, the sound and
@@ -6961,7 +7226,13 @@
     rec.disabled = busy || state.startingTake || state.beatLoading;
     rec.classList.toggle('recording', !!state.recording);
     rec.setAttribute('aria-label', state.recording ? 'Stop' : 'Record');
-    play.disabled = busy || !!state.recording || (!playing && !take && !state.beat);
+    // v39 (QUEUE #123): Play stays tappable with no take and no beat —
+    // a tap while the beat loads waits for it, a tap on a beatless
+    // song says so in plain words (playSelected). A disabled button
+    // can never explain itself, and that was the dead Play on first
+    // start. It still disables while recording, calibrating, or
+    // while a Play tap is waiting for the load (transient).
+    play.disabled = busy || !!state.recording || !!state.playWaiting;
     play.innerHTML = playing ? STOP_SVG : PLAY_SVG;
     play.setAttribute('aria-label', playing ? 'Stop' : 'Play');
     // v31 (mockup 12 fix): the Send button left the transport bar
@@ -7081,16 +7352,10 @@
       setStrength(Number(this.value));
       saveSessions();
     });
-    // Volume slider (v13): live while dragging (he hears it
-    // change), saved when he lets go — and it stays where he left
-    // it next time he opens the app.
-    $('volume-slider').addEventListener('input', function () {
-      setVolume(Number(this.value));
-    });
-    $('volume-slider').addEventListener('change', function () {
-      setVolume(Number(this.value));
-      PS.store.setVolume(Number(this.value));
-    });
+    // v40 (QUEUE #124): the master Volume slider is gone — no
+    // listeners, no element. Per-layer volume is the + / − on
+    // each layer row (changeLayerVolume), and the overall volume
+    // is the phone's hardware buttons.
     $('sheet-close').addEventListener('click', closeTakeSheet);
     // v29: the takes view is a full screen, not a sheet — there is
     // no backdrop to tap, so the backdrop-click-to-close listener
@@ -7853,10 +8118,11 @@
     } else {
       setTimeout(function () { loadHeavyModules().then(function () { warmWorklets(); }); }, 800);
     }
-    // v13 — Volume: hand the saved level to the engine at boot so
-    // the first thing he plays is already at his volume (the engine
-    // remembers it until the master gain is built).
-    PS.audio.setVolume(PS.store.volume() / 100);
+    // v40 (QUEUE #124): no master volume to hand the engine at
+    // boot — the master is fixed at full, and the per-layer levels
+    // ride with the session (applyLayerVolumes in renderAll, which
+    // runs above). The phone's hardware buttons are the overall
+    // volume now.
     // v13.2 (item 8) — read the reference voice when one is
     // present (voice-reference.json next to the app). The loader
     // never throws: no file yet means null. v16: the wiring is

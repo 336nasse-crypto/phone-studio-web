@@ -30,8 +30,11 @@
  *   so iOS locks playback to the headphones; on stop it goes
  *   playback -> auto so iOS exits HFP/VPIO and restores full-
  *   bandwidth A2DP stereo. Safari's AudioSession API implements
- *   only `type` (no `state` — WebKit 283417); AudioContext.state is
- *   watched for interruptions instead.
+ *   only `type` (no `state` — WebKit 283417). AudioContext.state is
+ *   NOT watched for interruptions — the block flow is (v41, QUEUE
+ *   #42): capture.lastBlockAt stamps every worklet block, and
+ *   app.js ends the take flagged 'audio-interrupted' when no block
+ *   arrives for > 2 s.
  * - Takes are written to storage in 48,000-sample chunks WHILE
  *   recording (Step 1B): the onChunk callback fires once per chunk,
  *   so a killed take is recoverable from its chunks.
@@ -80,9 +83,18 @@
 
   var ctx = null;
   var workletReady = false;
-  var masterGain = null; // one gain for all PLAYBACK (beat + takes) — the volume bar (v13)
-  var monitorGain = null; // B2 (v13.1): the live monitor's own gain, tied to the same volume level — one bar means one loudness everywhere he hears sound
-  var volumeLevel = 1; // 0..1 — set by setVolume(), applied when the gain nodes are built
+  var masterGain = null; // one gain for all PLAYBACK — fixed at full (v40, QUEUE #124: the master slider is gone; the phone's hardware buttons are the overall volume)
+  var monitorGain = null; // B2 (v13.1): the live monitor's own gain, fixed at full like the master — one loudness everywhere he hears sound
+  var volumeLevel = 1; // v40: fixed at full — setVolume is gone (QUEUE #124); the level is remembered only so the gain nodes are built at 1.0
+  // v40 (QUEUE #124): one gain per layer kind ('lead', 'adlibs',
+  // 'harmonies', 'extra1'..., 'beat') — every playback player
+  // connects through its own layer's gain into masterGain, so one
+  // layer can be made louder than another. Built on demand the
+  // first time the layer plays; the level lives in layerLevels
+  // (kind -> percent, 0..150, default 100), seeded by the app from
+  // the session at boot / song switch, so a tap rebalances live.
+  var layerGains = {};
+  var layerLevels = {};
   var stream = null;
   var sourceNode = null;
   var workletNode = null;
@@ -129,12 +141,12 @@
         return ctx;
       });
     }).then(function () {
-      // The master gain for playback (v13): built once, fed by
-      // every playback player (beat + takes). B2 (v13.1): the live
-      // monitor gets its own gain at the SAME level — the volume
-      // bar used to leave his own live voice at full blast. The
-      // calibration clicks stay direct: they are a measurement,
-      // not a sound he listens to.
+      // The master gain for playback: built once, fed by every
+      // layer gain (v40 — the per-layer gains feed this, not the
+      // players directly). B2 (v13.1): the live monitor gets its
+      // own gain at the SAME level — fixed at full, like the
+      // master. The calibration clicks stay direct: they are a
+      // measurement, not a sound he listens to.
       if (!masterGain) {
         masterGain = ctx.createGain();
         masterGain.gain.value = volumeLevel;
@@ -149,19 +161,50 @@
     });
   }
 
-  /* Volume (v13): one level for all playback — the beat and the
-   * takes — and, since v13.1, the live monitor too (B2). 0..1.
-   * Safe to call before the context exists: the level is
-   * remembered and applied when the gain nodes are built.
+  /* Per-layer volume (v40, QUEUE #124): each layer's own gain into
+   * masterGain. Safe to call before the context exists for the
+   * level setters (the level is remembered and applied when the
+   * gain node is built); layerGainFor returns null with no context.
    */
-  function setVolume(v) {
-    volumeLevel = Math.max(0, Math.min(1, Number(v) || 0));
-    if (masterGain) masterGain.gain.value = volumeLevel;
-    if (monitorGain) monitorGain.gain.value = volumeLevel;
+  function layerGainFor(kind) {
+    var k = kind || 'lead';
+    if (!ctx) return null;
+    if (!layerGains[k]) {
+      var g = ctx.createGain();
+      g.gain.value = layerLevel(k) / 100;
+      g.connect(masterGain || ctx.destination);
+      layerGains[k] = g;
+    }
+    return layerGains[k];
   }
 
-  function volume() {
-    return volumeLevel;
+  function setLayerLevel(kind, pct) {
+    var k = kind || 'lead';
+    var v = Math.max(0, Math.min(150, Math.round(Number(pct) || 0)));
+    layerLevels[k] = v;
+    if (layerGains[k]) layerGains[k].gain.value = v / 100;
+    return v;
+  }
+
+  function layerLevel(kind) {
+    var k = kind || 'lead';
+    return (typeof layerLevels[k] === 'number') ? layerLevels[k] : 100;
+  }
+
+  function setLayerLevels(map) {
+    if (!map) return;
+    Object.keys(map).forEach(function (k) { setLayerLevel(k, map[k]); });
+  }
+
+  /* The live gain value for a layer (the AudioParam the players run
+   * through) — the stored level / 100 when the node does not exist
+   * yet. The CDP suite reads this, not the stored number, so the
+   * test proves the graph itself moves, not just the label.
+   */
+  function layerGainValue(kind) {
+    var k = kind || 'lead';
+    if (layerGains[k]) return layerGains[k].gain.value;
+    return layerLevel(k) / 100;
   }
 
   /* The node playback players connect to: the master gain once the
@@ -244,6 +287,16 @@
       if (tracks[i].readyState === 'live') return true;
     }
     return false;
+  }
+
+  /* v41 (QUEUE #42): when the last capture block arrived, or null
+   * when no capture is running / no block has arrived yet. The
+   * liveness watchdog in app.js updateRecordTimer reads this every
+   * 100 ms — a live mic track with no blocks for > 2 s is a stalled
+   * take, not a dead mic.
+   */
+  function captureLastBlockAt() {
+    return capture ? capture.lastBlockAt : null;
   }
 
   /* v35 (QUEUE #32): the current mic track, or null. The CDP
@@ -423,6 +476,13 @@
       return;
     }
     if (!capture || data.type !== 'block') return;
+    // v41 (QUEUE #42): liveness stamp — every block refreshes it.
+    // app.js updateRecordTimer reads it through
+    // captureLastBlockAt: a live mic track with no blocks for > 2 s
+    // is a stalled take (page-visible interruption, suspended
+    // context, stalled worklet), not a dead mic — the micAlive poll
+    // cannot see it.
+    capture.lastBlockAt = Date.now();
     if (capture.firstTime === null) {
       capture.firstTime = data.time;
       var waiters = capture.waiters;
@@ -482,6 +542,7 @@
       if (!workletNode) return Promise.reject(new Error('The recorder could not start. Close the app and open it again.'));
       capture = {
         blocks: [], firstTime: null, totalFrames: 0, onBlock: onBlock || null, waiters: [],
+        lastBlockAt: null, // v41 (QUEUE #42): stamped in onWorkletMessage, per block (the liveness watchdog reads it)
         chunkBuf: new Float32Array(PS_CHUNK_SAMPLES), chunkFill: 0, chunkIndex: 0,
         onChunk: (opts && opts.onChunk) || null,
         stopping: false, stopPromise: null, stopResolve: null, stopTimer: null, stopDone: false
@@ -777,7 +838,8 @@
    *   beat: { buffer } | null — the decoded beat (plays at the anchor)
    *   overdubs: [{ buffer, sound }] — active takes of the other
    *     vocal tracks, each with its own stamped sound (B3, v13.1)
-   *   tuneNodeFor: fn(ctx, sound) — builds a playback tune node
+   *   tuneNodeFor: fn(ctx, sound, kind) — builds a playback tune node
+   *     (v40: wired to the overdub's layer gain, not the master)
    *     for an overdub (supplied by the app, which owns the tune
    *     module); without it an overdub plays dry, as before
    *   delaySeconds: number | null — the measured round-trip D (null
@@ -869,7 +931,9 @@
       function schedule(buffer) {
         var player = ctx.createBufferSource();
         player.buffer = buffer;
-        player.connect(masterGain || ctx.destination);
+        // v40 (QUEUE #124): the beat plays through its own layer
+        // gain — the beat lane's + / − moves the beat alone.
+        player.connect(layerGainFor('beat') || masterGain || ctx.destination);
         if (loop && loop.start < buffer.duration) {
           // Loop Zone: the beat plays [start, end) over and over
           // from the anchor — the singer hears the loop start
@@ -891,24 +955,28 @@
       var overdubNodes = [];
       function scheduleOverdub(item) {
         var buffer = item && item.buffer ? item.buffer : item;
+        // v40 (QUEUE #124): the guide vocal plays through ITS
+        // layer's gain — balancing a layer rebalances the guide
+        // he sings against, not just playback.
+        var overdubKind = (item && item.kind) || 'lead';
         var player = ctx.createBufferSource();
         player.buffer = buffer;
         if (item && item.sound && typeof opts.tuneNodeFor === 'function') {
-          var node = opts.tuneNodeFor(ctx, item.sound);
+          var node = opts.tuneNodeFor(ctx, item.sound, overdubKind);
           if (node && node.input && node.output) {
             // Step 4A (v13.4): a full vocal chain, not just a tune
             // node — the builder already wired the chain's output
-            // to the destination, so the player only connects to
+            // to the layer gain, so the player only connects to
             // the chain's input. The chain object carries a
             // disconnect() that drops the whole chain with it.
             player.connect(node.input);
           } else {
             player.connect(node);
-            node.connect(masterGain || ctx.destination);
+            node.connect(layerGainFor(overdubKind) || masterGain || ctx.destination);
           }
           overdubNodes.push(node);
         } else {
-          player.connect(masterGain || ctx.destination);
+          player.connect(layerGainFor(overdubKind) || masterGain || ctx.destination);
         }
         if (loop) {
           // Step 6C: the guide vocal loops with the beat — but
@@ -988,15 +1056,22 @@
    * delaySeconds (Step 6C, v13.3): the take starts this late — a
    * loop pass or a comp lives at its place in the song, so it
    * starts when the playhead reaches it instead of at the top.
+   * layerKind (v40, QUEUE #124): the take's layer — the take
+   * plays through that layer's gain, the beat through the beat's.
    */
-  function playTake(takeBuffer, beatBuffer, onEnded, delaySeconds) {
+  function playTake(takeBuffer, beatBuffer, onEnded, delaySeconds, layerKind) {
     return ensureContext().then(function () {
       var anchor = ctx.currentTime + 0.1;
       var players = [];
       function schedule(buffer, isTake) {
         var player = ctx.createBufferSource();
         player.buffer = buffer;
-        player.connect(masterGain || ctx.destination);
+        // v40 (QUEUE #124): take through its layer's gain, beat
+        // through the beat's — never straight to the master.
+        var gain = isTake
+          ? (layerGainFor(layerKind || 'lead') || masterGain || ctx.destination)
+          : (layerGainFor('beat') || masterGain || ctx.destination);
+        player.connect(gain);
         player.start(anchor + (isTake ? (delaySeconds || 0) : 0));
         if (isTake && onEnded) {
           player.onended = function () {
@@ -1079,6 +1154,7 @@
     ensureMic: ensureMic,
     onMicEnded: onMicEnded, // v35 (QUEUE #32): register the mic-died handler
     micAlive: micAlive, // v35 (QUEUE #32): polled liveness backstop
+    captureLastBlockAt: captureLastBlockAt, // v41 (QUEUE #42): last block stamp, or null (the watchdog reads it)
     micTrack: micTrack, // v35 (QUEUE #32): the current mic track, or null (CDP suite ends it)
     closeMic: closeMic,
     isMicOpen: isMicOpen,
@@ -1091,10 +1167,15 @@
     outputLatency: outputLatency,
     baseLatency: baseLatency,
     contextInfo: contextInfo,
-    setVolume: setVolume,
-    volume: volume,
+    // v40 (QUEUE #124): per-layer volume — one gain per layer kind,
+    // fed by every playback player; the master is fixed at full.
+    layerGainFor: layerGainFor,
+    setLayerLevel: setLayerLevel,
+    layerLevel: layerLevel,
+    setLayerLevels: setLayerLevels,
+    layerGainValue: layerGainValue,
     outputNode: outputNode,
-    monitorNode: monitorNode, // B2 (v13.1): the live monitor's gain — same volume level as playback
+    monitorNode: monitorNode, // B2 (v13.1): the live monitor's gain — fixed at full, like the master
     decodeBeat: decodeBeat,
     decodeAudio: decodeAudio,
     createBuffer: createBuffer, // B10 (v13.1): buffer creation on the engine's context, no scratch context
