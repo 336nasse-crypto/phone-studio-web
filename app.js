@@ -121,10 +121,14 @@
     blockDrag: null,
     swipeStart: null, // v29: the press point for the swipe-up gesture on the lanes
     // Live tune (Hard Tune): the headphones toggle = hear the tuned
-    // voice live. OFF by default (Voloco's own answer on Bluetooth —
-    // the tuned voice arrives late, and hearing yourself late throws
-    // a take off). The tuned take is heard on playback either way.
-    monitorOn: false,
+    // voice live. ON by default (v38, QUEUE #122 — Denasse, live
+    // v37: he recorded and could not hear himself at all). The
+    // guard stays in monitorWanted(): headphones output only (never
+    // the speaker — feedback) and never on a slow (Bluetooth-like)
+    // route, where the tuned voice arrives late and hearing
+    // yourself late throws a take off (Voloco's own rule). The
+    // tuned take is heard on playback either way.
+    monitorOn: true,
     monitor: null, // { source, gain, chain, tune } — the live monitor branch, or null
     tuneModuleReady: false,
     playbackTune: null, // the AudioWorkletNode that tunes take playback
@@ -1184,6 +1188,18 @@
   // calls noteLivePeak itself from onBlock; nothing else reads these.
   PS._noteLivePeak = noteLivePeak;
   PS._clipState = function () { return { blocks: liveClipBlocks, clipped: liveClipped }; };
+  // v38 (QUEUE #122): exposed for the CDP tests only (cdp-v161 reads
+  // the monitor state + gain) — the record path calls updateMonitor
+  // itself on take start; nothing else reads this handle.
+  PS._monitorState = function () {
+    return {
+      on: state.monitorOn,
+      running: !!state.monitor,
+      gain: state.monitor ? state.monitor.gain.gain.value : null,
+      allowed: !routeIsSlow(),
+      mode: PS.store.outputMode()
+    };
+  };
 
   function startLabRun() {
     if (labRunning || state.recording || state.calibrating) return;
@@ -1853,6 +1869,16 @@
       ensurePlayheadTimer();
       renderTracks();
       updateTransport();
+      // v38 (QUEUE #122): the monitor is ON by default — start the
+      // branch with the take, so he hears himself as soon as he
+      // records. monitorWanted() still refuses speaker output and
+      // slow routes, and a tap on the headphones button
+      // (toggleMonitor) turns it off until he taps it back on.
+      // updateMonitor() is otherwise only ever called from
+      // toggleMonitor — a `true` default alone would never build
+      // the branch, and the mic still opens only while a take is
+      // recording (v11): no monitor runs before the first record.
+      updateMonitor();
     }).catch(function (err) {
       state.startingTake = false;
       $('live-strip').style.display = 'none';
