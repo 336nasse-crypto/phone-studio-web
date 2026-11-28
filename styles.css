@@ -67,6 +67,7 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   position: relative;
 }
 
+
 /* v31 (mockup 12 fix): the studio top bar is two rows — the song
  * title big and centered like the approved photo, with the
  * navigation (Key / Sound / Takes / Loop / headphones / gear) on a
@@ -715,6 +716,21 @@ button { -webkit-tap-highlight-color: transparent; font-family: inherit; }
   background: var(--track-accent, var(--purple));
   color: #fff;
 }
+/* v49 (QUEUE #154): the mute button — same size as the stepper
+ * buttons, below the +. Muted is filled, like :active, so the
+ * state reads at a glance; the % dims with it. */
+.layer-mute-btn svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+.layer-mute-btn.muted {
+  background: var(--track-accent, var(--purple));
+  color: #fff;
+}
+.layer-vol.muted .layer-vol-value {
+  opacity: .45;
+}
 .layer-vol-value {
   flex: 0 0 auto;
   text-align: center;
@@ -1269,17 +1285,18 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
 .take-info strong { font-size: 16px; }
 .take-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
-/* v30 (QUEUE #4) — the take action row sticks to the bottom of the
- * takes scroll area so Send is visible on first open. Measured on
- * v29 (probe /tmp/fold-probe-v29.js, 390x844): the first take's row
- * is 775 px tall in a 732 px scroll area, so its Send button sat
- * top 815 / bottom 855 — 11 px below the fold. Sticky keeps the row
- * pinned to the scrollport bottom while its take scrolls through;
- * the opaque background + top border keep scrolled content from
- * showing through under the buttons. */
+/* v30 (QUEUE #4) — the take action row used to stick to the bottom
+ * of the takes scroll area so Send was visible on first open. v46
+ * (QUEUE #146) REMOVED the sticky: on a 775 px take row in a 732 px
+ * scroll area the bar was pulled 55 px up and sat ON the "More sound
+ * choices" button (63x34 overlap, the button untappable — elementFrom-
+ * Point at its center hit an action button, not the button itself)
+ * and on the take's muted sub-line at 320 px. The bar now sits in
+ * normal flow at the row's end, and openTakeSheet scrolls the first
+ * take's bar into view on open — Send stays visible on first open
+ * (the #4 outcome) with nothing shifted over anything. The opaque
+ * background + top border stay as the row's own separator. */
 .take-actions {
-  position: sticky;
-  bottom: 0;
   background: var(--bg);
   border-top: 1px solid var(--line);
   padding: 8px 0 4px;
@@ -1345,17 +1362,17 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
   margin: 10px 0 4px;
 }
 
-/* v34 (QUEUE #5) — the Sound-parts section sticks to the bottom of
- * the sheet scroll area so the 5 slots are visible on first open.
- * Measured on v32 (probe /tmp/fold-probe-v33.js, 390x844): strip
- * top 898 / bottom 976 — 132 px below the fold (card 236→844,
- * scrollHeight 1386). Sticky pins the section to the scrollport
- * bottom while its natural position is below the fold; the opaque
- * background + top border keep scrolled content from showing
- * through under the slots (the v30 .take-actions pattern). */
+/* v34 (QUEUE #5) — the Sound-parts section used to stick to the
+ * bottom of the sheet scroll area so the 5 slots were visible on
+ * first open. v46 (QUEUE #146) REMOVED the sticky: the wrap was
+ * pulled ~110 px up and sat ON the chain toggles — the "Sound
+ * parts" label painted over the Full-studio checkbox (20x8) and a
+ * slot button over the Cut-noise checkbox (20x20), both untappable
+ * at their centers. The strip now sits in normal flow, and
+ * openFxPanel scrolls it into view on open — the 5 slots stay
+ * visible on first open (the #5 outcome) with nothing shifted
+ * over anything. The opaque background + top border stay. */
 .fx-strip-wrap {
-  position: sticky;
-  bottom: 0;
   background: var(--card);
   border-top: 1px solid var(--line);
   padding: 8px 0 4px;
@@ -1553,4 +1570,22 @@ input[type="radio"] { width: 22px; height: 22px; accent-color: var(--purple); fl
   background: var(--purple-soft);
   border-color: var(--purple);
   color: var(--text);
+}
+
+/* v46 (QUEUE #146) — short screens (landscape phone, ~390 px tall):
+ * the studio column (topbar + ruler + lanes + overview + ideas +
+ * transport, ~520 px) is taller than the viewport, so the lanes
+ * collapsed to an 8 px sliver and the track canvases' rects spilled
+ * past the lanes over the overview strip and the Catch ideas button
+ * (clipped by the wrap, so invisible — but the lanes were unusable,
+ * and the beat row's label sat below the viewport). Let the view
+ * scroll and give the lanes their full height instead: the rows fit
+ * (no canvas rect leaves its lane), and everything stays reachable
+ * by scrolling. Portrait is untouched — the media query only fires
+ * under 500 px of height. */
+@media (max-height: 500px) {
+  .studio-view { overflow-y: auto; }
+  /* Rows need ~302 px (3 vocal x 64 + beat 52 + add-layer ~34 +
+   * 4 x 6 gaps) + 8 px wrap padding = 310; 320 leaves headroom. */
+  .tracks-wrap { min-height: 320px; }
 }

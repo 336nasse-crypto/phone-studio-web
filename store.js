@@ -27,7 +27,13 @@
   var CALIBRATIONS_KEY = 'ps.calibrations.v1';
   var ACTIVE_CAL_KEY = 'ps.activeCalibration.v1';
   var MODE_KEY = 'ps.outputMode.v1'; // 'headphones' | 'speaker'
-  var VOLUME_KEY = 'ps.volume.v1'; // playback volume 0-100 (v13)
+  // v40 (QUEUE #124): per-layer volume lives WITH the layer — in
+  // the session (session.layerVolumes, kind -> percent). No separate
+  // key: a layer's level survives a reload exactly as long as the
+  // layer does, because the session is what persists. The master
+  // volume key is gone with the master slider (Denasse: no sliders
+  // — the phone's hardware buttons are the overall volume).
+  var LAYER_VOLUME_DEFAULT = 100; // percent; 0..150 in steps of 25
   var LAB_REPORTS_KEY = 'ps.labReports.v1'; // route-lab reports, keyed by label
   var SEEN_DEVICES_KEY = 'ps.seenDevices.v1'; // audioinput deviceIds seen (Step 0C)
   var BANNER_KEY = 'ps.bannerDismissed.v1'; // which one-time banners were dismissed
@@ -134,16 +140,22 @@
       // each. Plain words on screen: Even (keeps loud and quiet
       // parts level), Bright (makes the voice shine), Space (how
       // much room you hear), Punch (makes words hit harder), Warm
-      // (rounds the voice out). 50 is the sensible middle. A take
-      // stamps the song's macros when it records, like the preset.
-      macros: { even: 50, bright: 50, space: 50, punch: 50, warm: 50 },
+      // (rounds the voice out). v50 (QUEUE #164, Denasse's order
+      // "Work on the sound"): the defaults are wetter + more
+      // levelled than the old all-50 middle — Voloco's sound is
+      // a room you can hear, not a dry middle. A take stamps the
+      // song's macros when it records, like the preset.
+      macros: { even: 60, bright: 50, space: 65, punch: 50, warm: 60 },
       chainOn: true, // the full studio sound (not just the tune) — on by default, off on a slow (Bluetooth-like) route
       // v23 (QUEUE #58, Denasse's order 09:19 — "I want it to sound
       // good while I'm recording"): the full chain runs LIVE by
       // default now — what he hears while singing is the studio
       // sound, not the tune-only light version. lightLive false
       // from the start, so a new song never passes through the
-      // light default. Old songs keep their stored flag.
+      // light default. v50 (QUEUE #164): old songs no longer keep
+      // a stored light flag either — the loadSessions backfill
+      // migrates it to false, because the switch that could flip
+      // it back is gone (v33 removed it).
       lightLive: false,
       // Step 4B (v13.5) — per-stage bypasses (true = that part of
       // the studio sound is off) + fine tone controls (0-100,
@@ -239,25 +251,50 @@
     try { localStorage.setItem(MODE_KEY, mode); } catch (e) { /* ignore */ }
   }
 
-  // --- Playback volume (v13) — beat + take playback, 0-100, default 100 ---
+  // --- Per-layer volume (v40, QUEUE #124) — tap + / − on the layer
+  // itself, steps of 25, 0..150 percent, default 100. Stored in the
+  // session (session.layerVolumes) so it survives a reload with the
+  // layer. Old sessions have no map — they read as 100 everywhere.
+  // 'beat' is a layer too (the beat lane has the same + / − control).
 
-  function volume() {
-    try {
-      var raw = localStorage.getItem(VOLUME_KEY);
-      // v13 FIX: Number(null) is 0, not NaN — a fresh install with
-      // nothing stored read as volume 0 (silent). An absent value
-      // is the default 100, not 0.
-      if (raw === null || raw === undefined || raw === '') return 100;
-      var v = Number(raw);
-      if (isFinite(v) && v >= 0 && v <= 100) return Math.round(v);
-    } catch (e) { /* ignore */ }
-    return 100;
+  function layerVolume(session, kind) {
+    var map = (session && session.layerVolumes) || {};
+    var v = Number(map[kind]);
+    if (!isFinite(v)) return LAYER_VOLUME_DEFAULT;
+    return Math.max(0, Math.min(150, Math.round(v)));
   }
 
-  function setVolume(v) {
-    try {
-      localStorage.setItem(VOLUME_KEY, String(Math.max(0, Math.min(100, Math.round(Number(v) || 0)))));
-    } catch (e) { /* ignore */ }
+  function setLayerVolume(session, kind, v) {
+    var next = Math.max(0, Math.min(150, Math.round(Number(v) || 0)));
+    if (!session.layerVolumes) session.layerVolumes = {};
+    session.layerVolumes[kind] = next;
+    return next;
+  }
+
+  // v49 (QUEUE #154): per-layer mute — the beat or a voice can be
+  // silenced with one tap while playing, and the level is remembered
+  // (session.layerMuted, kind -> true). Old sessions have no map —
+  // they read as unmuted everywhere. Muting never touches the
+  // stored level; the engine applies 0 while the flag is set, and
+  // unmuting restores the stored level.
+  function layerMuted(session, kind) {
+    var map = (session && session.layerMuted) || {};
+    return map[kind] === true;
+  }
+
+  function setLayerMuted(session, kind, muted) {
+    if (!session.layerMuted) session.layerMuted = {};
+    session.layerMuted[kind] = !!muted;
+    return !!muted;
+  }
+
+  function layerVolumes(session) {
+    var out = {};
+    trackKinds(session || { extraTracks: [] }).forEach(function (k) {
+      out[k] = layerVolume(session, k);
+    });
+    out.beat = layerVolume(session, 'beat');
+    return out;
   }
 
   // --- Route-lab reports (Step 0, keyed by user-typed label) ---
@@ -339,8 +376,11 @@
     setActiveCalibrationLabel: setActiveCalibrationLabel,
     outputMode: outputMode,
     setOutputMode: setOutputMode,
-    volume: volume,
-    setVolume: setVolume,
+    layerVolume: layerVolume,
+    setLayerVolume: setLayerVolume,
+    layerVolumes: layerVolumes,
+    layerMuted: layerMuted,
+    setLayerMuted: setLayerMuted,
     loadLabReports: loadLabReports,
     saveLabReport: saveLabReport,
     deleteLabReport: deleteLabReport,

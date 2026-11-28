@@ -97,9 +97,21 @@
   var layerLevels = {};
   var stream = null;
   var sourceNode = null;
+  var sourceStream = null; // v45 (QUEUE #139): the stream sourceNode was built from — the graph rebuilds when it changes
   var workletNode = null;
   var micSettingsCache = null; // last track.getSettings() reading
   var micTrackLabel = ''; // v13.2 (item 4): the mic track's label (device name), cached when the mic opens
+  // v51 (QUEUE #167): the speaker monitor's OWN mic stream — echoCancellation
+  // ON. The take's stream above stays RAW (echoCancellation off) by design;
+  // this second stream exists only so the polished monitor can run live on
+  // the speaker without the speaker output feeding back into it. The
+  // browser's AEC uses the speaker output as a reference and cancels it
+  // from this stream. It is NEVER wired to the recorder graph or the
+  // worklet — the take never hears it. If the browser will not actually
+  // apply echo cancellation (getSettings says false), the speaker monitor
+  // is not built at all — a monitor without AEC WILL squeal.
+  var monitorStream = null;
+  var monitorStreamSettings = null; // last monitor track.getSettings() reading
   var sessionLog = []; // AudioSession type transitions (for take metadata)
 
   // Capture state (one capture at a time — calibration or take).
@@ -125,14 +137,22 @@
     // on an existing context and the worklet never loaded, so every
     // record / mic-test / calibration failed with "No
     // ScriptProcessor was registered with this name".)
+    // v45 (QUEUE #139): resume whenever the context is not running —
+    // 'suspended' AND 'interrupted' (iOS parks the context in
+    // 'interrupted' after a route change / session flip, and the old
+    // check sailed past it, scheduling players on a dead context
+    // while the wall-clock playhead moved). 'closed' is not resumed
+    // (resume on a closed context rejects) — that is a separate,
+    // unreported class.
     var ready;
+    var needsResume = function () { return ctx.state === 'suspended' || ctx.state === 'interrupted'; };
     if (ctx) {
-      ready = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
+      ready = needsResume() ? ctx.resume() : Promise.resolve();
     } else {
       var AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return Promise.reject(new Error('This browser cannot do audio recording.'));
       ctx = new AC();
-      ready = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
+      ready = needsResume() ? ctx.resume() : Promise.resolve();
     }
     return ready.then(function () {
       if (workletReady) return ctx;
@@ -392,6 +412,93 @@
       micSettingsCache.autoGainControl === true;
   }
 
+  /* v51 (QUEUE #167): the speaker monitor's mic — a SECOND getUserMedia
+   * stream with echoCancellation ON, for the monitor source only. The
+   * take's stream (ensureMic) stays RAW; this one is the AEC'd copy the
+   * polished monitor sings through on the speaker route. The browser's
+   * AEC takes the speaker output as its reference and subtracts it from
+   * this stream, so the monitor does not hear its own output back.
+   * Returns the cached stream while it is active (one AEC stream for
+   * the context's life — a second open would ask the mic twice).
+   * The caller MUST check monitorMicAecOn() after this resolves: if
+   * the browser did not actually apply echo cancellation, the speaker
+   * monitor is not built (it would squeal). Never throws for a
+   * missing mic — rejects, and the caller falls back to no monitor
+   * on the speaker (today's behaviour). Does NOT touch the raw
+   * `stream` — opening this stream must never process the take.
+   */
+  function ensureMonitorMic() {
+    if (monitorStream && monitorStream.active) return Promise.resolve(monitorStream);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return Promise.reject(new Error('This browser cannot open a second microphone.'));
+    }
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1
+      }
+    }).then(function (s) {
+      monitorStream = s;
+      var track = s.getAudioTracks()[0];
+      if (track && track.getSettings) {
+        try {
+          monitorStreamSettings = track.getSettings();
+        } catch (err) {
+          monitorStreamSettings = null;
+        }
+      }
+      if (monitorStreamSettings) {
+        console.log('Monitor mic settings:', JSON.stringify(monitorStreamSettings));
+      }
+      // If the AEC track dies mid-monitor, drop the cached stream so
+      // the next ensure re-opens it — the monitor branch rebuilds
+      // from it (app.js rebuildMonitorSource) instead of singing
+      // into a dead track.
+      if (track) {
+        track.onended = function () {
+          monitorStream = null;
+          monitorStreamSettings = null;
+        };
+      }
+      try { s.oninactive = function () { monitorStream = null; monitorStreamSettings = null; }; } catch (e) { /* older browsers may not allow it */ }
+      return s;
+    });
+  }
+
+  /* The last verified monitor-mic settings (track.getSettings()), or
+   * null when the AEC stream has never been opened.
+   */
+  function monitorMicSettings() {
+    return monitorStreamSettings ? JSON.parse(JSON.stringify(monitorStreamSettings)) : null;
+  }
+
+  /* v51 (QUEUE #167): is echo cancellation ACTUALLY on in the
+   * monitor stream? The gate for the speaker monitor — true only
+   * when the browser applied echoCancellation to the AEC stream.
+   * False (or null settings) means the speaker monitor is not built:
+   * without AEC the speaker output feeds back into the mic and the
+   * monitor squeals. The take's raw stream is never consulted here.
+   */
+  function monitorMicAecOn() {
+    return !!(monitorStreamSettings && monitorStreamSettings.echoCancellation === true);
+  }
+
+  /* Closes the monitor (AEC) stream: stops every track and drops
+   * it so the next open re-requests it. No-op when it was never
+   * opened. Never touches the take's raw stream. The monitor branch
+   * owns this stream — it closes when the branch tears down (the
+   * mic must not stay open with nothing listening).
+   */
+  function closeMonitorMic() {
+    if (!monitorStream) return false;
+    try { monitorStream.getTracks().forEach(function (t) { t.stop(); }); } catch (err) { /* ignore */ }
+    monitorStream = null;
+    monitorStreamSettings = null;
+    return true;
+  }
+
   /* v13.2 (item 4) — what mic recorded the take, in plain words.
    * The track label IS the identification (it names the device
    * once the mic is open — no device list needed). "Microphone"
@@ -427,6 +534,7 @@
     } catch (err) { /* ignore */ }
     stream = null;
     sourceNode = null;
+    sourceStream = null;
     workletNode = null;
     setAudioSessionType('playback');
     setTimeout(function () { setAudioSessionType('auto'); }, 500);
@@ -441,22 +549,37 @@
     return ensureContext().then(function () {
       return ensureMic();
     }).then(function () {
-      if (!sourceNode) {
+      // v45 (QUEUE #139): the graph follows the stream. The old
+      // `if (!sourceNode)` built the source once and never rebuilt
+      // it — after a route change replaced the stream, the worklet
+      // stayed wired to the dead stream and recorded silence while
+      // every guard stayed green. Rebuild whenever the stream
+      // changed; the worklet itself is reused (one worklet for the
+      // context's life — a second worklet would double-post blocks).
+      if (!sourceNode || sourceStream !== stream) {
         try {
+          if (sourceNode) {
+            try { sourceNode.disconnect(); } catch (e) { /* ignore */ }
+            sourceNode = null;
+          }
           sourceNode = ctx.createMediaStreamSource(stream);
-          workletNode = new AudioWorkletNode(ctx, 'recorder-processor', {
-            numberOfInputs: 1,
-            numberOfOutputs: 0,
-            channelCount: 1
-          });
-          workletNode.port.onmessage = onWorkletMessage;
+          sourceStream = stream;
+          if (!workletNode) {
+            workletNode = new AudioWorkletNode(ctx, 'recorder-processor', {
+              numberOfInputs: 1,
+              numberOfOutputs: 0,
+              channelCount: 1
+            });
+            workletNode.port.onmessage = onWorkletMessage;
+          }
           sourceNode.connect(workletNode);
         } catch (err) {
           // A failed graph build must not leave a half-built graph
           // behind (source set, worklet null) — the next attempt
           // would skip the build and crash on workletNode.port.
-          // Reset both so the next attempt retries from scratch.
+          // Reset all three so the next attempt retries from scratch.
           sourceNode = null;
+          sourceStream = null;
           workletNode = null;
           throw err;
         }
@@ -1160,6 +1283,11 @@
     isMicOpen: isMicOpen,
     micSettings: micSettings,
     micProcessed: micProcessed, // B9 (v13.1): the phone processed the mic despite the raw constraints
+    // v51 (QUEUE #167): the speaker monitor's own AEC mic stream — echoCancellation ON, never the take's stream.
+    ensureMonitorMic: ensureMonitorMic,
+    closeMonitorMic: closeMonitorMic,
+    monitorMicSettings: monitorMicSettings,
+    monitorMicAecOn: monitorMicAecOn,
     micLabel: micLabel, // v13.2 (item 4): the mic that recorded the take, in plain words
     micLabelFromTrackLabel: micLabelFromTrackLabel, // v13.2 (item 4): the label rule, unit-tested in Node
     audioSessionLog: audioSessionLog,

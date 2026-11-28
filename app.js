@@ -85,6 +85,10 @@
   var PLAY_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"></path></svg>';
   var STOP_SVG = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>';
   var MIC_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>';
+  // v49 (QUEUE #154): the per-layer mute button — a speaker, and
+  // the same speaker crossed out when the layer is muted.
+  var SPK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z" fill="currentColor" stroke="none"></path><path d="M15.5 8.5a5 5 0 0 1 0 7"></path><path d="M18.5 5.5a9 9 0 0 1 0 13"></path></svg>';
+  var SPK_MUTED_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z" fill="currentColor" stroke="none"></path><line x1="16" y1="9" x2="22" y2="15"></line><line x1="22" y1="9" x2="16" y2="15"></line></svg>';
   var NOTE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>';
 
   var state = {
@@ -125,13 +129,15 @@
     // Live tune (Hard Tune): the headphones toggle = hear the tuned
     // voice live. ON by default (v38, QUEUE #122 — Denasse, live
     // v37: he recorded and could not hear himself at all). The
-    // guard stays in monitorWanted(): headphones output only (never
-    // the speaker — feedback) and never on a slow (Bluetooth-like)
+    // guard stays in monitorWanted() (headphones) and
+    // speakerMonitorWanted() (v51, QUEUE #167: speaker, only when
+    // the phone really cancels the echo — AEC on — or the speaker
+    // output feeds back), and never on a slow (Bluetooth-like)
     // route, where the tuned voice arrives late and hearing
     // yourself late throws a take off (Voloco's own rule). The
     // tuned take is heard on playback either way.
     monitorOn: true,
-    monitor: null, // { source, gain, chain, tune } — the live monitor branch, or null
+    monitor: null, // { source, gain, chain, tune, isSpeaker, sourceStream, hotTicks, analyser, waveTimer } — the live monitor branch, or null
     tuneModuleReady: false,
     playbackTune: null, // the AudioWorkletNode that tunes take playback
     // Step 4A (v13.4) — the live chain.
@@ -376,6 +382,26 @@
       } else if (state.logger) {
         state.logger.micEnded = true;
         saveLoggerTake();
+      } else if (!state.calibrating) {
+        // v45 (QUEUE #139): the mic died while nothing was
+        // recording — the old code did nothing here, so the dead
+        // stream stayed in audio.js and the next take's graph kept
+        // the worklet wired to it (a silent take, all guards
+        // green). Close the mic so the next open rebuilds the
+        // graph from a live stream. (The graph rebuild in audio.js
+        // is the backstop if a death ever arrives without this
+        // handler firing.) A calibration in flight is left alone —
+        // its own flow reports the failure.
+        // v48 (QUEUE #144): when the MONITOR is running, do NOT
+        // close the mic out from under it — the branch keeps a
+        // source wired to the dead stream while updateMonitor's
+        // `if (state.monitor) return` guard refuses to rebuild it,
+        // so the wave drains to 0 px with running=true (probe
+        // PROBE-LEG2-MONITOR-DEAD, 2 runs). Rebuild the branch's
+        // source on the fresh stream instead; without a monitor,
+        // close the mic as v45 did.
+        if (state.monitor) rebuildMonitorSource();
+        else PS.audio.closeMic();
       }
     });
   }
@@ -391,6 +417,10 @@
   function maybeCloseMic() {
     if (state.recording || state.calibrating || state.monitor || state.logger) return;
     PS.audio.closeMic();
+    // v51 (QUEUE #167): the AEC monitor stream is owned by the
+    // speaker monitor — when nothing needs a mic, it closes too,
+    // so the mic does not stay open with nothing listening.
+    PS.audio.closeMonitorMic();
   }
 
   function isStandalone() {
@@ -496,20 +526,29 @@
       if (typeof s.beatSha256 !== 'string') s.beatSha256 = null;
       if (typeof s.keySource !== 'string') s.keySource = null;
       // Step 4A (v13.4): the live chain's One Knob macros +
-      // toggles. Old songs get the defaults (all 50, chain on,
-      // room-noise cut off); old takes fall back to the song's
-      // macros when they play (see takeSound).
-      if (!s.macros || typeof s.macros !== 'object') s.macros = { even: 50, bright: 50, space: 50, punch: 50, warm: 50 };
+      // toggles. Old songs get the defaults (chain on, room-noise
+      // cut off); old takes fall back to the song's macros when
+      // they play (see takeSound).
+      if (!s.macros || typeof s.macros !== 'object') s.macros = { even: 60, bright: 50, space: 65, punch: 50, warm: 60 };
       s.macros = clampMacros(s.macros);
+      // v50 (QUEUE #164): a song whose macros are exactly the old
+      // all-50 default never had its sound touched — give it the
+      // new wetter defaults. Any dragged slider breaks the exact-50
+      // pattern, so a deliberate choice is never overwritten.
+      if (s.macros.even === 50 && s.macros.bright === 50 && s.macros.space === 50 && s.macros.punch === 50 && s.macros.warm === 50) {
+        s.macros = { even: 60, bright: 50, space: 65, punch: 50, warm: 60 };
+      }
       if (typeof s.chainOn !== 'boolean') s.chainOn = true;
       // v23 (QUEUE #58, Denasse's order 09:19): live sound is the
       // FULL chain by default — what he hears while singing is the
-      // studio sound, not the tune-only light version. Old songs
-      // missing the flag get the full default; a song WITH a stored
-      // flag keeps its pick (the #3 precedent — his current song
-      // stays light until he flips the Setup switch). The switch
-      // lives in Setup ("Light live sound").
-      if (typeof s.lightLive !== 'boolean') s.lightLive = false;
+      // studio sound, not the tune-only light version. v50 (QUEUE
+      // #164, Denasse's order "Work on the sound"): the stored
+      // flag is migrated too — a song WITH lightLive=true stored
+      // gets false on load, one-way. The v23 escape hatch is gone:
+      // v33 removed the Setup switch that could flip it back, so
+      // keeping the flag would leave his song tune-only live
+      // forever with no way out.
+      s.lightLive = false;
       // Step 4B (v13.5): per-stage bypasses + fine tone. Old
       // songs get the defaults; a song saved by v13.4 keeps its
       // room-noise cut — it becomes the nr bypass (cut on means
@@ -1226,7 +1265,12 @@
       running: !!state.monitor,
       gain: state.monitor ? state.monitor.gain.gain.value : null,
       allowed: !routeIsSlow(),
-      mode: PS.store.outputMode()
+      mode: PS.store.outputMode(),
+      // v51 (QUEUE #167): speaker-monitor state for the CDP tests.
+      isSpeaker: !!(state.monitor && state.monitor.isSpeaker),
+      aecOn: PS.audio.monitorMicAecOn(),
+      monitorMicOpen: PS.audio.monitorMicSettings() !== null,
+      speakerWanted: speakerMonitorWanted()
     };
   };
   // v39 (QUEUE #123): exposed for the CDP tests only (cdp-v162 reads
@@ -1248,7 +1292,8 @@
     trackKinds().concat(['beat']).forEach(function (k) {
       out[k] = {
         stored: PS.store.layerVolume(state.session, k),
-        live: PS.audio.layerGainValue(k)
+        live: PS.audio.layerGainValue(k),
+        muted: PS.store.layerMuted(state.session, k)
       };
     });
     return out;
@@ -1924,9 +1969,11 @@
       updateTransport();
       // v38 (QUEUE #122): the monitor is ON by default — start the
       // branch with the take, so he hears himself as soon as he
-      // records. monitorWanted() still refuses speaker output and
-      // slow routes, and a tap on the headphones button
-      // (toggleMonitor) turns it off until he taps it back on.
+      // records. The speaker monitor (v51, QUEUE #167) runs here too
+      // when the phone really cancels the echo (AEC on); without AEC
+      // there is no speaker monitor, and slow routes still refuse it.
+      // A tap on the headphones button (toggleMonitor) turns it off
+      // until he taps it back on.
       // updateMonitor() is otherwise only ever called from
       // toggleMonitor — a `true` default alone would never build
       // the branch, and the mic still opens only while a take is
@@ -2121,6 +2168,12 @@
     canvas._psLastDraw = nowMs;
     var c2d = canvas._psCtx || (canvas._psCtx = canvas.getContext('2d'));
     if (!c2d) return;
+    // v44 (QUEUE #130, latent — not the cause: it would ADD pixels,
+    // not zero them): drawWave sets a dpr transform on this shared
+    // canvas and this draw never reset it, so live bars after a take
+    // draw dpr-scaled. Reset to identity — this draw works in device
+    // pixels (canvas.width/height units).
+    c2d.setTransform(1, 0, 0, 1, 0, 0);
     var w = canvas.width;
     var h = canvas.height;
     c2d.clearRect(0, 0, w, h);
@@ -2173,6 +2226,12 @@
     // for the finish message ('mic-disconnected' — the track
     // died; the visibilitychange path passes no reason).
     if (reason) rec.interruptedReason = reason;
+    // v43 (QUEUE #135): the flag itself, not just the reason —
+    // finishLoopTake's per-pass metadata reads rec.interrupted
+    // (interrupted + partial), and it was never assigned, so every
+    // interrupted loop take's passes were stamped complete while
+    // their reason said 'audio-interrupted'.
+    rec.interrupted = !!interrupted;
     state.recording = null;
     clearInterval(rec.timer);
     releaseWakeLock();
@@ -3143,6 +3202,13 @@
     }
     if (state.recording || state.calibrating) return;
     clearError();
+    // v45 (QUEUE #139): resume the context IN THE TAP, before the
+    // IDB read + decode below — on iOS Safari a resume outside a
+    // user gesture never settles, so the old order (decode first,
+    // resume after) left Play sitting silent after any
+    // interruption. Fire and forget: the later ensureContext joins
+    // the same resume, and a running context resolves at once.
+    PS.audio.ensureContext().catch(function () { /* the play chain below reports a failure, not this pre-warm */ });
     // Generation: if another play starts (or the user stops) while
     // this take is still loading, the stale chain must not start
     // playing over it — or leave a take playing with no stop.
@@ -3216,6 +3282,20 @@
           if (gen !== state.playGen) {
             // A newer play won — stop this one before it is heard.
             if (stopFn) stopFn();
+            return;
+          }
+          // v45 (QUEUE #139): the players were scheduled on a
+          // context that never started — a moving playhead with no
+          // sound is a lie. Stop, say so in plain words, and let
+          // the next tap (a fresh gesture) resume it.
+          if (PS.audio.contextInfo().state !== 'running') {
+            if (stopFn) stopFn();
+            state.playingStop = null;
+            state.playingTakeId = null;
+            showError('Playback did not start — tap Play again.');
+            renderTracks();
+            renderSheet();
+            updateTransport();
             return;
           }
           state.playingStop = stopFn;
@@ -4284,7 +4364,7 @@
    *   Warm — rounds the voice out (soft saturation + low shelf)
    */
   var MACRO_KEYS = ['even', 'bright', 'space', 'punch', 'warm'];
-  var MACRO_DEFAULTS = { even: 50, bright: 50, space: 50, punch: 50, warm: 50 };
+  var MACRO_DEFAULTS = { even: 60, bright: 50, space: 65, punch: 50, warm: 60 }; // v50 (QUEUE #164): wetter + more levelled than the old all-50 middle — Voloco's sound is a room you can hear
   var MACRO_LABELS = {
     even: 'Even',
     bright: 'Bright',
@@ -4856,63 +4936,212 @@
       !routeIsSlow();
   }
 
+  /* v51 (QUEUE #167): the SPEAKER monitor — the polished voice live
+   * on the speaker, through the AEC mic stream. Wanted only when the
+   * toggle is on AND the output is the speaker AND the phone really
+   * is cancelling the echo (PS.audio.monitorMicAecOn() — the AEC
+   * stream is already open and its settings say echoCancellation is
+   * on). Without AEC the speaker output feeds back into the mic and
+   * the monitor squeals, so a false here means no speaker monitor —
+   * today's behaviour, not an error. The AEC stream is opened by
+   * updateMonitor before this is consulted (it is async); this
+   * function only ever reads the cached settings, never opens.
+   */
+  function speakerMonitorWanted() {
+    return state.monitorOn &&
+      PS.store.outputMode() === 'speaker' &&
+      !state.calibrating &&
+      !routeIsSlow() &&
+      PS.audio.monitorMicAecOn();
+  }
+
+  /* v51 (QUEUE #167): the stream promise the monitor branch sings
+   * through, for the current output mode. Headphones: the raw mic
+   * stream (ensureMic) — no feedback through headphones, and the
+   * raw monitor sounds most natural. Speaker: the AEC mic stream
+   * (ensureMonitorMic) — the browser cancels the speaker output
+   * from it. The take ALWAYS uses the raw stream either way.
+   */
+  function monitorSourcePromise() {
+    if (PS.store.outputMode() === 'speaker') return PS.audio.ensureMonitorMic();
+    return PS.audio.ensureMic();
+  }
+
+  // v48 (QUEUE #144): the monitor branch's source is built once in
+  // updateMonitor and never rebuilt — after a route change ends the
+  // mic track, the v45 idle handler closed the mic but left the
+  // branch wired to the dead stream, so the wave drained to 0 px
+  // over the 9 s peak history while _monitorState still said
+  // running=true, gain=1 (probe runs 4-5, MONITOR-DEAD twice).
+  // Swap ONLY the source node onto the fresh stream (keep gain +
+  // chain + analyser + waveTimer — the analyser taps the gain, so
+  // it survives the swap untouched); store sourceStream on the
+  // branch, the recorder graph's rule (audio.js:461). v51 (QUEUE
+  // #167): a speaker branch rebuilds from the AEC stream, a
+  // headphones branch from the raw stream — the branch's isSpeaker
+  // flag picks which. If the monitor is no longer wanted, tear the
+  // branch down through updateMonitor instead of rebuilding it.
+  // If the mic will not re-open, tear the branch down too — a dead
+  // branch claiming to run is worse than no monitor, and the next
+  // record tap rebuilds it via updateMonitor.
+  function rebuildMonitorSource() {
+    var mon = state.monitor;
+    if (!mon) return;
+    // v51 (QUEUE #167): a speaker branch rebuilds from the AEC
+    // stream, a headphones branch from the raw stream. If the branch
+    // is no longer wanted (speaker route now, or AEC gone), tear it
+    // down through updateMonitor instead of rebuilding it.
+    var wanted = mon.isSpeaker ? speakerMonitorWanted() : monitorWanted();
+    if (!wanted) { updateMonitor(); return; }
+    var streamPromise = mon.isSpeaker ? PS.audio.ensureMonitorMic() : PS.audio.ensureMic();
+    PS.audio.ensureContext().then(function (ctx) {
+      return streamPromise.then(function (stream) {
+        return { ctx: ctx, stream: stream };
+      });
+    }).then(function (opened) {
+      if (state.monitor !== mon || (mon.isSpeaker ? !speakerMonitorWanted() : !monitorWanted())) return;
+      try { mon.source.disconnect(); } catch (e) { /* ignore */ }
+      mon.source = opened.ctx.createMediaStreamSource(opened.stream);
+      mon.source.connect(mon.gain);
+      mon.sourceStream = opened.stream;
+    }).catch(function (err) {
+      console.warn('Monitor source rebuild failed:', err);
+      if (state.monitor !== mon) return;
+      if (mon.waveTimer) clearInterval(mon.waveTimer);
+      state.monitor = null;
+      livePeaks = [];
+      livePeakAccum = 0;
+      drawLiveWave();
+      drawFxWave();
+      // Mirror updateMonitor's teardown leg: drop the dead nodes so
+      // no silent subgraph stays wired to the context.
+      try { mon.source.disconnect(); } catch (e) { /* ignore */ }
+      try { mon.gain.disconnect(); } catch (e) { /* ignore */ }
+      try { if (mon.analyser) mon.analyser.disconnect(); } catch (e) { /* ignore */ }
+      try { mon.chain.disconnect(); } catch (e) { /* ignore */ }
+      maybeCloseMic();
+    });
+  }
+
+  /* v51 (QUEUE #167): builds the live monitor branch (source -> gain
+   * -> full vocal chain -> monitor output) from the stream for the
+   * current output mode (monitorSourcePromise: raw mic on headphones,
+   * AEC mic on speaker). isSpeaker marks a speaker branch — its source
+   * rebuilds from the AEC stream, and its wave tick carries the
+   * feedback runaway guard. The start runs on a 3-second timeout:
+   * after a calibration finishes (not a tap), the context resume can
+   * hang on iOS Safari, and a hang must become a visible error —
+   * never a toggle that says ON with no sound.
+   */
+  function buildMonitorBranch(isSpeaker) {
+    var startJob = ensureTuneModule().then(function (ctx) {
+      return monitorSourcePromise().then(function (stream) {
+        // The toggle may have flipped while the mic was opening.
+        var wanted = isSpeaker ? speakerMonitorWanted() : monitorWanted();
+        if (!wanted || state.monitor) {
+          if (isSpeaker) PS.audio.closeMonitorMic();
+          return;
+        }
+        var source = ctx.createMediaStreamSource(stream);
+        var gain = ctx.createGain();
+        gain.gain.value = 0;
+        // Step 4A (v13.4): the monitor runs through the full
+        // vocal chain (live mode: chorus renders 4 voices) —
+        // the chain object owns the tune, the EQ, the echo and
+        // the room, and its input is where the mic goes. The
+        // chain's output is already wired to the monitor gain.
+        var chainObj = makeVocalChain(ctx, true, null, PS.audio.monitorNode() || ctx.destination);
+        source.connect(gain);
+        gain.connect(chainObj.input);
+        state.monitor = { source: source, gain: gain, chain: chainObj, tune: chainObj.tune, isSpeaker: isSpeaker, sourceStream: stream, hotTicks: 0 };
+        gain.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
+        // Step 5 (v13.6): the sound panel's live wave needs the
+        // mic's level while the monitor runs — a passive analyser
+        // tap on the monitor gain (it hears the signal, it never
+        // changes it). A 100 ms tick feeds the same rolling peaks
+        // the record strip draws, so the panel's wave moves while
+        // he sings into the monitor.
+        var analyser = ctx.createAnalyser();
+        analyser.fftSize = 512;
+        gain.connect(analyser);
+        var waveBuf = new Uint8Array(analyser.fftSize);
+        state.monitor.analyser = analyser;
+        state.monitor.waveTimer = setInterval(function () {
+          analyser.getByteTimeDomainData(waveBuf);
+          var peak = 0;
+          for (var i = 0; i < waveBuf.length; i++) {
+            var v = Math.abs(waveBuf[i] - 128) / 128;
+            if (v > peak) peak = v;
+          }
+          livePeaks.push(peak);
+          if (livePeaks.length > 90) livePeaks.shift();
+          drawLiveWave();
+          drawFxWave();
+          // v51 (QUEUE #167): feedback runaway guard — speaker
+          // monitor only. If the mic level pins at max for a full
+          // second, the AEC is not holding and the monitor is
+          // feeding back: kill it before it squeals. A sung note
+          // has dynamics; feedback pins flat at max. The kill is
+          // a plain-words message, never a crash — and the take
+          // keeps recording (the take never hears the monitor).
+          if (state.monitor && state.monitor.isSpeaker) {
+            if (peak >= 0.99) {
+              state.monitor.hotTicks = (state.monitor.hotTicks || 0) + 1;
+            } else {
+              state.monitor.hotTicks = 0;
+            }
+            if (state.monitor.hotTicks >= 10) {
+              console.warn('Speaker monitor killed — feedback suspected (level pinned 1s).');
+              state.monitorOn = false;
+              updateTransport();
+              updateMonitor();
+              showError('The speaker monitor was feeding back, so it turned itself off — the polish still reaches you on playback and headphones.');
+            }
+          }
+        }, 100);
+      });
+    });
+    withTimeout(startJob, 3000, 'Monitor start timed out.').catch(function (err) {
+      console.warn('Monitor could not start:', err);
+      state.monitorOn = false;
+      updateTransport();
+      // v44 (QUEUE #130): the start failed, so no live branch
+      // exists — re-draw the panel onto the take/empty branch
+      // instead of leaving the live hint over a blank canvas.
+      drawFxWave();
+      showError('Could not hear yourself — the mic did not open. Try again.');
+    });
+  }
+
   function updateMonitor() {
     if (monitorWanted()) {
       if (state.monitor) return; // already running
-      // The start runs on a 3-second timeout: after a calibration
-      // finishes (not a tap), the context resume can hang on iOS
-      // Safari, and a hang must become a visible error — never a
-      // toggle that says ON with no sound. (If the start resolves
-      // late, the monitorWanted guard below still refuses to build
-      // the branch, because the timeout already turned the toggle
-      // off.)
-      var startJob = ensureTuneModule().then(function (ctx) {
-        return PS.audio.ensureMic().then(function (stream) {
-          // The toggle may have flipped while the mic was opening.
-          if (!monitorWanted() || state.monitor) return;
-          var source = ctx.createMediaStreamSource(stream);
-          var gain = ctx.createGain();
-          gain.gain.value = 0;
-          // Step 4A (v13.4): the monitor runs through the full
-          // vocal chain (live mode: chorus renders 4 voices) —
-          // the chain object owns the tune, the EQ, the echo and
-          // the room, and its input is where the mic goes. The
-          // chain's output is already wired to the monitor gain.
-          var chainObj = makeVocalChain(ctx, true, null, PS.audio.monitorNode() || ctx.destination);
-          source.connect(gain);
-          gain.connect(chainObj.input);
-          state.monitor = { source: source, gain: gain, chain: chainObj, tune: chainObj.tune };
-          gain.gain.setTargetAtTime(1, ctx.currentTime, 0.01);
-          // Step 5 (v13.6): the sound panel's live wave needs the
-          // mic's level while the monitor runs — a passive analyser
-          // tap on the monitor gain (it hears the signal, it never
-          // changes it). A 100 ms tick feeds the same rolling peaks
-          // the record strip draws, so the panel's wave moves while
-          // he sings into the monitor.
-          var analyser = ctx.createAnalyser();
-          analyser.fftSize = 512;
-          gain.connect(analyser);
-          var waveBuf = new Uint8Array(analyser.fftSize);
-          state.monitor.analyser = analyser;
-          state.monitor.waveTimer = setInterval(function () {
-            analyser.getByteTimeDomainData(waveBuf);
-            var peak = 0;
-            for (var i = 0; i < waveBuf.length; i++) {
-              var v = Math.abs(waveBuf[i] - 128) / 128;
-              if (v > peak) peak = v;
-            }
-            livePeaks.push(peak);
-            if (livePeaks.length > 90) livePeaks.shift();
-            drawLiveWave();
-            drawFxWave();
-          }, 100);
-        });
-      });
-      withTimeout(startJob, 3000, 'Monitor start timed out.').catch(function (err) {
-        console.warn('Monitor could not start:', err);
-        state.monitorOn = false;
-        updateTransport();
-        showError('Could not hear yourself — the mic did not open. Try again.');
+      buildMonitorBranch(false);
+      return;
+    }
+    // v51 (QUEUE #167): the speaker monitor — the polished voice live
+    // on the speaker, through the AEC mic stream. The AEC stream must
+    // be opened first (async) and echo cancellation must really be on;
+    // without AEC the speaker output feeds back into the mic and the
+    // monitor squeals. If the phone will not cancel the echo, this
+    // falls through silently to no monitor on the speaker (today's
+    // behaviour) — the take still records, and the polish still
+    // reaches him on playback and headphones. The explicit toggle
+    // (toggleMonitor) is the place that tells him why, in words.
+    if (state.monitorOn && PS.store.outputMode() === 'speaker' && !state.calibrating && !routeIsSlow()) {
+      if (state.monitor) return; // already running
+      PS.audio.ensureMonitorMic().then(function () {
+        if (!PS.audio.monitorMicAecOn()) return; // no AEC — no speaker monitor, silently
+        if (!speakerMonitorWanted() || state.monitor) {
+          // The toggle flipped or the mode changed while the AEC
+          // stream was opening — close it so the mic does not stay
+          // open with nothing listening.
+          PS.audio.closeMonitorMic();
+          return;
+        }
+        buildMonitorBranch(true);
+      }).catch(function (err) {
+        console.warn('Speaker monitor unavailable:', err);
       });
       return;
     }
@@ -4926,6 +5155,12 @@
     livePeaks = [];
     livePeakAccum = 0;
     drawLiveWave();
+    // v44 (QUEUE #130): the panel wave switches source with the
+    // monitor — live peaks while it runs, the take when it stops —
+    // but this teardown never re-drew the panel, so after the
+    // monitor stopped the panel kept the live hint + stale bars
+    // until the next record. Re-draw now that the branch is gone.
+    drawFxWave();
     PS.audio.ensureContext().then(function (ctx) {
       try { mon.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.01); } catch (e) { /* ignore */ }
       setTimeout(function () {
@@ -4948,10 +5183,40 @@
   }
 
   function toggleMonitor() {
-    if (PS.store.outputMode() !== 'headphones') {
-      showError('Put your headphones on to hear yourself while you sing — through the speaker it would feed back.');
+    // Turning OFF: always allowed, whatever the mode.
+    if (state.monitorOn) {
+      state.monitorOn = false;
+      updateMonitor();
+      updateTransport();
+      // Step 5 (v13.6): the panel's wave switches source with the
+      // monitor — live peaks while it runs, the take when it stops.
+      drawFxWave();
       return;
     }
+    // Turning ON, speaker route — v51 (QUEUE #167): try the AEC
+    // monitor. If the phone will not cancel the echo, the toggle
+    // stays off with plain words (the polish still reaches him on
+    // playback and headphones).
+    if (PS.store.outputMode() === 'speaker') {
+      if (routeIsSlow()) {
+        showError('This route adds too much delay to hear yourself live — the tune still works on playback. Try wired headphones to hear the full sound while you sing.');
+        return;
+      }
+      PS.audio.ensureMonitorMic().then(function () {
+        if (!PS.audio.monitorMicAecOn()) {
+          showError('This phone will not cancel the speaker echo, so hearing yourself live on the speaker stays off — the polish still reaches you on playback and headphones.');
+          return;
+        }
+        state.monitorOn = true;
+        updateMonitor();
+        updateTransport();
+        drawFxWave();
+      }).catch(function () {
+        showError('This phone will not cancel the speaker echo, so hearing yourself live on the speaker stays off — the polish still reaches you on playback and headphones.');
+      });
+      return;
+    }
+    // Turning ON, headphones — the existing path.
     // Step 4A (v13.4): a measured slow route is a Bluetooth-like
     // path — hearing yourself late throws a take off, so the
     // monitor stays off (Voloco's own rule). The tune still works
@@ -4960,7 +5225,7 @@
       showError('These headphones add too much delay to hear yourself live — the tune still works on playback. Try wired headphones to hear the full sound while you sing.');
       return;
     }
-    state.monitorOn = !state.monitorOn;
+    state.monitorOn = true;
     updateMonitor();
     updateTransport();
     // Step 5 (v13.6): the panel's wave switches source with the
@@ -5659,7 +5924,7 @@
    * without touching the label.
    */
   function layerVolumeControl(kind) {
-    var wrap = el('div', 'layer-vol');
+    var wrap = el('div', 'layer-vol' + (PS.store.layerMuted(state.session, kind) ? ' muted' : ''));
     wrap.setAttribute('data-track', kind);
     var name = kind === 'beat' ? 'Beat' : trackName(kind);
     var minus = el('button', 'layer-vol-btn', '−');
@@ -5683,6 +5948,22 @@
     wrap.appendChild(minus);
     wrap.appendChild(value);
     wrap.appendChild(plus);
+    // v49 (QUEUE #154): one-tap mute on the row, beside the
+    // stepper — the speaker silences this layer live and brings
+    // it back at its remembered level. The button carries the
+    // state (aria-pressed + crossed speaker) so he can see it.
+    var isMuted = PS.store.layerMuted(state.session, kind);
+    var mute = el('button', 'layer-vol-btn layer-mute-btn' + (isMuted ? ' muted' : ''));
+    mute.type = 'button';
+    mute.setAttribute('aria-label', (isMuted ? 'Unmute ' : 'Mute ') + name);
+    mute.setAttribute('aria-pressed', isMuted ? 'true' : 'false');
+    mute.setAttribute('data-track', kind);
+    mute.innerHTML = isMuted ? SPK_MUTED_SVG : SPK_SVG;
+    mute.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      toggleLayerMute(kind);
+    });
+    wrap.appendChild(mute);
     return wrap;
   }
 
@@ -5690,7 +5971,23 @@
     var cur = PS.store.layerVolume(state.session, kind);
     var next = PS.store.setLayerVolume(state.session, kind, cur + dir * 25);
     saveSessions();
-    PS.audio.setLayerLevel(kind, next);
+    // v49 (QUEUE #154): moving the level on a muted layer changes
+    // the remembered level, not the audible one — the gain stays 0
+    // until he unmutes, when the new level comes back.
+    PS.audio.setLayerLevel(kind, PS.store.layerMuted(state.session, kind) ? 0 : next);
+    renderTracks();
+  }
+
+  // v49 (QUEUE #154): one tap mutes a layer, one more brings it
+  // back at its remembered level. The gain moves live — it works
+  // mid-playback, no restart, no re-import — and the flag is saved
+  // with the session, so the mute survives stop/start and reload.
+  function toggleLayerMute(kind) {
+    var muted = PS.store.setLayerMuted(state.session, kind,
+      !PS.store.layerMuted(state.session, kind));
+    saveSessions();
+    PS.audio.setLayerLevel(kind,
+      muted ? 0 : PS.store.layerVolume(state.session, kind));
     renderTracks();
   }
 
@@ -5698,9 +5995,16 @@
    * to the engine — at boot and on every song switch (renderAll
    * runs both). Levels are remembered before any audio exists, so
    * a layer gain built later starts at its stored level.
+   * v49 (QUEUE #154): a muted layer is handed 0, not its stored
+   * level — the stored level is the remembered one, the engine
+   * level is the audible one.
    */
   function applyLayerVolumes() {
-    PS.audio.setLayerLevels(PS.store.layerVolumes(state.session));
+    var levels = PS.store.layerVolumes(state.session);
+    Object.keys(levels).forEach(function (k) {
+      if (PS.store.layerMuted(state.session, k)) levels[k] = 0;
+    });
+    PS.audio.setLayerLevels(levels);
   }
 
   function renderTracks() {
@@ -5971,14 +6275,113 @@
    * (take-sheet / sheet-title / sheet-list / sheet-close) so the
    * take rows, the "Make a best take" button, and the per-track
    * take counts all work exactly as they did on the sheet. */
+  // v47 (QUEUE #146 R2-6a, #147) — scroll one take row's action row
+  // into view inside .takes-scroll, minimally. The bar's bottom is
+  // the target when the whole bar fits under the title cap; but
+  // SEND wins over the title: on rows taller than ~790 px the title
+  // and the bar cannot both fit whole (row 808–828 px vs a 732 px
+  // scroll area), and the v154 gate is Send visible, not the title
+  // — so the scroll is never less than what Send itself needs, even
+  // when that pushes the title fully out of view (worst measured:
+  // 828 px row, Send needs 60 px of scroll against a 49 px title
+  // allowance — the title clips 23 px, i.e. fully out, and Send
+  // lands clear; scrolling only to the cap left Send 11 px under
+  // the fold). The title is still fully visible whenever the row
+  // fits, and one short scroll up brings it back. Shared by
+  // openTakeSheet (#147) and the note-focus handler below (R2-6a).
+  // When the title already scrolled past, the focused row IS the
+  // context and the cap must not veto the scroll.
+  function scrollRowActionsIntoView(row) {
+    var scroller = document.querySelector('.takes-scroll');
+    if (!scroller || !row) return;
+    var bar = row.querySelector('.take-actions');
+    if (!bar) return;
+    var sRect = scroller.getBoundingClientRect();
+    var need = bar.getBoundingClientRect().bottom - sRect.bottom;
+    if (need <= 0) return;
+    var title = row.querySelector('.take-info strong');
+    var titleTop = title ? title.getBoundingClientRect().top : sRect.top;
+    var allow = titleTop >= sRect.top ? (titleTop - sRect.top + 12) : need;
+    var sendNeed = 0;
+    var btns = bar.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) {
+      if (btns[i].textContent.trim().indexOf('Send') === 0) {
+        sendNeed = Math.max(0, btns[i].getBoundingClientRect().bottom - sRect.bottom);
+        break;
+      }
+    }
+    scroller.scrollTop = scroller.scrollTop +
+      Math.max(Math.min(need, allow), sendNeed);
+    // v49 (QUEUE #157): mark programmatic scrolls so the sheet's
+    // scroll listener can tell them from his own scrolling.
+    state.sheetLastProgrammaticScrollAt = Date.now();
+  }
+
+  // v49 (QUEUE #157): the row grows after open — the async take
+  // analysis lands and re-renders the sheet with more sub-lines
+  // (Clipped / Sounds muffled / phone-processed), so the one-frame
+  // scroll in openTakeSheet measured a shorter row and Send ends
+  // up below the fold. Re-run the scroll once the sheet has
+  // settled, and on every re-render while the sheet is freshly
+  // opened — but never after he has scrolled it himself, and
+  // never more than 3 s after the open (a later re-render is his
+  // browsing, not the open). Idempotent: the scroll itself
+  // early-returns when nothing pokes below the fold.
+  function reScrollTakeActions() {
+    if (!state.sheetTrack) return;
+    if (state.sheetUserScrolled) return;
+    if (Date.now() - (state.sheetOpenedAt || 0) > 3000) return;
+    var row = document.querySelector('#sheet-list .take-row');
+    scrollRowActionsIntoView(row);
+  }
+
+  function armSheetScrollGuard() {
+    var scroller = document.querySelector('.takes-scroll');
+    if (!scroller || scroller._psSheetScrollListener) return;
+    scroller._psSheetScrollListener = true;
+    scroller.addEventListener('scroll', function () {
+      // A scroll within 150 ms of a programmatic set is ours.
+      if (Date.now() - (state.sheetLastProgrammaticScrollAt || 0) < 150) return;
+      state.sheetUserScrolled = true;
+    });
+  }
+
   function openTakeSheet(track) {
     // Step 5 (v13.6): one sheet at a time — the takes view takes
     // over from the sound panel (the key sheet is the exception:
     // it opens on top of the panel from the panel's Key button).
     closeFxPanel();
     state.sheetTrack = track || state.selectedTrack || 'lead';
+    // v49 (QUEUE #157): fresh-open window for the settle re-scroll
+    // — the analysis re-render grows the row after the one-frame
+    // scroll, so the scroll re-runs while the sheet is fresh.
+    state.sheetOpenedAt = Date.now();
+    state.sheetUserScrolled = false;
+    armSheetScrollGuard();
     renderSheet();
     $('take-sheet').style.display = 'flex';
+    // v46 (QUEUE #146): the take action row is no longer sticky
+    // (its sticky bottom covered the "More sound choices" button)
+    // — so scroll the first take's action row into view on open,
+    // keeping Send visible on first open (the #4 outcome) with
+    // nothing shifted over anything. One frame so layout settles;
+    // scrollTop reset first so a re-open starts from a known
+    // position. v47 (#147): the scroll is capped so the title clips
+    // at most 12 px — except Send wins over the title when the row
+    // is too tall for both (see scrollRowActionsIntoView).
+    requestAnimationFrame(function () {
+      var scroller = document.querySelector('.takes-scroll');
+      if (!scroller) return;
+      scroller.scrollTop = 0;
+      var row = document.querySelector('#sheet-list .take-row');
+      scrollRowActionsIntoView(row);
+    });
+    // v49 (QUEUE #157): belt-and-braces re-scroll once the sheet
+    // has settled — the analysis can land after the one-frame
+    // scroll (its re-render grows the row); the renderSheet hook
+    // below catches the same landing, whichever fires first wins
+    // and the second is a no-op (need <= 0).
+    setTimeout(function () { reScrollTakeActions(); }, 800);
   }
 
   function closeTakeSheet() {
@@ -6308,6 +6711,11 @@
         tab.setAttribute('data-track', k);
         tab.addEventListener('click', function () {
           state.sheetTrack = k;
+          // v49 (QUEUE #157): a lane switch is a fresh open for
+          // the settle re-scroll — the new lane's first row gets
+          // the same treatment as the first open.
+          state.sheetOpenedAt = Date.now();
+          state.sheetUserScrolled = false;
           renderSheet();
         });
         tabs.appendChild(tab);
@@ -6448,6 +6856,10 @@
       row.appendChild(actions);
       list.appendChild(row);
     });
+    // v49 (QUEUE #157): the sheet just re-rendered — if the row
+    // grew since the open-scroll (the analysis landing is the
+    // usual cause), re-scroll now while the sheet is fresh.
+    reScrollTakeActions();
   }
 
   // ---------------------------------------------------------- Step 6C: comping
@@ -7158,7 +7570,15 @@
     if (!panel || panel.style.display === 'none') return;
     var canvas = $('fx-wave');
     if (!canvas) return;
-    if (state.recording || state.monitorOn) {
+    // v44 (QUEUE #130): the live branch runs only when a live source
+    // exists — recording, or the monitor branch actually built. The
+    // monitorOn FLAG alone lies: it defaults on (#122/v38) while the
+    // branch itself needs monitorWanted() (headphones + not-slow-route
+    // + not-calibrating) and state.monitor to exist — so in speaker
+    // mode the panel said 'Your voice, live.' over a blank canvas
+    // (drawLivePeaksInto clearRects, then draws nothing with no live
+    // peaks). Probe PROBE-LEG1-CONFIRMED, 3/3 runs.
+    if (state.recording || state.monitor) {
       drawLivePeaksInto(canvas);
       $('fx-wave-hint').textContent = 'Your voice, live.';
       return;
@@ -7172,20 +7592,44 @@
     var label = trackName(state.selectedTrack);
     $('fx-wave-hint').textContent = 'Your last take on ' + label + '.';
     drawWave(canvas, null, '#a78bfa'); // baseline until the peaks arrive
-    getTakeWave(take.id).then(function (wave) {
-      if ($('fx-panel').style.display === 'none') return;
-      if (state.recording || state.monitorOn) {
-        drawLivePeaksInto(canvas);
-        return;
-      }
-      if (wave) drawWave(canvas, wave, '#a78bfa');
-    });
+    // v44 (QUEUE #130): the take's peaks arrive async (IDB read +
+    // decode). If the save is still in flight the first resolve is
+    // null — and nothing used to re-draw, so a quick panel-open after
+    // a take left the wave blank until the panel reopened. Retry
+    // every 500 ms (max 5 s) while the panel stays open on the same
+    // take with no live source. (The suite's fixed 800 ms sleep was
+    // the other half: it read before the decode landed under load —
+    // the check polls now, cdp-v136.js check 12.)
+    var takeId = take.id;
+    var attemptsLeft = 10;
+    (function drawTakeWave() {
+      getTakeWave(takeId).then(function (wave) {
+        if ($('fx-panel').style.display === 'none') return;
+        if (state.recording || state.monitor) {
+          drawLivePeaksInto(canvas);
+          return;
+        }
+        if (wave) { drawWave(canvas, wave, '#a78bfa'); return; }
+        if (attemptsLeft-- <= 0) return;
+        var now = activeTakeOf(state.selectedTrack);
+        if (!now || now.id !== takeId) return;
+        setTimeout(drawTakeWave, 500);
+      });
+    })();
   }
 
   function openFxPanel() {
     renderFxPanel();
     $('fx-panel').style.display = 'flex';
     drawFxWave();
+    // v46 (QUEUE #146): the Sound-parts strip is no longer sticky
+    // (its sticky bottom covered the chain toggles) — so scroll it
+    // into view on open, keeping the 5 slots visible on first open
+    // (the #5 outcome) with nothing shifted over anything.
+    requestAnimationFrame(function () {
+      var strip = document.querySelector('.fx-strip-wrap');
+      if (strip) strip.scrollIntoView({ block: 'end', behavior: 'auto' });
+    });
   }
 
   function closeFxPanel() {
@@ -7357,6 +7801,20 @@
     // each layer row (changeLayerVolume), and the overall volume
     // is the phone's hardware buttons.
     $('sheet-close').addEventListener('click', closeTakeSheet);
+    // v47 (QUEUE #146 R2-6a): a note input focused with the
+    // keyboard open must leave its take's Send reachable — the
+    // keyboard shrinks the viewport to ~420 px and the focused
+    // row's Send sits ~8,500 px off (a 12-take list is ~10,000 px
+    // tall). Focus does not bubble, focusin does, so one listener
+    // on #sheet-list covers every note input renderSheet rebuilds.
+    // One frame so the browser's own focus scroll settles first.
+    $('sheet-list').addEventListener('focusin', function (ev) {
+      var input = ev.target && ev.target.closest ? ev.target.closest('.take-note input') : null;
+      if (!input) return;
+      var row = input.closest('.take-row');
+      if (!row) return;
+      requestAnimationFrame(function () { scrollRowActionsIntoView(row); });
+    });
     // v29: the takes view is a full screen, not a sheet — there is
     // no backdrop to tap, so the backdrop-click-to-close listener
     // is gone (tapping empty space in the view must not close it).
@@ -7537,6 +7995,14 @@
         renderPlayhead();
         renderLoop();
         renderRuler();
+        // v47 (QUEUE #146 R2-6a): a keyboard open/close resizes
+        // the viewport while a note input is focused — re-scroll
+        // the focused take's Send into view at the new height.
+        var ae = document.activeElement;
+        if (ae && ae.closest && ae.closest('.take-note') && ae.closest('#take-sheet')) {
+          var row = ae.closest('.take-row');
+          if (row) requestAnimationFrame(function () { scrollRowActionsIntoView(row); });
+        }
       }, 150);
     });
   }
